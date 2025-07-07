@@ -1,0 +1,37 @@
+[package]
+name = "api"
+version.workspace = true
+edition.workspace = true
+description = "Ядро приложения журнала событий"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+dotenv.workspace = true
+env_logger.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+sqlx-cli.workspace = true
+tokio.workspace = true
+validator.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+uuid.workspace = true
+base64.workspace = true
+
+axum = "0.8.1"
+tower-http = { version = "0.6.2", features = [
+    "cors",
+    "compression-gzip",
+    "trace",
+] }
+axum-valid = { version = "0.24.0", features = ["into_json", "json"] }
+jsonwebtoken = "9.3.1"
+utoipa = { version = "5.3.1", features = ["uuid", "chrono", "axum_extras"] }
+utoipa-swagger-ui = { version = "9.0.1", features = ["axum"] }
+infer = "0.19.0"
+hyper = "1.6.0"
+casbin = { version = "2.10.1", features = ["tokio"] }
+parking_lot = "0.12.3"
