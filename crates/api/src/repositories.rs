@@ -10,7 +10,7 @@ use crate::dto::{AuditDTO, ChangeDTO, ChangeDetailDTO, QAudit, QChange};
 // Функция для добавления условий в запрос
 fn add_conditions<'a>(query_builder: &mut QueryBuilder<'a, Postgres>, q: &'a QAudit) {
     // Вспомогательная функция для форматирования поиска с подстроками
-    let like_format = |val: &str| format!("%{}%", val);
+    let like_format = |val: &str| format!("%{val}%");
 
     // Макрос для уменьшения дублирования кода при добавлении условий
     macro_rules! add_condition {

@@ -36,3 +36,20 @@ tracing-appender = "0.2.3"
 redis = { version = "0.32.3", features = ["tokio-comp"] }
 base64 = "0.22.1"
 rayon = "1.10.0"
+tokio-stream = "0.1.17"
+fancy-regex = "0.15.0"
+lazy_static = "1.5.0"
+axum = "0.8.1"
+tower-http = { version = "0.6.2", features = [
+    "cors",
+    "compression-gzip",
+    "trace",
+] }
+axum-valid = { version = "0.24.0", features = ["into_json", "json"] }
+jsonwebtoken = "9.3.1"
+utoipa = { version = "5.3.1", features = ["uuid", "chrono", "axum_extras"] }
+utoipa-swagger-ui = { version = "9.0.1", features = ["axum"] }
+infer = "0.19.0"
+hyper = "1.6.0"
+casbin = { version = "2.10.1", features = ["tokio"] }
+parking_lot = "0.12.3"

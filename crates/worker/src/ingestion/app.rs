@@ -31,7 +31,7 @@ pub async fn run_loop(
     group: String,
     topic: String,
 ) -> Result<()> {
-    let group = format!("{}_app", group);
+    let group = format!("{group}_app");
 
     info!(topic = topic, group = group, "Запуск обработки App!");
 

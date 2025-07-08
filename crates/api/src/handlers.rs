@@ -57,7 +57,7 @@ pub async fn get_audit_body(
                 .header(CONTENT_TYPE, content_type)
                 .header(
                     CONTENT_DISPOSITION,
-                    format!("attachment; filename=\"{}\"", filename),
+                    format!("attachment; filename=\"{filename}\""),
                 )
                 .header(ACCESS_CONTROL_EXPOSE_HEADERS, CONTENT_DISPOSITION)
                 .body(Body::from(buf))
@@ -70,7 +70,7 @@ pub async fn get_audit_body(
                 .header(CONTENT_TYPE, "text/plain")
                 .header(
                     CONTENT_DISPOSITION,
-                    format!("attachment; filename=\"{}.txt\"", id),
+                    format!("attachment; filename=\"{id}.txt\""),
                 )
                 .header(ACCESS_CONTROL_EXPOSE_HEADERS, CONTENT_DISPOSITION)
                 .body(Body::from(response_body.into_bytes()))
@@ -86,10 +86,10 @@ fn detect_content_type(buf: &[u8], id: Uuid) -> (&'static str, String) {
         (kind.mime_type(), format!("{}.{}", id, kind.extension()))
     } else if serde_json::from_slice::<serde_json::Value>(buf).is_ok() {
         // Если это JSON
-        ("application/json", format!("{}.json", id))
+        ("application/json", format!("{id}.json"))
     } else {
         // По умолчанию - текст
-        ("text/plain", format!("{}.txt", id))
+        ("text/plain", format!("{id}.txt"))
     }
 }
 

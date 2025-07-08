@@ -71,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
         .acquire_timeout(Duration::from_secs(30))
         .connect(&url)
         .await
-        .unwrap_or_else(|_| panic!("Failed to create Postgres connection pool! URL: {}", url));
+        .unwrap_or_else(|_| panic!("Failed to create Postgres connection pool! URL: {url}"));
 
     let redis = Client::open(redis_url)?;
     // Настраиваем параметры пула соединений
