@@ -86,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
         batch_size = config.batch_size,
         concurrent_processors = config.concurrent_processors,
         chunk_size = config.chunk_size,
-        "Конфигурация процессора"
+        "Конфигурация Debezium воркера"
     );
 
     // Подключение к БД

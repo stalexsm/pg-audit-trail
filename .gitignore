@@ -73,4 +73,4 @@ docs/_build/
 .env
 
 docker-volumes
-logs
+logs/*
