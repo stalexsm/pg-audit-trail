@@ -1,0 +1,141 @@
+networks:
+  default:
+    driver: bridge
+services:
+  kafka:
+    image: "bitnami/kafka:4.0.0"
+    restart: always
+    environment:
+      - KAFKA_CFG_NODE_ID=0
+      - KAFKA_CFG_PROCESS_ROLES=controller,broker
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=0@kafka:9093
+
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093,INTERNAL://:19092
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,INTERNAL://kafka:19092
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=INTERNAL
+      # Храним записи 40 мин
+      - KAFKA_CFG_LOG_RETENTION_MS=2400000
+      - KAFKA_CFG_LOG_RETENTION_CHECK_INTERVAL_MS=60000
+      - KAFKA_CFG_LOG_SEGMENT_BYTES=1073741824 # 1GB для сегментов логов (при высокой нагрузке)
+      - KAFKA_CFG_TOPIC_AUTO_CREATE_CONFIG_RETENTION_MS=2400000
+
+    volumes:
+      - ./docker-volumes/kafka/:/bitnami/kafka:cached
+
+    networks:
+      - default
+
+    healthcheck:
+      test:
+        ["CMD", "kafka-topics.sh", "--bootstrap-server", "kafka:9092", "--list"]
+      interval: 15s
+      retries: 5
+      start_period: 120s
+      timeout: 60s
+
+  debezium:
+    image: debezium/connect:3.0.0.Final
+    restart: always
+    ports:
+      - "${DEBEZIUM_CONTAINER_PORT:-8083}:8083"
+    environment:
+      - GROUP_ID=1
+      - BOOTSTRAP_SERVERS=kafka:9092
+      - CONFIG_STORAGE_TOPIC=debezium-config
+      - OFFSET_STORAGE_TOPIC=debezium-offsets
+      - STATUS_STORAGE_TOPIC=debezium-status
+
+      # Schema Settings
+      - CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE=false
+      - CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE=false
+
+    volumes:
+      - ./docker-volumes/debezium/config:/config:cached
+      - ./docker-volumes/debezium/data:/data:cached
+      - ./docker-volumes/debezium/connect:/connect:cached
+      - ./docker-volumes/debezium/logs:/logs:cached
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+    networks:
+      - default
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083"]
+      interval: 15s
+      retries: 10
+      start_period: 120s
+      timeout: 30s
+
+  redis:
+    restart: always
+    image: redis:8.0.1-bookworm
+    volumes:
+      - ./docker-volumes/redis/:/data
+
+    networks:
+      - default
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      retries: 3
+      start_period: 60s
+      timeout: 10s
+
+  db:
+    image: postgres:17.4
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      PGDATA: /var/lib/postgresql/data
+      POSTGRES_DB: postgres
+    volumes:
+      - ./docker-volumes/postgres_audit/:/var/lib/postgresql/data
+    ports:
+      - "${DB_AUDIT_CONTAINER_PORT}:5432"
+
+    networks:
+      - default
+
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"]
+      interval: 30s
+      retries: 3
+      start_period: 60s
+      timeout: 10s
+
+  api:
+    build:
+      context: ${PROJECT_DIR_AUDIT:-audit-rs}
+      target: final
+    ports:
+      - "${AUDIT_PORT}:8000"
+    env_file:
+      - ./${PROJECT_DIR_AUDIT:-audit-rs}/.env
+    volumes:
+      - ./${PROJECT_DIR_AUDIT:-audit-rs}/logs:/app/logs
+    depends_on:
+      db1:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      debezium:
+        condition: service_healthy
+
+    networks:
+      - default
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 60s
+      retries: 5
+      start_period: 60s
+      timeout: 20s
