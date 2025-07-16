@@ -219,7 +219,7 @@ fn create_kafka_consumer(
         .set("enable.partition.eof", "false")
         .set(
             "session.timeout.ms",
-            &config.kafka_session_timeout_ms.to_string(),
+            config.kafka_session_timeout_ms.to_string(),
         )
         .set("heartbeat.interval.ms", "2000")
         .set("max.poll.interval.ms", "300000")
@@ -424,7 +424,7 @@ async fn process_single_batch(
 
                 if retry_count >= config.max_retries {
                     error!(error = %err, "Максимальное количество попыток вставки исчерпано");
-                    return Err(err.into());
+                    return Err(err);
                 }
 
                 warn!(
