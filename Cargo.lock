@@ -4036,6 +4036,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "worker-app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "chrono",
+ "dotenv",
+ "fancy-regex",
+ "futures",
+ "lazy_static",
+ "rayon",
+ "rdkafka",
+ "redis",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "writeable"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

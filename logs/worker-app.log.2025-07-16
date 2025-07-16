@@ -1,0 +1,24 @@
+2025-07-16T12:25:12.172811Z  INFO Starting worker-app service...
+2025-07-16T12:27:45.500087Z  INFO relation "_sqlx_migrations" already exists, skipping
+2025-07-16T12:27:45.504226Z  INFO Starting worker-app service...
+2025-07-16T12:29:03.995438Z  INFO relation "_sqlx_migrations" already exists, skipping
+2025-07-16T12:29:03.999426Z  INFO Starting worker-app service...
+2025-07-16T12:29:03.999456Z  INFO Запуск обработки App! topic="audit.app" group="group_audit_app"
+2025-07-16T12:29:09.406718Z  INFO Сообщений для обработки! message_cnt=1
+2025-07-16T12:29:10.033667Z  INFO Сообщений для обработки! message_cnt=1
+2025-07-16T12:29:14.934977Z  INFO Сообщений для обработки! message_cnt=1
+2025-07-16T12:29:15.051124Z  INFO Сообщений для обработки! message_cnt=1
+2025-07-16T12:29:15.263020Z  INFO Сообщений для обработки! message_cnt=1
+2025-07-16T12:29:15.373970Z  INFO Сообщений для обработки! message_cnt=1
+2025-07-16T12:29:15.480466Z  INFO Сообщений для обработки! message_cnt=1
+2025-07-16T12:29:15.587992Z  INFO Сообщений для обработки! message_cnt=1
+2025-07-16T12:29:15.696178Z  INFO Сообщений для обработки! message_cnt=1
+2025-07-16T12:29:15.802486Z  INFO Сообщений для обработки! message_cnt=1
+2025-07-16T12:29:15.908986Z  INFO Сообщений для обработки! message_cnt=1
+2025-07-16T12:29:16.015053Z  INFO Сообщений для обработки! message_cnt=1
+2025-07-16T12:29:16.123699Z  INFO Сообщений для обработки! message_cnt=1
+2025-07-16T12:29:16.333922Z  INFO Сообщений для обработки! message_cnt=1
+2025-07-16T12:29:50.978937Z  INFO relation "_sqlx_migrations" already exists, skipping
+2025-07-16T12:29:50.982655Z  INFO Starting worker-app service...
+2025-07-16T12:29:50.982680Z  INFO Запуск обработки App! topic="audit.app" group="group_audit_app"
+2025-07-16T12:29:55.068169Z  INFO Сообщений для обработки! message_cnt=13

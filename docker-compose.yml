@@ -96,9 +96,9 @@ services:
       PGDATA: /var/lib/postgresql/data
       POSTGRES_DB: postgres
     volumes:
-      - ./docker-volumes/postgres_audit/:/var/lib/postgresql/data
+      - ./docker-volumes/postgres/:/var/lib/postgresql/data
     ports:
-      - "${DB_AUDIT_CONTAINER_PORT}:5432"
+      - "54399:5432"
 
     networks:
       - default
@@ -112,16 +112,16 @@ services:
 
   api:
     build:
-      context: ${PROJECT_DIR_AUDIT:-audit-rs}
+      context: .
       target: final
     ports:
-      - "${AUDIT_PORT}:8000"
+      - "8000:8000"
     env_file:
-      - ./${PROJECT_DIR_AUDIT:-audit-rs}/.env
+      - /.env
     volumes:
-      - ./${PROJECT_DIR_AUDIT:-audit-rs}/logs:/app/logs
+      - ./logs:/app/logs
     depends_on:
-      db1:
+      db:
         condition: service_healthy
       kafka:
         condition: service_healthy
