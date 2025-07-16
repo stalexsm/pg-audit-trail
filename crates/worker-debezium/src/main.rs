@@ -1,10 +1,12 @@
 use std::time::Duration;
 
 use sqlx::postgres::PgPoolOptions;
+use tokio::signal;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_appender::rolling;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
-use worker_debezium::debezium;
+use worker_debezium::debezium::{self, ProcessorConfig};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -52,6 +54,41 @@ async fn main() -> anyhow::Result<()> {
         panic!("An error occurred while getting `DATABASE_URL` from ENV. Add a variable to the environment!")
     });
 
+    // Создание конфигурации с возможностью переопределения из ENV
+    let config = ProcessorConfig {
+        batch_size: std::env::var("BATCH_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10000),
+        concurrent_processors: std::env::var("CONCURRENT_PROCESSORS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10),
+        chunk_size: std::env::var("CHUNK_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(500),
+        channel_buffer_size: std::env::var("CHANNEL_BUFFER_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000),
+        batch_timeout_ms: std::env::var("BATCH_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100),
+        max_retries: std::env::var("MAX_RETRIES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3),
+    };
+
+    info!(
+        batch_size = config.batch_size,
+        concurrent_processors = config.concurrent_processors,
+        chunk_size = config.chunk_size,
+        "Конфигурация процессора"
+    );
+
     // Подключение к БД
     let pool = PgPoolOptions::new()
         .min_connections(3) // Поддерживать минимальное количество соединений
@@ -66,12 +103,46 @@ async fn main() -> anyhow::Result<()> {
     // Запуск миграций
     sqlx::migrate!("../../migrations").run(&pool).await?;
 
+    // Создание токена для graceful shutdown
+    let cancellation_token = CancellationToken::new();
+
+    // Настройка обработки сигналов для graceful shutdown
+    let shutdown_token = cancellation_token.clone();
+    tokio::spawn(async move {
+        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("Failed to register SIGTERM handler");
+        let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
+            .expect("Failed to register SIGINT handler");
+
+        tokio::select! {
+            _ = sigterm.recv() => {
+                info!("Получен SIGTERM, инициируем graceful shutdown");
+            }
+            _ = sigint.recv() => {
+                info!("Получен SIGINT (Ctrl+C), инициируем graceful shutdown");
+            }
+        }
+
+        shutdown_token.cancel();
+    });
+
     // Запуск циклов обработки сообщений!
     info!("Starting worker-debezium service...");
 
-    if let Err(e) = debezium::run_loop(pool, brokers, group, topic).await {
+    if let Err(e) = debezium::run_loop(
+        pool,
+        brokers,
+        group,
+        topic,
+        Some(config),
+        cancellation_token,
+    )
+    .await
+    {
         error!(error=%e,"Error in debezium task!");
     }
+
+    info!("Worker-debezium service завершен");
 
     Ok(())
 }
