@@ -47,7 +47,7 @@ pub async fn run_loop(
     consumer.subscribe(&[&topic])?;
 
     const BATCH_SIZE: usize = 100;
-    const MAX_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+    const MAX_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
     let mut consumer_msg_stream = consumer.stream();
     let mut con = redis.get_multiplexed_async_connection().await?;
@@ -84,10 +84,10 @@ pub async fn run_loop(
             continue;
         }
 
-        info!(message_cnt = messages.len(), "Сообщений для обработки!");
-
         // Обработка данных
         let records = borrowed_message_to_audit_dto(&mut con, &messages).await?;
+
+        info!(message_cnt = records.len(), "Сообщений для обработки!");
 
         // Обработка изменений в бд и удаление записей из буфера
         let mut tx = pool.begin().await?;

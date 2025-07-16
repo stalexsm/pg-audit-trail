@@ -8,7 +8,8 @@
 
 ARG RUST_VERSION=1.88.0
 ARG APP_NAME=api
-ARG WORKER_NAME=worker
+ARG WORKER_APP_NAME=worker-app
+ARG WORKER_DEBEZIUM_NAME=worker-debezium
 
 ################################################################################
 # Create a stage for building the application.
@@ -41,8 +42,9 @@ RUN --mount=type=bind,source=crates,target=crates \
     --mount=type=cache,target=/usr/local/cargo/git/db \
     --mount=type=cache,target=/usr/local/cargo/registry/ \
     cargo build --release && \
-    cp ./target/release/$APP_NAME /bin/server && \
-    cp ./target/release/$WORKER_NAME /bin/worker && \
+    cp ./target/release/$APP_NAME /bin/$APP_NAME && \
+    cp ./target/release/$WORKER_APP_NAME /bin/$WORKER_APP_NAME && \
+    cp ./target/release/$WORKER_DEBEZIUM_NAME /bin/$WORKER_DEBEZIUM_NAME && \
     cp ./casbin.conf /bin/casbin.conf && \
     cp ./policy.csv /bin/policy.csv
 
@@ -64,8 +66,9 @@ WORKDIR /app
 RUN mkdir -p /app/logs
 
 # Copy the executable from the "build" stage.
-COPY --from=build /bin/server /app/
-COPY --from=build /bin/worker /app/
+COPY --from=build /bin/$APP_NAME /app/
+COPY --from=build /bin/$WORKER_APP_NAME /app/
+COPY --from=build /bin/$WORKER_DEBEZIUM_NAME /app/
 COPY --from=build /bin/casbin.conf /app/
 COPY --from=build /bin/policy.csv /app/
 
@@ -73,4 +76,4 @@ COPY --from=build /bin/policy.csv /app/
 EXPOSE 8000
 
 # What the container should run when it is started.
-CMD ["sh", "-c", "/app/worker & /app/server"]
+CMD ["sh", "-c", "/app/$APP_NAME & /app/$WORKER_APP_NAME & /app/$WORKER_DEBEZIUM_NAME"]
