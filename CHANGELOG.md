@@ -1,3 +1,10 @@
+## 0.2.1 (2025-07-17)
+
+### Fix
+
+- Внес правки а docker-compose.yml и Dockerfile.
+- Переменные в Dockerfile
+
 ## 0.2.0 (2025-07-16)
 
 ### Feat
