@@ -43,9 +43,9 @@ RUN --mount=type=bind,source=crates,target=crates \
     --mount=type=cache,target=/usr/local/cargo/git/db \
     --mount=type=cache,target=/usr/local/cargo/registry/ \
     cargo build --release && \
-    cp ./target/release/$APP_NAME /bin/$APP_NAME && \
-    cp ./target/release/$WORKER_APP_NAME /bin/$WORKER_APP_NAME && \
-    cp ./target/release/$WORKER_DEBEZIUM_NAME /bin/$WORKER_DEBEZIUM_NAME && \
+    cp ./target/release/$APP_NAME /bin/ && \
+    cp ./target/release/$WORKER_APP_NAME /bin/ && \
+    cp ./target/release/$WORKER_DEBEZIUM_NAME /bin/ && \
     cp ./casbin.conf /bin/casbin.conf && \
     cp ./policy.csv /bin/policy.csv
 
@@ -61,24 +61,23 @@ RUN --mount=type=bind,source=crates,target=crates \
 # (e.g., alpine@sha256:664888ac9cfd28068e062c991ebcff4b4c7307dc8dd4df9e728bedde5c449d91).
 FROM alpine:3.18 AS final
 
-ARG APP_NAME
-ARG WORKER_APP_NAME
-ARG WORKER_DEBEZIUM_NAME
-
 WORKDIR /app
 
 # Создать директорию для логов
 RUN mkdir -p /app/logs
 
 # Copy the executable from the "build" stage.
-COPY --from=build /bin/$APP_NAME /app/
-COPY --from=build /bin/$WORKER_APP_NAME /app/
-COPY --from=build /bin/$WORKER_DEBEZIUM_NAME /app/
+COPY --from=build /bin/api /app/
+COPY --from=build /bin/worker-app /app/
+COPY --from=build /bin/worker-debezium /app/
 COPY --from=build /bin/casbin.conf /app/
 COPY --from=build /bin/policy.csv /app/
 
 # Expose the port that the application listens on.
 EXPOSE 8000
 
+# Make executables executable
+RUN chmod +x /app/api /app/worker-app /app/worker-debezium
+
 # What the container should run when it is started.
-CMD ["sh", "-c", "/app/$APP_NAME & /app/$WORKER_APP_NAME & /app/$WORKER_DEBEZIUM_NAME"]
+CMD ["sh", "-c", "/app/api & /app/worker-app & /app/worker-debezium"]

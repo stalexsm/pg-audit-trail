@@ -25,7 +25,7 @@ services:
       - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=0@kafka:9093
 
       - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
-      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,EXTERNAL://192.168.1.116:9094
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,EXTERNAL://:9094
       - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT,PLAINTEXT:PLAINTEXT
 
       - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
@@ -59,7 +59,7 @@ services:
     image: debezium/connect:3.0.0.Final
     restart: always
     ports:
-      - "${DEBEZIUM_CONTAINER_PORT:-8083}:8083"
+      - "8083:8083"
     environment:
       - GROUP_ID=1
       - BOOTSTRAP_SERVERS=kafka:9092
@@ -138,7 +138,7 @@ services:
     ports:
       - "8000:8000"
     env_file:
-      - /.env
+      - ./.env
     volumes:
       - ./logs:/app/logs
     depends_on:
