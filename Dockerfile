@@ -17,7 +17,8 @@ ARG WORKER_DEBEZIUM_NAME=worker-debezium
 FROM rust:${RUST_VERSION}-alpine AS build
 
 ARG APP_NAME
-ARG WORKER_NAME
+ARG WORKER_APP_NAME
+ARG WORKER_DEBEZIUM_NAME
 
 WORKDIR /app
 
@@ -59,6 +60,10 @@ RUN --mount=type=bind,source=crates,target=crates \
 # reproducibility is important, consider using a digest
 # (e.g., alpine@sha256:664888ac9cfd28068e062c991ebcff4b4c7307dc8dd4df9e728bedde5c449d91).
 FROM alpine:3.18 AS final
+
+ARG APP_NAME
+ARG WORKER_APP_NAME
+ARG WORKER_DEBEZIUM_NAME
 
 WORKDIR /app
 
