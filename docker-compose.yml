@@ -17,7 +17,7 @@ services:
       - shared-network
       - default
   kafka:
-    image: "bitnami/kafka:4.0.0"
+    image: "bitnamilegacy/kafka:4.0.0"
     restart: always
     environment:
       - KAFKA_CFG_NODE_ID=0
@@ -100,6 +100,9 @@ services:
 
     networks:
       - default
+
+    ports:
+      - "6379:6379"
 
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]

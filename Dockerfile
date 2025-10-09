@@ -6,7 +6,7 @@
 
 # Want to help us make this template better? Share your feedback here: https://forms.gle/ybq9Krt8jtBL3iCk7
 
-ARG RUST_VERSION=1.88.0
+ARG RUST_VERSION=1.90.0
 ARG APP_NAME=api
 ARG WORKER_APP_NAME=worker-app
 ARG WORKER_DEBEZIUM_NAME=worker-debezium
@@ -35,7 +35,7 @@ RUN apk add --no-cache clang lld musl-dev git openssl-dev pkgconfig cmake make g
 # output directory before the cache mounted /app/target is unmounted.
 RUN --mount=type=bind,source=crates,target=crates \
     --mount=type=bind,source=Cargo.toml,target=Cargo.toml \
-    --mount=type=bind,source=Cargo.lock,target=Cargo.lock \
+    --mount=type=bind,source=Cargo.lock,target=Cargo.lock,rw \
     --mount=type=bind,source=casbin.conf,target=casbin.conf \
     --mount=type=bind,source=policy.csv,target=policy.csv \
     --mount=type=bind,source=migrations,target=migrations \

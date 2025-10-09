@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{env, path::PathBuf, sync::Arc, time::Duration};
 
 use api::routes::{ApiDoc, api_router};
 use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::get};
@@ -24,7 +24,23 @@ use utoipa_swagger_ui::SwaggerUi;
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
 
-    let log_file = rolling::daily("logs", "api.log"); // Лог-файл, создается каждый день
+    // Определение правильного пути к файлам
+    let base_dir = if cfg!(debug_assertions) {
+        // В режиме разработки используем корень проекта
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+    } else {
+        // В продакшене используем директорию, где находится исполняемый файл
+        env::current_exe()?
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or(env::current_exe()?)
+    };
+
+    let log_file = rolling::daily(base_dir.join("logs"), "api.log"); // Лог-файл, создается каждый день
     let (non_blocking, _guard) = tracing_appender::non_blocking(log_file);
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -65,10 +81,29 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind("0.0.0.0:8000").await?;
     info!("listening on {}", listener.local_addr()?);
 
+    // Путь для конфига casbin
+    let casbin_path: &'static str = Box::leak(
+        base_dir
+            .join("casbin.conf")
+            .to_string_lossy()
+            .into_owned()
+            .into_boxed_str(),
+    );
+
+    // Путь для настроек разрешений политик casbin
+    let policy_path: &'static str = Box::leak(
+        base_dir
+            .join("policy.csv")
+            .to_string_lossy()
+            .into_owned()
+            .into_boxed_str(),
+    );
+
     // Casbin для обработки политики достуров...
-    let enforcer = Arc::new(RwLock::new(
-        Enforcer::new("casbin.conf", "policy.csv").await?,
-    ));
+    let enforcer = Arc::new(RwLock::new(Enforcer::new(casbin_path, policy_path).await?));
+
+    // Запуск миграций
+    sqlx::migrate!("../../migrations").run(&pool).await?;
 
     axum::serve(
         listener,

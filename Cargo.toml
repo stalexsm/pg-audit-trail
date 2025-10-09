@@ -8,34 +8,26 @@ version = "0.2.1"
 edition = "2024"
 description = "Журнал событий приложения"
 
-rust-version = "1.89"
+rust-version = "1.90"
 
 [workspace.dependencies]
 anyhow = "1.0.97"
-chrono = { version = "0.4.40", features = ["serde"] }
-uuid = { version = "1.15.1", features = ["serde", "v4"] }
+chrono = "0.4.40"
+uuid = "1.15.1"
 dotenv = "0.15.0"
 env_logger = "0.11.6"
-serde = { version = "1.0.218", features = ["derive"] }
+serde = "1.0.218"
 serde_json = "1.0.140"
-sqlx = { version = "0.8.3", features = [
-    "uuid",
-    "chrono",
-    "runtime-tokio-rustls",
-    "postgres",
-    "migrate",
-    "json",
-    "any",
-] }
+sqlx = "0.8.3"
 sqlx-cli = "0.8.3"
-tokio = { version = "1.46.0", features = ["full"] }
-validator = { version = "0.20.0", features = ["derive"] }
+tokio = "1.46.0"
+validator = "0.20.0"
 futures = "0.3.31"
-rdkafka = { version = "0.38.0", features = ["cmake-build"] }
+rdkafka = "0.38.0"
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = ["chrono", "env-filter"] }
+tracing-subscriber = "0.3.19"
 tracing-appender = "0.2.3"
-redis = { version = "0.32.3", features = ["tokio-comp"] }
+redis = "0.32.3"
 base64 = "0.22.1"
 rayon = "1.10.0"
 tokio-stream = "0.1.17"
@@ -43,16 +35,12 @@ tokio-util = "0.7.15"
 fancy-regex = "0.16.1"
 lazy_static = "1.5.0"
 axum = "0.8.1"
-tower-http = { version = "0.6.2", features = [
-    "cors",
-    "compression-gzip",
-    "trace",
-] }
-axum-valid = { version = "0.24.0", features = ["into_json", "json"] }
-jsonwebtoken = "9.3.1"
-utoipa = { version = "5.3.1", features = ["uuid", "chrono", "axum_extras"] }
-utoipa-swagger-ui = { version = "9.0.1", features = ["axum"] }
+tower-http = "0.6.2"
+axum-valid = "0.24.0"
+jsonwebtoken = "10.0.0"
+utoipa = "5.4.0"
+utoipa-swagger-ui = "9.0.2"
 infer = "0.19.0"
 hyper = "1.6.0"
-casbin = { version = "2.10.1", features = ["tokio"] }
+casbin = "2.10.1"
 parking_lot = "0.12.3"

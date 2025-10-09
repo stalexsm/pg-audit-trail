@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{env, path::PathBuf, time::Duration};
 
 use sqlx::postgres::PgPoolOptions;
 use tokio::signal;
@@ -12,7 +12,25 @@ use worker_debezium::debezium::{self, ProcessorConfig};
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
 
-    let log_file = rolling::daily("logs", "worker-debezium.log"); // Лог-файл, создается каждый день
+    // Определение правильного пути к файлам
+    let base_dir = if cfg!(debug_assertions) {
+        // В режиме разработки используем корень проекта (поднимаемся из crates/api)
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+    } else {
+        // В продакшене используем директорию, где находится исполняемый файл
+        env::current_exe()?
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or(env::current_exe()?)
+    };
+
+    // Path для логов
+
+    let log_file = rolling::daily(base_dir.join("logs"), "worker-debezium.log"); // Лог-файл, создается каждый день
     let (non_blocking, _guard) = tracing_appender::non_blocking(log_file);
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 

@@ -8,14 +8,21 @@ description.workspace = true
 anyhow.workspace = true
 dotenv.workspace = true
 futures.workspace = true
-rdkafka.workspace = true
-redis.workspace = true
-serde.workspace = true
+rdkafka = { workspace = true, features = ["cmake-build"] }
+redis = { workspace = true, features = ["tokio-comp"] }
+serde= { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-sqlx.workspace = true
-tokio.workspace = true
+sqlx = { workspace = true, features = [
+    "uuid",
+    "chrono",
+    "runtime-tokio-rustls",
+    "postgres",
+    "json",
+    "any",
+] }
+tokio = { workspace = true, features = ["full"] }
 tokio-util.workspace = true
 tracing-appender.workspace = true
-tracing-subscriber.workspace = true
+tracing-subscriber = { workspace = true, features = ["chrono", "env-filter"] }
 tracing.workspace = true
-uuid.workspace = true
+uuid = { workspace = true, features = ["serde", "v4"] }
