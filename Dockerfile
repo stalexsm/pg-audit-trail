@@ -38,6 +38,7 @@ RUN --mount=type=bind,source=crates,target=crates \
     --mount=type=bind,source=Cargo.lock,target=Cargo.lock,rw \
     --mount=type=bind,source=casbin.conf,target=casbin.conf \
     --mount=type=bind,source=policy.csv,target=policy.csv \
+    --mount=type=bind,source=start.sh,target=start.sh \
     --mount=type=bind,source=migrations,target=migrations \
     --mount=type=cache,target=/app/target/ \
     --mount=type=cache,target=/usr/local/cargo/git/db \
@@ -47,7 +48,8 @@ RUN --mount=type=bind,source=crates,target=crates \
     cp ./target/release/$WORKER_APP_NAME /bin/ && \
     cp ./target/release/$WORKER_DEBEZIUM_NAME /bin/ && \
     cp ./casbin.conf /bin/casbin.conf && \
-    cp ./policy.csv /bin/policy.csv
+    cp ./policy.csv /bin/policy.csv && \
+    cp ./start.sh /bin/start.sh
 
 ################################################################################
 # Create a new stage for running the application that contains the minimal
@@ -61,6 +63,9 @@ RUN --mount=type=bind,source=crates,target=crates \
 # (e.g., alpine@sha256:664888ac9cfd28068e062c991ebcff4b4c7307dc8dd4df9e728bedde5c449d91).
 FROM alpine:3.18 AS final
 
+# Установить tini в runtime образе
+RUN apk add --no-cache tini
+
 WORKDIR /app
 
 # Создать директорию для логов
@@ -72,12 +77,15 @@ COPY --from=build /bin/worker-app /app/
 COPY --from=build /bin/worker-debezium /app/
 COPY --from=build /bin/casbin.conf /app/
 COPY --from=build /bin/policy.csv /app/
+COPY --from=build /bin/start.sh /app/
 
 # Expose the port that the application listens on.
 EXPOSE 8000
 
 # Make executables executable
-RUN chmod +x /app/api /app/worker-app /app/worker-debezium
+RUN chmod +x /app/api /app/worker-app /app/worker-debezium /app/start.sh
+
+ENTRYPOINT ["tini", "--"]
 
 # What the container should run when it is started.
-CMD ["sh", "-c", "/app/api & /app/worker-app & /app/worker-debezium"]
+CMD ["/app/start.sh"]
