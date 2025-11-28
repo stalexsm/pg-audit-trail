@@ -554,7 +554,6 @@ fn create_kafka_consumer(brokers: &str, group: &str) -> Result<StreamConsumer> {
         .set("reconnect.backoff.ms", "500") // Начальная задержка 0.5 сек
         .set("reconnect.backoff.max.ms", "5000") // Максимальная задержка 5 сек
         .set("retry.backoff.ms", "50") // Задержка между retry 50 мс
-        .set("request.timeout.ms", "60000") // Таймаут запроса 60 сек
         .set("metadata.request.timeout.ms", "120000") // Таймаут метаданных 120 сек
         // Дополнительные настройки для стабильности
         .set("socket.keepalive.enable", "true") // Включить keepalive

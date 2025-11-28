@@ -230,8 +230,7 @@ fn create_kafka_consumer(
         // Настройки для восстановления соединения
         .set("reconnect.backoff.ms", "1000") // Начальная задержка 1 сек
         .set("reconnect.backoff.max.ms", "10000") // Максимальная задержка 10 сек
-        .set("retry.backoff.ms", "100") // Задержка между retry 100мс
-        .set("request.timeout.ms", "30000") // Таймаут запроса 30 сек
+        .set("retry.backoff.ms", "100") // Задержка между retry 100мс // Таймаут запроса 30 сек
         .set("metadata.request.timeout.ms", "60000") // Таймаут метаданных 60 сек
         .create()?;
 
