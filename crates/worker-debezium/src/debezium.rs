@@ -540,9 +540,9 @@ fn create_kafka_consumer(brokers: &str, group: &str) -> Result<StreamConsumer> {
         .set("group.id", group)
         .set("enable.auto.commit", "false")
         .set("enable.partition.eof", "false")
-        .set("session.timeout.ms", "6000")
-        .set("heartbeat.interval.ms", "2000")
-        .set("max.poll.interval.ms", "300000")
+        .set("session.timeout.ms", "30000")
+        .set("heartbeat.interval.ms", "3000")
+        .set("max.poll.interval.ms", "600000")
         .set("fetch.min.bytes", "1")
         .set("fetch.max.bytes", "52428800") // 50MB
         .set("max.partition.fetch.bytes", "1048576") // 1MB
@@ -551,11 +551,15 @@ fn create_kafka_consumer(brokers: &str, group: &str) -> Result<StreamConsumer> {
         .set("queued.max.messages.kbytes", "1048576") // 1GB буфер
         .set("fetch.wait.max.ms", "500") // Максимальное время ожидания
         // Настройки для восстановления соединения
-        .set("reconnect.backoff.ms", "1000") // Начальная задержка 1 сек
-        .set("reconnect.backoff.max.ms", "10000") // Максимальная задержка 10 сек
-        .set("retry.backoff.ms", "100") // Задержка между retry 100мс
-        .set("request.timeout.ms", "30000") // Таймаут запроса 30 сек
-        .set("metadata.request.timeout.ms", "60000") // Таймаут метаданных 60 сек
+        .set("reconnect.backoff.ms", "500") // Начальная задержка 0.5 сек
+        .set("reconnect.backoff.max.ms", "5000") // Максимальная задержка 5 сек
+        .set("retry.backoff.ms", "50") // Задержка между retry 50 мс
+        .set("request.timeout.ms", "60000") // Таймаут запроса 60 сек
+        .set("metadata.request.timeout.ms", "120000") // Таймаут метаданных 120 сек
+        // Дополнительные настройки для стабильности
+        .set("socket.keepalive.enable", "true") // Включить keepalive
+        .set("socket.timeout.ms", "60000") // Таймаут сокета
+        .set("connections.max.idle.ms", "540000") // 9 минут до закрытия idle соединения
         .create::<StreamConsumer>()
         .map_err(|err| anyhow!("KafkaError: {}", err))
 }
