@@ -50,6 +50,7 @@ ALTER TABLE [table3] REPLICA IDENTITY DEFAULT;
         "transforms.Reroute.type": "org.apache.kafka.connect.transforms.RegexRouter",
         "transforms.Reroute.regex": "audit\\..*",
         "transforms.Reroute.replacement": "audit",
+        "heartbeat.interval.ms": "5000"
     },
 }
 ```

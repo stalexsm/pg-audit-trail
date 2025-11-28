@@ -1,17 +1,15 @@
-## 0.2.2 (2025-10-09)
+## Unreleased
+
+### Feat
+
+- Добавил в Dockerfile запуск с помошью tini. Также добавил настройки для recconect kafka. Добавлен скрипт start.sh для запуска приложения с помошью tini.
 
 ### Fix
 
+- Внес изменения в настроки consumer.
 - Доработка по определение path для разработки. Обновдение Rust 1.88 -> 1.90. Обновление зависимостей. Изменение метки bitnami/kafka -> bitnamilegacy/kafka.
 
-## 0.2.1 (2025-07-17)
-
-### Fix
-
-- Внес правки а docker-compose.yml и Dockerfile.
-- Переменные в Dockerfile
-
-## 0.2.0 (2025-07-16)
+## 0.2.1 (2025-07-18)
 
 ### Feat
 
@@ -20,6 +18,9 @@
 
 ### Fix
 
+- Bump package versions to 0.2.1
+- Внес правки а docker-compose.yml и Dockerfile.
+- Переменные в Dockerfile
 - Правки по рекомендации clippy
 
 ### Refactor
