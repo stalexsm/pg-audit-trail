@@ -54,47 +54,46 @@ ALTER TABLE [table3] REPLICA IDENTITY DEFAULT;
     },
 }
 ```
-```plantuml
-@startuml
+```mermaid
+flowchart LR
 
-!include <logos/kafka>
-!include <logos/java>
-!include <logos/postgresql>
-!include <logos/rust>
+Client[Client]
 
-actor Client #black
+subgraph Debezium
+  Api_D["Java API"]
+  D["Debezium Connect"]
+end
 
-package Debezium {
-  rectangle "<$java>\n\n   API" as Api_D
-  rectangle "  <$java>\n\nDebezium\n Connect" as D
-}
+subgraph M_Audit
+  W["Rust Worker"]
+  A["Rust API"]
+  PG[(PostgreSQL)]
+end
 
-package M_Audit {
-   rectangle  "<$rust>\n\nWorker" as W
-   rectangle "<$rust>\n\n   Api" as A
-   database "<$postgresql>" as PG
+subgraph M_Any
+  PG_ANY[(PostgreSQL)]
+  A_Any["API"]
+end
 
-   A <-down-> PG: Read
-   W -down-> PG: Write
-}
+K[(Kafka)]
 
-package M_Any {
-   database "<$postgresql>" as PG_ANY
-   rectangle "Api" as A_Any
+%% Client interaction
+Client --> A
 
-   A_Any <-> PG_ANY: Write/Read
-}
+%% M_Audit internal
+A -->|Read| PG
+W -->|Write| PG
 
-queue "<$kafka>" as K
+%% M_Any internal
+A_Any <--> |Write/Read| PG_ANY
 
-M_Any ..> Api_D: Добавление данных о БД в коннектор.
-PG_ANY -> D: CDC.
-D -down-> K: Debezium скидывает данные по топикам в kafka.
+%% Cross-system flows
+M_Any -.->|Добавление данных о БД в коннектор| Api_D
+PG_ANY -->|CDC| D
+D -->|Debezium скидывает данные по топикам в Kafka| K
 
-K -> W: Worker читает топики и обрабатывает.
-A_Any ..down..> K: Данные о выполнении запроса
+K -->|Worker читает топики и обрабатывает| W
+A_Any -.->|Данные о выполнении запроса| K
 
-A <-right-> Client
-
-@enduml
+@mermaid
 ```
