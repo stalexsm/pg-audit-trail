@@ -17,21 +17,19 @@ WORKDIR /app
 # Install host build dependencies.
 RUN apk add --no-cache clang lld musl-dev git openssl-dev pkgconfig curl openssl-libs-static
 
+# Исходники и миграции копируются COPY (не bind mounts): содержимое COPY
+# участвует в ключе кэша слоя, а bind mounts слой не инвалидируют — без этого
+# слой переиспользовался бы со старым бинарником (например, с устаревшим
+# набором миграций, встроенных макросом sqlx::migrate! при компиляции).
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY migrations ./migrations
+
 # Build the application.
-# Leverage a cache mount to /usr/local/cargo/registry/
-# for downloaded dependencies, a cache mount to /usr/local/cargo/git/db
-# for git repository dependencies, and a cache mount to /app/target/ for
-# compiled dependencies which will speed up subsequent builds.
-# Leverage a bind mount to the src directory to avoid having to copy the
-# source code into the container. Once built, copy the executable to an
-# output directory before the cache mounted /app/target is unmounted.
+# Кэш-маунты (target, git db, registry) дают инкрементальность между сборками.
 # Каталог migrations нужен на этапе сборки: макрос sqlx::migrate! встраивает
 # миграции в бинарник при компиляции.
-RUN --mount=type=bind,source=crates,target=crates \
-    --mount=type=bind,source=Cargo.toml,target=Cargo.toml \
-    --mount=type=bind,source=Cargo.lock,target=Cargo.lock,rw \
-    --mount=type=bind,source=migrations,target=migrations \
-    --mount=type=cache,target=/app/target/ \
+RUN --mount=type=cache,target=/app/target/ \
     --mount=type=cache,target=/usr/local/cargo/git/db \
     --mount=type=cache,target=/usr/local/cargo/registry/ \
     cargo build --release && \
