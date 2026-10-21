@@ -100,6 +100,8 @@ pub async fn setup_journal(pool: &PgPool) {
 #[derive(Debug, Clone)]
 pub struct SeedRow {
     pub id: Uuid,
+    /// Имя источника; пустая строка — строка до переезда (источник неизвестен).
+    pub source: String,
     pub database: String,
     pub schema: String,
     pub table: String,
@@ -118,6 +120,7 @@ impl SeedRow {
     pub fn new(operation: &str, created_at: DateTime<Utc>) -> Self {
         Self {
             id: Uuid::new_v4(),
+            source: String::new(),
             database: "client_db".to_string(),
             schema: "public".to_string(),
             table: "orders".to_string(),
@@ -141,11 +144,12 @@ pub async fn insert_row(pool: &PgPool, row: &SeedRow) {
 
     sqlx::query(
         "INSERT INTO changes \
-         (id, database, schema, \"table\", primary_key, operation, before, after, context, \
+         (id, source, database, schema, \"table\", primary_key, operation, before, after, context, \
           trace_id, committed_at, created_at, transaction_id, position) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
     )
     .bind(row.id)
+    .bind(&row.source)
     .bind(&row.database)
     .bind(&row.schema)
     .bind(&row.table)

@@ -61,6 +61,9 @@ const TARGET_COLUMNS: &[(&str, &str, &str)] = &[
     ("commit_lsn", "bigint", "YES"),
     ("event_index", "integer", "YES"),
     ("trace_id", "character varying", "YES"),
+    // Ключ источника (ADR-0005, тикет #29): пустая строка — источник
+    // неизвестен (строки до переезда на мультиисточность).
+    ("source", "character varying", "NO"),
     // Колонка сохраняет смысл «LSN события»
     ("position", "bigint", "NO"),
 ];
@@ -142,6 +145,7 @@ async fn target_changes_schema_is_applied() {
             "commit_lsn",
             "event_index",
             "trace_id",
+            "source",
         ],
         "неожиданный состав колонок changes"
     );
@@ -160,6 +164,22 @@ async fn target_changes_schema_is_applied() {
         trace_id_index.to_uppercase().contains("USING BTREE")
             && trace_id_index.to_uppercase().contains("TRACE_ID"),
         "changes_trace_id_index должен быть btree по trace_id: {trace_id_index}"
+    );
+
+    // Btree-индекс по ключу источника: фильтр чтения журнала — равенство.
+    let source_index: String = sqlx::query_scalar(
+        "SELECT indexdef \
+         FROM pg_indexes \
+         WHERE schemaname = 'public' AND tablename = 'changes' \
+           AND indexname = 'changes_source_index'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("индекс changes_source_index не найден");
+    assert!(
+        source_index.to_uppercase().contains("USING BTREE")
+            && source_index.to_uppercase().contains("SOURCE"),
+        "changes_source_index должен быть btree по source: {source_index}"
     );
 
     // Реестр источников (ADR-0005, тикет #28): состав колонок и правило
@@ -204,7 +224,9 @@ async fn target_changes_schema_is_applied() {
         "правило имён слотов в схеме: {slot_rule}"
     );
 
-    // Уникальный констрейнт дедупликации по (commit_lsn, event_index).
+    // Уникальные констрейнты журнала включают ключ источника (ADR-0005):
+    // LSN и txid разных серверов коллидируют, без ключа вставка второго
+    // источника падает.
     let constraint_def: String = sqlx::query_scalar(
         "SELECT pg_get_constraintdef(oid) \
          FROM pg_constraint \
@@ -216,8 +238,23 @@ async fn target_changes_schema_is_applied() {
     .expect("констрейнт changes_commit_lsn_event_index_unique не найден");
     assert_eq!(
         constraint_def.replace(' ', "").to_lowercase(),
-        "unique(commit_lsn,event_index)",
+        "unique(source,commit_lsn,event_index)",
         "неожиданное определение констрейнта дедупликации: {constraint_def}"
+    );
+
+    let position_def: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid) \
+         FROM pg_constraint \
+         WHERE conrelid = 'public.changes'::regclass \
+           AND conname = 'changes_position_table_schema_database_operation_unique'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("констрейнт changes_position_table_schema_database_operation_unique не найден");
+    assert_eq!(
+        position_def.replace(' ', "").to_lowercase(),
+        "unique(source,\"position\",\"table\",schema,database,operation)",
+        "неожиданное определение констрейнта позиции: {position_def}"
     );
 
     // Функционально: replay-дубль по дедуп-ключу гасится, а строки старого
@@ -265,7 +302,49 @@ async fn target_changes_schema_is_applied() {
         "строки с (NULL, NULL) не должны конфликтовать по дедуп-ключу"
     );
 
+    // Одинаковый дедуп-ключ у разных источников не конфликтует: строки
+    // разводит ключ источника (ADR-0005, тикет #29), как при вставке
+    // изменений двух серверов с коллидирующими LSN.
+    let other_source = sqlx::query(
+        "INSERT INTO changes \
+         (source, database, schema, \"table\", operation, before, after, context, \
+          transaction_id, position, commit_lsn, event_index) \
+         VALUES ('client_b', 'db', 'public', 't', 'CREATE', '{}', '{}', '{}', 1, 5, 100, 0) \
+         ON CONFLICT DO NOTHING",
+    )
+    .execute(&pool)
+    .await
+    .expect("вставка строки второго источника")
+    .rows_affected();
+    assert_eq!(
+        other_source, 1,
+        "строка другого источника с тем же дедуп-ключом должна вставиться"
+    );
+    let other_source_replay = sqlx::query(
+        "INSERT INTO changes \
+         (source, database, schema, \"table\", operation, before, after, context, \
+          transaction_id, position, commit_lsn, event_index) \
+         VALUES ('client_b', 'db', 'public', 't', 'CREATE', '{}', '{}', '{}', 1, 5, 100, 0) \
+         ON CONFLICT DO NOTHING",
+    )
+    .execute(&pool)
+    .await
+    .expect("повторная вставка строки второго источника")
+    .rows_affected();
+    assert_eq!(
+        other_source_replay, 0,
+        "replay-дубль второго источника гасится своим дедуп-ключом"
+    );
+
     // История миграций чистая: полный цикл down/up проходит на той же БД.
+    // Пробные строки двух источников убираются: на смешанных по источникам
+    // данных откат невозможен по определению — старые констрейнты не
+    // разводят совпадающие LSN (см. комментарий в down-миграции), а молча
+    // удалять строки журнала откат не имеет права.
+    sqlx::query("DELETE FROM changes")
+        .execute(&pool)
+        .await
+        .expect("очистка пробных строк перед откатом миграций");
     let migrator = sqlx::migrate!("../../migrations");
     migrator
         .undo(&pool, 0)

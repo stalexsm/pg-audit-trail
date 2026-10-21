@@ -18,6 +18,8 @@ pub(crate) type TimeRange = (Option<DateTime<chrono::Utc>>, Option<DateTime<chro
 #[derive(Debug, Clone, Serialize, FromRow, ToSchema)]
 pub struct ChangeRowDTO {
     pub id: Uuid,
+    /// Имя источника журнала; пустая строка — источник неизвестен (ADR-0005).
+    pub source: String,
     pub database: String,
     pub schema: String,
     pub table: String,
@@ -71,6 +73,11 @@ pub struct QChange {
 
     /// Идентификатор сквозной операции: вся операция целиком — все изменения строк транзакции.
     pub trace_id: Option<String>,
+
+    /// Имя источника журнала; строки без источника (до переезда на
+    /// мультиисточность, пустая строка в журнале) в выборку не попадают;
+    /// пустое значение параметра — без фильтра.
+    pub source: Option<String>,
 
     /// Имя таблицы, без учёта регистра.
     pub table: Option<String>,
@@ -181,6 +188,8 @@ fn validate_sortable(val: &str) -> Result<(), ValidationError> {
 #[derive(Debug, Clone, Serialize, FromRow, ToSchema)]
 pub struct ChangeDetailDTO {
     pub id: Uuid,
+    /// Имя источника журнала; пустая строка — источник неизвестен (ADR-0005).
+    pub source: String,
     pub database: String,
     pub schema: String,
     pub table: String,
@@ -413,6 +422,7 @@ mod tests {
         QChange {
             page: 1,
             per_page: 25,
+            source: None,
             trace_id: None,
             table: None,
             operation: None,

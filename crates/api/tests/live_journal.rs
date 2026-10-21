@@ -3,8 +3,8 @@
 //! Требует поднятой инфраструктуры: `docker compose up -d`. Роутер axum
 //! проверяется против живого тестового Postgres; журнал сидируется чистым
 //! SQL. Истина — HTTP-ответы: список журнала с пагинацией, сортировкой и
-//! фильтрами (trace_id, таблица, операция, время, вхождение в `context`),
-//! только изменения строк (ADR-0004), детальная, 404.
+//! фильтрами (источник, trace_id, таблица, операция, время, вхождение в
+//! `context`), только изменения строк (ADR-0004), детальная, 404.
 
 mod common;
 
@@ -364,6 +364,83 @@ async fn empty_journal_gives_empty_page() {
     assert_eq!(body["page"], 1);
     assert_eq!(body["pages"], 0);
     assert_eq!(body["rows"], json!([]));
+
+    drop_db(&connect_admin(&audit_admin_url()).await, &db_name).await;
+}
+
+#[tokio::test]
+async fn filter_by_source() {
+    let (pool, db_name, router) = spawn_env("source").await;
+
+    // Два источника (ADR-0005): имена баз у клиентов совпадают, разводит
+    // их только ключ источника. Третья строка — до переезда, источник
+    // неизвестен (пустая строка, как у всех строк старого пайплайна).
+    let mut alpha = row("CREATE", "orders", json!({}), at(15, 9));
+    alpha.source = "client_alpha".to_string();
+    let mut beta = row("CREATE", "orders", json!({}), at(15, 10));
+    beta.source = "client_beta".to_string();
+    let legacy = row("UPDATE", "orders", json!({}), at(15, 11));
+    for r in [&alpha, &beta, &legacy] {
+        insert_row(&pool, r).await;
+    }
+
+    // Фильтр по источнику возвращает только его строки, источник виден
+    // и в строке ответа.
+    let (status, body) = get_json(router.clone(), "/api/changes?source=client_alpha").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["pages"], 1);
+    let rows = body["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "только строки client_alpha");
+    assert_eq!(rows[0]["id"], json!(alpha.id));
+    assert_eq!(rows[0]["source"], "client_alpha");
+
+    // Второй источник не путается с первым, хотя базы у клиентов
+    // называются одинаково.
+    let (status, body) = get_json(router.clone(), "/api/changes?source=client_beta").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "только строки client_beta");
+    assert_eq!(rows[0]["id"], json!(beta.id));
+
+    // Пустое значение параметра — как без фильтра, а не «только
+    // безымянные»: именованные источники не прячутся случайно.
+    let (status, body) = get_json(router.clone(), "/api/changes?source=&per_page=200").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["rows"].as_array().expect("rows").len(),
+        3,
+        "пустой параметр источника — отсутствие фильтра"
+    );
+
+    // Без фильтра читается весь журнал, включая старые строки.
+    let (status, body) = get_json(router.clone(), "/api/changes").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 3, "все источники и строки до переезда");
+
+    // Несуществующий источник — пустая страница, а не ошибка.
+    let (status, body) = get_json(router.clone(), "/api/changes?source=no_such_source").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["rows"], json!([]));
+
+    // Комбинация с другим фильтром.
+    let mut users = row("UPDATE", "users", json!({}), at(15, 12));
+    users.source = "client_alpha".to_string();
+    insert_row(&pool, &users).await;
+    let (status, body) = get_json(
+        router.clone(),
+        "/api/changes?source=client_alpha&table=USERS",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "источник + таблица, без учёта регистра");
+    assert_eq!(rows[0]["id"], json!(users.id));
+
+    // Источник виден и в детальной строке.
+    let (status, body) = get_json(router.clone(), &format!("/api/changes/{}", beta.id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["source"], "client_beta");
 
     drop_db(&connect_admin(&audit_admin_url()).await, &db_name).await;
 }

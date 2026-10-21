@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::{
     AppError, AppResult,
     dto::{ChangeDetailDTO, ChangePageDTO, QChange, QSourceCreate, QSourcePatch, SourceDTO},
-    repositories::{ChangeRepo, JournalQuery, SourceCreate, SourcePatch, SourceRepo},
+    repositories::{ChangeQuery, ChangeRepo, SourceCreate, SourcePatch, SourceRepo},
 };
 
 /// Список журнала: изменения строк источника с пагинацией,
@@ -25,9 +25,15 @@ pub async fn get_list_changes(
     let time_range = q.time_range()?;
     let descending = q.descending();
 
-    let query = JournalQuery {
+    // Пустое значение параметра — отсутствие фильтра: `?source=` не должен
+    // случайно спрятать все именованные источники или стать выборкой
+    // «только безымянные».
+    let source = q.source.filter(|s| !s.is_empty());
+
+    let query = ChangeQuery {
         page: q.page,
         per_page: q.per_page,
+        source,
         trace_id: q.trace_id,
         table: q.table,
         operation: q.operation,
