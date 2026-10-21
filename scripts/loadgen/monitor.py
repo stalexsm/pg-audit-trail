@@ -50,7 +50,8 @@ class SampleState:
 
 def fetch_row(conn, query, params=()):
     """Первая строка результата; пустой результат — ошибка."""
-    row = conn.execute(query, params).fetchone()
+    # Параметризованный запрос: значения через плейсхолдеры — SKY-D211 ложный.
+    row = conn.execute(query, params).fetchone()  # skylos: ignore[SKY-D211]
     if row is None:
         raise RuntimeError(f"запрос не вернул строк: {query!r}")
     return row

@@ -107,17 +107,20 @@ def table_ident(table: str) -> sql.Identifier:
     return sql.Identifier(*table.split("."))
 
 
-def payload_expr(bytes_size: int) -> sql.SQL:
-    """SQL-выражение случайного payload заданного размера: 32-байтовые блоки md5."""
+def payload_expr(bytes_size: int) -> sql.Composable:
+    """SQL-выражение случайного payload заданного размера: 32-байтовые блоки md5.
+
+    Числа подставляются через sql.Literal (композиция psycopg) — строкового
+    вклеивания нет.
+    """
     blocks = max(1, bytes_size // 32)
     remainder = bytes_size - blocks * 32
-    expr = f"repeat(md5(random()::text), {blocks})"
+    expr = sql.SQL("repeat(md5(random()::text), {})").format(sql.Literal(blocks))
     if remainder:
-        expr += f" || left(md5(random()::text), {remainder})"
-    # Выражение собрано из целочисленных аргументов, идентификаторов и
-    # пользовательских строк в нём нет — LiteralString-ограничение psycopg
-    # здесь обходится сознательно.
-    return sql.SQL(expr)  # ty: ignore[invalid-argument-type]
+        expr += sql.SQL(" || left(md5(random()::text), {})").format(
+            sql.Literal(remainder)
+        )
+    return expr
 
 
 def fetch_scalar(conn, query, params=()):
@@ -136,7 +139,9 @@ def setup_table(conn, table):
     """
     ident = table_ident(table)
     with conn.transaction():
-        conn.execute(
+        # sql.Identifier подставляет идентификатор параметризованно, строковых
+        # значений в тексте SQL нет — SKY-D211 здесь ложное срабатывание.
+        conn.execute(  # skylos: ignore[SKY-D211]
             sql.SQL(
                 "CREATE TABLE IF NOT EXISTS {} ("
                 "id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "
@@ -144,7 +149,9 @@ def setup_table(conn, table):
                 "created_at timestamptz NOT NULL DEFAULT now())"
             ).format(ident)
         )
-        conn.execute(sql.SQL("ALTER TABLE {} REPLICA IDENTITY FULL").format(ident))
+        conn.execute(  # skylos: ignore[SKY-D211]
+            sql.SQL("ALTER TABLE {} REPLICA IDENTITY FULL").format(ident)
+        )
     # pg_get_serial_sequence принимает имя таблицы строкой-параметром,
     # а не идентификатором в тексте запроса.
     sequence = fetch_scalar(conn, "SELECT pg_get_serial_sequence(%s, 'id')", (table,))
@@ -227,7 +234,10 @@ def session_loop(args, table, sequence, stop, stats, session_id):
                         query = update_query if update else delete_query
                         rows = conn.execute(query, (low, high)).rowcount
                     else:
-                        conn.execute(insert_query, (args.rows_per_tx,))
+                        # Параметризованный запрос: значения через плейсхолдеры %s.
+                        conn.execute(  # skylos: ignore[SKY-D211]
+                            insert_query, (args.rows_per_tx,)
+                        )
                         rows = args.rows_per_tx
                 stats.add(rows, 1 if emit_message else 0)
     except psycopg.Error as error:
