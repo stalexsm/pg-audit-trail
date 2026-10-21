@@ -22,6 +22,9 @@ pub const MAX_TRACE_ID_LEN: usize = 255;
 /// Строка журнала, подготовленная к вставке в `changes`.
 #[derive(Debug, Clone)]
 pub struct ChangeRow {
+    /// Ключ источника журнала — имя из реестра (ADR-0005): LSN и txid
+    /// разных серверов коллидируют, дедуп-ключи журнала включают источник.
+    pub source: String,
     pub database: String,
     pub schema: String,
     pub table: String,
@@ -114,10 +117,8 @@ impl TransactionBuffer {
         }
     }
 
-    pub fn rows(&self) -> &[ChangeRow] {
-        &self.rows
-    }
-
+    /// Забирает накопленные строки, очищая буфер (счётчик событий
+    /// сохраняется).
     pub fn take_rows(&mut self) -> Vec<ChangeRow> {
         std::mem::take(&mut self.rows)
     }
@@ -224,12 +225,13 @@ async fn flush_once(
     for chunk in rows.chunks(batch_size.max(1)) {
         let mut builder = QueryBuilder::new(
             "INSERT INTO changes \
-             (database, schema, \"table\", primary_key, operation, before, after, context, \
+             (source, database, schema, \"table\", primary_key, operation, before, after, context, \
               committed_at, queued_at, transaction_id, position, commit_lsn, event_index, \
               trace_id) ",
         );
         builder.push_values(chunk, |mut b, row| {
-            b.push_bind(&row.database)
+            b.push_bind(&row.source)
+                .push_bind(&row.database)
                 .push_bind(&row.schema)
                 .push_bind(&row.table)
                 .push_bind(&row.primary_key)
@@ -271,6 +273,7 @@ mod tests {
     /// Строка журнала с заданной операцией для тестов агрегатора.
     fn journal_row_fixture(operation: &'static str) -> ChangeRow {
         ChangeRow {
+            source: "client_a".into(),
             database: "db".into(),
             schema: "public".into(),
             table: "t".into(),
@@ -309,7 +312,7 @@ mod tests {
         assert_eq!(buffer.xid, 77);
         assert_eq!(buffer.next_index(), 0);
         assert_eq!(buffer.next_index(), 1);
-        assert!(buffer.rows().is_empty());
+        assert!(buffer.take_rows().is_empty());
     }
 
     #[test]
@@ -317,11 +320,10 @@ mod tests {
         let mut buffer = TransactionBuffer::new(1);
         buffer.next_index();
         buffer.push_row(journal_row_fixture("TRUNCATE"));
-        assert_eq!(buffer.rows().len(), 1);
         let rows = buffer.take_rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].event_index, 0);
-        assert!(buffer.rows().is_empty());
+        assert!(buffer.take_rows().is_empty());
         assert_eq!(buffer.next_index(), 1, "счётчик событий не сбрасывается");
     }
 

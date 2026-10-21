@@ -3,40 +3,21 @@ use serde::Deserialize;
 
 use crate::Result;
 
-/// Конфигурация воркера CDC: собирается из окружения поверх дефолтов
-/// (крейт `config`; URL баз — без префикса, настройки воркера — `CDC_*`).
+/// Таймаут взятия соединения из пулов БД, секунды (общий для супервизора
+/// и задач источников).
+pub(crate) const DB_ACQUIRE_TIMEOUT_SECS: u64 = 30;
+
+/// Глобальная конфигурация воркера: собирается из окружения поверх дефолтов
+/// (крейт `config`). Настройки источников — строки подключения, служебные
+/// таблицы, префикс MESSAGE, размер батча — из окружения не читаются:
+/// их единственный источник правды — реестр источников в БД аудита (ADR-0005).
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkerConfig {
-    /// Подключение к БД аудита (`DATABASE_URL`).
+    /// Подключение к БД аудита (`DATABASE_URL`): журнал, реестр источников,
+    /// чекпоинты.
     pub database_url: String,
 
-    /// Подключение к БД-источнику CDC (`SOURCE_DATABASE_URL`).
-    pub source_database_url: String,
-
-    /// Имя слота логической репликации (`CDC_SLOT`).
-    #[serde(default = "default_slot")]
-    pub slot: String,
-
-    /// Имя публикации на источнике (`CDC_PUBLICATION`).
-    #[serde(default = "default_publication")]
-    pub publication: String,
-
-    /// Префикс MESSAGE, интерпретируемого как канал контекста транзакции
-    /// (`CDC_MESSAGE_PREFIX`); MESSAGE с другими префиксами только расходует
-    /// индекс события, строкам контекст не меняет.
-    #[serde(default = "default_message_prefix")]
-    pub message_prefix: String,
-
-    /// Игнорируемые (служебные) таблицы источника в виде `schema.table`
-    /// (`CDC_IGNORE_TABLES`, через запятую).
-    #[serde(default = "default_ignore_tables")]
-    pub ignore_tables: Vec<String>,
-
-    /// Размер чанка батчевой вставки строк в журнал (`CDC_BATCH_SIZE`).
-    #[serde(default = "default_batch_size")]
-    pub batch_size: usize,
-
-    /// Начальная пауза реконнекта после обрыва соединения с источником,
+    /// Начальная пауза реконнекта задачи источника после обрыва соединения,
     /// в миллисекундах (`CDC_RECONNECT_INITIAL_BACKOFF_MS`).
     #[serde(default = "default_reconnect_initial_backoff_ms")]
     pub reconnect_initial_backoff_ms: u64,
@@ -45,34 +26,6 @@ pub struct WorkerConfig {
     /// в миллисекундах (`CDC_RECONNECT_MAX_BACKOFF_MS`).
     #[serde(default = "default_reconnect_max_backoff_ms")]
     pub reconnect_max_backoff_ms: u64,
-}
-
-fn default_slot() -> String {
-    "waltrail".to_owned()
-}
-
-fn default_publication() -> String {
-    "audit".to_owned()
-}
-
-/// Префикс MESSAGE контекста транзакции: исторически `_audit`, как
-/// в легаси-пайплайне.
-fn default_message_prefix() -> String {
-    "_audit".to_owned()
-}
-
-/// Служебные таблицы типовых миграторов: в журнал они не попадают.
-fn default_ignore_tables() -> Vec<String> {
-    vec![
-        "public.alembic_version".to_owned(),
-        "public.schema_migrations".to_owned(),
-        "public._sqlx_migrations".to_owned(),
-        "public.django_migrations".to_owned(),
-    ]
-}
-
-fn default_batch_size() -> usize {
-    500
 }
 
 fn default_reconnect_initial_backoff_ms() -> u64 {
@@ -84,18 +37,18 @@ fn default_reconnect_max_backoff_ms() -> u64 {
 }
 
 impl WorkerConfig {
-    /// Читает конфигурацию из окружения: без префикса — URL баз,
-    /// с префиксом `CDC_` — настройки воркера.
+    /// Читает конфигурацию из окружения: без префикса — URL БД аудита,
+    /// с префиксом `CDC_` — глобальные настройки воркера. Источниковые
+    /// настройки из окружения не читаются вовсе (ADR-0005).
     pub fn from_env() -> Result<Self> {
         let settings = config::Config::builder()
             .add_source(Environment::default())
             .add_source(
                 Environment::with_prefix("CDC")
-                    .try_parsing(true)
-                    // Без with_list_parse_key список-парсинг превращает в
-                    // Vec<String> все CDC_* значения, ломая строковые поля.
-                    .list_separator(",")
-                    .with_list_parse_key("ignore_tables"),
+                    // Числовые значения CDC_* приходят строками: без
+                    // try_parsing «250» не приводится к u64 и поле молча
+                    // остаётся на дефолте.
+                    .try_parsing(true),
             )
             .build()?;
 
@@ -107,38 +60,52 @@ impl WorkerConfig {
 mod tests {
     use super::*;
 
-    /// CDC_* строки приходят строками, а не списками: список — только
-    /// ignore_tables. Регрессия config-rs: list_separator + try_parsing
-    /// без with_list_parse_key превращает все CDC_* значения в Vec<String>,
-    /// и любой заданный оператором CDC_SLOT валил воркер.
+    /// Из окружения читаются только глобальные настройки; переехавшие в
+    /// реестр переменные (`SOURCE_DATABASE_URL`, `CDC_SLOT`, …) воркером
+    /// больше не читаются — их наличие не влияет на конфигурацию.
     #[test]
-    fn env_strings_stay_strings_and_only_ignore_tables_is_a_list() {
+    fn env_reads_only_global_settings() {
         // Глобальное состояние окружения: правка безопасна — других
-        // env-тестов в этом бинарнике нет.
+        // env-тестов в этом бинарнике нет; значения возвращаются в конце.
         unsafe {
             std::env::set_var("DATABASE_URL", "postgresql://audit/db");
+            std::env::set_var("CDC_RECONNECT_INITIAL_BACKOFF_MS", "250");
+            std::env::set_var("CDC_RECONNECT_MAX_BACKOFF_MS", "45000");
             std::env::set_var("SOURCE_DATABASE_URL", "postgresql://src/db");
-            std::env::set_var("CDC_SLOT", "survival-slot");
+            std::env::set_var("CDC_SLOT", "legacy-slot");
+            std::env::set_var("CDC_PUBLICATION", "legacy-pub");
+            std::env::set_var("CDC_MESSAGE_PREFIX", "_legacy");
             std::env::set_var("CDC_IGNORE_TABLES", "public.a,public.b");
+            std::env::set_var("CDC_BATCH_SIZE", "42");
         }
 
         let config = WorkerConfig::from_env().expect("конфиг из окружения");
-        assert_eq!(config.slot, "survival-slot");
-        assert_eq!(config.publication, "audit");
-        assert_eq!(
-            config.message_prefix, "_audit",
-            "без CDC_MESSAGE_PREFIX — исторический дефолт"
-        );
-        assert_eq!(
-            config.ignore_tables,
-            vec!["public.a".to_owned(), "public.b".to_owned()]
-        );
+        assert_eq!(config.database_url, "postgresql://audit/db");
+        assert_eq!(config.reconnect_initial_backoff_ms, 250);
+        assert_eq!(config.reconnect_max_backoff_ms, 45_000);
 
-        // Префикс MESSAGE-канала контекста переопределяется из окружения.
         unsafe {
-            std::env::set_var("CDC_MESSAGE_PREFIX", "_ctx");
+            std::env::remove_var("DATABASE_URL");
+            std::env::remove_var("CDC_RECONNECT_INITIAL_BACKOFF_MS");
+            std::env::remove_var("CDC_RECONNECT_MAX_BACKOFF_MS");
+            std::env::remove_var("SOURCE_DATABASE_URL");
+            std::env::remove_var("CDC_SLOT");
+            std::env::remove_var("CDC_PUBLICATION");
+            std::env::remove_var("CDC_MESSAGE_PREFIX");
+            std::env::remove_var("CDC_IGNORE_TABLES");
+            std::env::remove_var("CDC_BATCH_SIZE");
         }
-        let config = WorkerConfig::from_env().expect("конфиг из окружения");
-        assert_eq!(config.message_prefix, "_ctx");
+    }
+
+    /// Без переопределений — дефолты реконнекта.
+    #[test]
+    fn reconnect_defaults() {
+        let config = WorkerConfig {
+            database_url: "postgresql://audit/db".to_owned(),
+            reconnect_initial_backoff_ms: default_reconnect_initial_backoff_ms(),
+            reconnect_max_backoff_ms: default_reconnect_max_backoff_ms(),
+        };
+        assert_eq!(config.reconnect_initial_backoff_ms, 1_000);
+        assert_eq!(config.reconnect_max_backoff_ms, 30_000);
     }
 }

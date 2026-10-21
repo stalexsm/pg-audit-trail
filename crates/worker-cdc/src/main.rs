@@ -45,11 +45,9 @@ async fn main() -> anyhow::Result<()> {
 
     let config = WorkerConfig::from_env().context("переменные окружения воркера CDC")?;
     info!(
-        slot = %config.slot,
-        publication = %config.publication,
-        ignore_tables = ?config.ignore_tables,
-        batch_size = config.batch_size,
-        "Конфигурация воркера CDC"
+        reconnect_initial_backoff_ms = config.reconnect_initial_backoff_ms,
+        reconnect_max_backoff_ms = config.reconnect_max_backoff_ms,
+        "worker-cdc: супервизор источников — настройки источников читаются из реестра (ADR-0005)"
     );
 
     // Graceful shutdown по SIGTERM/SIGINT.
@@ -76,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
     info!("Запуск worker-cdc...");
 
     if let Err(e) = worker_cdc::run(config, cancellation_token).await {
-        error!(error = %e, "Ошибка в цикле репликации worker-cdc!");
+        error!(error = %e, "Ошибка супервизора worker-cdc!");
     }
 
     info!("worker-cdc завершён");

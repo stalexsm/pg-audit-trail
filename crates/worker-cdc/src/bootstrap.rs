@@ -4,6 +4,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 use crate::Result;
+use crate::registry::SourceRecord;
 
 /// Результат бутстрапа: данные для запуска репликации.
 pub struct Bootstrap {
@@ -18,17 +19,51 @@ pub struct Bootstrap {
     pub server_major: u32,
 }
 
-/// Убеждается в существовании слота репликации и читает точку старта.
-///
-/// Источник истины — чекпоинт в БД аудита; при старте берётся меньшая из
-/// координат (чекпоинт, `confirmed_flush_lsn` слота), чтобы после сбоя
-/// и/или лага слота не потерять события.
-pub async fn bootstrap(audit: &PgPool, source: &PgPool, slot: &str) -> Result<Bootstrap> {
+/// Бутстрап при подхвате источника (ADR-0005): только воркер ходит в
+/// клиентскую БД, поэтому публикация и слот создаются им же. Источник и
+/// истина координаты старта — чекпоинт в БД аудита; при старте берётся
+/// меньшая из координат (чекпоинт, `confirmed_flush_lsn` слота), чтобы
+/// после сбоя и/или лага слота не потерять события.
+pub async fn bootstrap(
+    audit: &PgPool,
+    source: &PgPool,
+    record: &SourceRecord,
+) -> Result<Bootstrap> {
+    let publication = record.publication();
+    let slot = record.slot();
     let (source_database, version_num): (String, i32) =
         sqlx::query_as("SELECT current_database(), current_setting('server_version_num')::int")
             .fetch_one(source)
             .await
             .context("параметры источника CDC")?;
+
+    // Публикация создаётся при подхвате (ADR-0005): FOR ALL TABLES, чтобы
+    // новые таблицы клиента попадали в поток без правок; фильтрация
+    // служебных таблиц — на стороне воркера (игнор-лист источника).
+    let publication_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)")
+            .bind(&publication)
+            .fetch_one(source)
+            .await
+            .context("проверка публикации источника")?;
+    if publication_exists {
+        info!(publication, "публикация уже существует");
+    } else {
+        // Имя публикации деривировано из имени источника, проверенного
+        // правилом слотов [a-z0-9_] (CHECK в схеме реестра) — инъекции нет.
+        let create = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE PUBLICATION \"{publication}\" FOR ALL TABLES"
+        )));
+        match create.execute(source).await {
+            Ok(_) => info!(publication, "публикация создана"),
+            // Повторный бутстрап после падения между проверкой и созданием:
+            // существование публикации — успех.
+            Err(e) if is_duplicate_object(&e) => {
+                info!(publication, "публикация уже создана параллельно")
+            }
+            Err(e) => return Err(anyhow::Error::new(e).context("создание публикации")),
+        }
+    }
 
     // Слот создаётся, только если его ещё нет: волатильная функция в списке
     // выборки не вычисляется для отфильтрованных WHERE строк.
@@ -37,7 +72,7 @@ pub async fn bootstrap(audit: &PgPool, source: &PgPool, slot: &str) -> Result<Bo
          FROM pg_create_logical_replication_slot($1, 'pgoutput') \
          WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
     )
-    .bind(slot)
+    .bind(&slot)
     .fetch_optional(source)
     .await
     .context("создание слота репликации")?;
@@ -50,14 +85,14 @@ pub async fn bootstrap(audit: &PgPool, source: &PgPool, slot: &str) -> Result<Bo
     let confirmed: Option<String> = sqlx::query_scalar(
         "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
     )
-    .bind(slot)
+    .bind(&slot)
     .fetch_optional(source)
     .await
     .context("чтение confirmed_flush_lsn слота")?;
 
     let checkpoint: Option<i64> =
         sqlx::query_scalar("SELECT last_commit_lsn FROM checkpoints WHERE name = $1")
-            .bind(slot)
+            .bind(&slot)
             .fetch_optional(audit)
             .await
             .context("чтение чекпоинта")?;
@@ -91,6 +126,15 @@ pub async fn bootstrap(audit: &PgPool, source: &PgPool, slot: &str) -> Result<Bo
         start_lsn,
         server_major: u32::try_from(version_num / 10_000).unwrap_or(17),
     })
+}
+
+/// Объект уже существует (42710 duplicate_object у `CREATE PUBLICATION`,
+/// 42P07 duplicate_table у прочих объектов) — гонка с параллельным
+/// созданием того же объекта: считаем существование успехом.
+fn is_duplicate_object(err: &sqlx::Error) -> bool {
+    err.as_database_error()
+        .and_then(|db| db.code())
+        .is_some_and(|code| code.as_ref() == "42710" || code.as_ref() == "42P07")
 }
 
 /// Имена колонок первичного ключа таблицы источника по OID отношения.

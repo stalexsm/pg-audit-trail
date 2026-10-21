@@ -14,8 +14,9 @@ use std::sync::Once;
 use std::time::Duration;
 
 use common::{
-    audit_admin_url, cleanup_leftovers, connect_db, drop_db, journal_duplicate_pairs, setup_source,
-    source_admin_url, spawn_db, wait_until,
+    application_name, audit_admin_url, cleanup_leftovers, connect_db, drop_db,
+    journal_duplicate_pairs, register_source_with, setup_source, source_admin_url, source_name,
+    source_slot, spawn_db, wait_sources_table, wait_until,
 };
 use sqlx::PgPool;
 use worker_cdc::WorkerConfig;
@@ -45,23 +46,11 @@ async fn connect_admin(url: &str) -> PgPool {
         .expect("нет подключения к стенду — поднимите `docker compose up -d`")
 }
 
-/// Конфиг воркера под сценарий выживания: уникальные БД и слот,
-/// маленький чанк батча, быстрый backoff для коротких тестов.
-fn worker_config(
-    audit_url: String,
-    source_url: String,
-    slot: String,
-    initial_backoff_ms: u64,
-    max_backoff_ms: u64,
-) -> WorkerConfig {
+/// Конфиг воркера под сценарий выживания: уникальная БД аудита и быстрый
+/// backoff для коротких тестов. Настройки источников — в реестре (ADR-0005).
+fn worker_config(audit_url: String, initial_backoff_ms: u64, max_backoff_ms: u64) -> WorkerConfig {
     WorkerConfig {
         database_url: audit_url,
-        source_database_url: source_url,
-        slot,
-        publication: "audit".to_owned(),
-        message_prefix: "_audit".to_owned(),
-        ignore_tables: vec!["public.schema_migrations".to_owned()],
-        batch_size: 2,
         reconnect_initial_backoff_ms: initial_backoff_ms,
         reconnect_max_backoff_ms: max_backoff_ms,
     }
@@ -103,18 +92,6 @@ async fn spawn_env(prefix: &str) -> (PgPool, PgPool, String, String, String, Str
         audit_name,
         source_name,
     )
-}
-
-/// application_name walsender-соединения воркера — формат из `replicate.rs`.
-fn application_name(slot: &str) -> String {
-    format!("waltrail-cdc-{slot}")
-}
-
-/// Короткий уникальный суффикс имени слота: сервер обрезает
-/// application_name до 63 байт (NAMEDATALEN), поэтому полный UUID не
-/// влезает и соединение не находится в pg_stat_replication точным совпадением.
-fn short_id() -> String {
-    uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
 }
 
 /// PID активного walsender-бэкенда слота в `pg_stat_replication`
@@ -207,15 +184,29 @@ async fn shutdown_cleanly(
 #[tokio::test]
 async fn hard_kill_and_restart_delivers_exactly_once() {
     init_logging();
-    let (audit_admin, source_admin, audit_url, source_url, audit_name, source_name) =
+    let (audit_admin, source_admin, audit_url, source_url, audit_name, source_db) =
         spawn_env("killrun").await;
     let source = connect_db(&source_url).await;
     let audit = connect_db(&audit_url).await;
-    let slot_name = format!("waltrail_kill_{}", short_id());
 
-    let config = worker_config(audit_url, source_url, slot_name.clone(), 1_000, 30_000);
+    let config = worker_config(audit_url.clone(), 1_000, 30_000);
     let token = tokio_util::sync::CancellationToken::new();
     let handle = tokio::spawn(worker_cdc::run(config.clone(), token.clone()));
+
+    // Регистрация источника после применения миграций; подхват — на опросе
+    // реестра, слот и публикация деривируются из имени.
+    wait_sources_table(&audit).await;
+    let source_key = source_name("kill");
+    let slot_name = source_slot(&source_key);
+    register_source_with(
+        &audit,
+        &source_key,
+        &source_url,
+        &["public.schema_migrations"],
+        "_audit",
+        2,
+    )
+    .await;
     wait_worker_ready(&audit, &source, &source_admin, &slot_name).await;
 
     // Первая половина потока до глушения.
@@ -264,7 +255,7 @@ async fn hard_kill_and_restart_delivers_exactly_once() {
 
     shutdown_cleanly(token2, handle2).await;
     drop_db(&audit_admin, &audit_name).await;
-    drop_db(&source_admin, &source_name).await;
+    drop_db(&source_admin, &source_db).await;
 }
 
 /// AC #3: принудительный обрыв соединения (pg_terminate_backend walsender)
@@ -272,16 +263,28 @@ async fn hard_kill_and_restart_delivers_exactly_once() {
 #[tokio::test]
 async fn forced_disconnect_reconnects_and_continues() {
     init_logging();
-    let (audit_admin, source_admin, audit_url, source_url, audit_name, source_name) =
+    let (audit_admin, source_admin, audit_url, source_url, audit_name, source_db) =
         spawn_env("reconnect").await;
     let source = connect_db(&source_url).await;
     let audit = connect_db(&audit_url).await;
-    let slot_name = format!("waltrail_reconnect_{}", short_id());
 
     // Быстрый backoff: реконнект не должен растянуть тест.
-    let config = worker_config(audit_url, source_url, slot_name.clone(), 200, 2_000);
+    let config = worker_config(audit_url.clone(), 200, 2_000);
     let token = tokio_util::sync::CancellationToken::new();
     let handle = tokio::spawn(worker_cdc::run(config, token.clone()));
+
+    wait_sources_table(&audit).await;
+    let source_key = source_name("reconnect");
+    let slot_name = source_slot(&source_key);
+    register_source_with(
+        &audit,
+        &source_key,
+        &source_url,
+        &["public.schema_migrations"],
+        "_audit",
+        2,
+    )
+    .await;
 
     let app_name = application_name(&slot_name);
     let first_pid = wait_worker_ready(&audit, &source, &source_admin, &slot_name).await;
@@ -321,7 +324,7 @@ async fn forced_disconnect_reconnects_and_continues() {
 
     shutdown_cleanly(token, handle).await;
     drop_db(&audit_admin, &audit_name).await;
-    drop_db(&source_admin, &source_name).await;
+    drop_db(&source_admin, &source_db).await;
 }
 
 /// AC #2: долгая пауза эмиттера не рвёт соединение. Пауза больше дефолтного
@@ -330,15 +333,27 @@ async fn forced_disconnect_reconnects_and_continues() {
 #[tokio::test]
 async fn idle_pause_does_not_break_connection() {
     init_logging();
-    let (audit_admin, source_admin, audit_url, source_url, audit_name, source_name) =
+    let (audit_admin, source_admin, audit_url, source_url, audit_name, source_db) =
         spawn_env("pause").await;
     let source = connect_db(&source_url).await;
     let audit = connect_db(&audit_url).await;
-    let slot_name = format!("waltrail_pause_{}", short_id());
 
-    let config = worker_config(audit_url, source_url, slot_name.clone(), 1_000, 30_000);
+    let config = worker_config(audit_url.clone(), 1_000, 30_000);
     let token = tokio_util::sync::CancellationToken::new();
     let handle = tokio::spawn(worker_cdc::run(config, token.clone()));
+
+    wait_sources_table(&audit).await;
+    let source_key = source_name("pause");
+    let slot_name = source_slot(&source_key);
+    register_source_with(
+        &audit,
+        &source_key,
+        &source_url,
+        &["public.schema_migrations"],
+        "_audit",
+        2,
+    )
+    .await;
 
     let app_name = application_name(&slot_name);
     let first_pid = wait_worker_ready(&audit, &source, &source_admin, &slot_name).await;
@@ -366,7 +381,7 @@ async fn idle_pause_does_not_break_connection() {
 
     shutdown_cleanly(token, handle).await;
     drop_db(&audit_admin, &audit_name).await;
-    drop_db(&source_admin, &source_name).await;
+    drop_db(&source_admin, &source_db).await;
 }
 
 /// AC #4: SIGTERM (CancellationToken) останавливает воркер чисто; после
@@ -374,15 +389,27 @@ async fn idle_pause_does_not_break_connection() {
 #[tokio::test]
 async fn sigterm_restart_keeps_journal_complete() {
     init_logging();
-    let (audit_admin, source_admin, audit_url, source_url, audit_name, source_name) =
+    let (audit_admin, source_admin, audit_url, source_url, audit_name, source_db) =
         spawn_env("sigterm").await;
     let source = connect_db(&source_url).await;
     let audit = connect_db(&audit_url).await;
-    let slot_name = format!("waltrail_sigterm_{}", short_id());
 
-    let config = worker_config(audit_url, source_url, slot_name.clone(), 1_000, 30_000);
+    let config = worker_config(audit_url.clone(), 1_000, 30_000);
     let token = tokio_util::sync::CancellationToken::new();
     let handle = tokio::spawn(worker_cdc::run(config.clone(), token.clone()));
+
+    wait_sources_table(&audit).await;
+    let source_key = source_name("sigterm");
+    let slot_name = source_slot(&source_key);
+    register_source_with(
+        &audit,
+        &source_key,
+        &source_url,
+        &["public.schema_migrations"],
+        "_audit",
+        2,
+    )
+    .await;
     wait_worker_ready(&audit, &source, &source_admin, &slot_name).await;
 
     // Первая половина потока до сигнала.
@@ -464,5 +491,5 @@ async fn sigterm_restart_keeps_journal_complete() {
 
     shutdown_cleanly(token2, handle2).await;
     drop_db(&audit_admin, &audit_name).await;
-    drop_db(&source_admin, &source_name).await;
+    drop_db(&source_admin, &source_db).await;
 }

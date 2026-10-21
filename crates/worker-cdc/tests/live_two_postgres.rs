@@ -1,19 +1,22 @@
-//! Интеграционный тест шва №1 «живые два Postgres» (эпик #3, тикеты #6, #8 и #20).
+//! Интеграционный тест шва №1 «живые два Postgres» (эпик #3, тикеты #6, #8,
+//! #20 и #30).
 //!
 //! Требует поднятой инфраструктуры: `docker compose up -d` (db1 и db-src
-//! с проброшенными портами). Воркер запускается из библиотечной части
-//! поверх уникальных БД: на источнике эмитится нагрузка чистым SQL —
+//! с проброшенными портами). Воркер-супервизор запускается из библиотечной
+//! части поверх уникальных БД; источник регистрируется в реестре чистым SQL
+//! (как POST /api/sources). На источнике эмитится нагрузка чистым SQL —
 //! I/U/D/T, MESSAGE (`_audit` и чужие префиксы, несколько в одной
-//! транзакции) и вставки в игнорируемые таблицы; ассерты — по
-//! содержимому журнала `changes` в БД аудита.
+//! транзакции) и вставки в игнорируемые таблицы; ассерты — по содержимому
+//! журнала `changes` в БД аудита и статусам источника в реестре.
 
 mod common;
 
 use std::time::Duration;
 
 use common::{
-    audit_admin_url, cleanup_leftovers, connect_db, drop_db, setup_source, source_admin_url,
-    spawn_db, wait_until,
+    audit_admin_url, cleanup_leftovers, connect_db, drop_db, register_source_with, setup_source,
+    source_admin_url, source_name, source_publication, source_slot, spawn_db, wait_publication,
+    wait_slot, wait_sources_table, wait_until,
 };
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
@@ -40,25 +43,19 @@ async fn live_replication_ingests_changes_to_journal() {
 
     let (audit_url, audit_name) =
         spawn_db(&audit_admin, &audit_admin_url(), "waltrail_audit").await;
-    let (source_url, source_name) =
+    let (source_url, source_db) =
         spawn_db(&source_admin, &source_admin_url(), "waltrail_src").await;
 
-    // Слот уникален на прогон: остатки прошлых запусков не должны мешать.
-    let slot_name = format!("waltrail_test_{}", uuid::Uuid::new_v4().simple());
+    // Имя источника уникально на прогон: слот и публикация деривируются
+    // из него (ADR-0005), остатки прошлых прогонов не мешают.
+    let source_key = source_name("two");
+    let slot_name = source_slot(&source_key);
 
     let source = connect_db(&source_url).await;
     setup_source(&source).await;
 
     let config = WorkerConfig {
         database_url: audit_url.clone(),
-        source_database_url: source_url.clone(),
-        slot: slot_name.clone(),
-        publication: "audit".to_owned(),
-        message_prefix: "_audit".to_owned(),
-        ignore_tables: vec!["public.schema_migrations".to_owned()],
-        // Маленький чанк, чтобы батчевая вставка разбивалась на несколько
-        // push_values внутри одной транзакции.
-        batch_size: 2,
         reconnect_initial_backoff_ms: 1_000,
         reconnect_max_backoff_ms: 30_000,
     };
@@ -70,18 +67,23 @@ async fn live_replication_ingests_changes_to_journal() {
     // Пул к журналу аудита: воркер применит миграции, таблица появится чуть позже.
     let audit = connect_db(&audit_url).await;
 
-    // Бутстрап воркера обязан создать слот, раз его нет.
-    let slot_check = slot_name.clone();
-    wait_until(|| async {
-        sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
-        )
-        .bind(&slot_check)
-        .fetch_one(&source)
-        .await
-        .unwrap_or(false)
-    })
+    // Регистрация источника в реестре — после применения миграций воркером.
+    // Маленький чанк батча: вставка разбивается на несколько push_values
+    // внутри одной транзакции.
+    wait_sources_table(&audit).await;
+    register_source_with(
+        &audit,
+        &source_key,
+        &source_url,
+        &["public.schema_migrations"],
+        "_audit",
+        2,
+    )
     .await;
+
+    // Бутстрап воркера обязан создать слот и публикацию, раз их нет.
+    wait_slot(&source, &slot_name).await;
+    wait_publication(&source, &source_publication(&source_key)).await;
 
     // --- SQL-эмиттер ------------------------------------------------------
 
@@ -541,6 +543,45 @@ async fn live_replication_ingests_changes_to_journal() {
         "чекпоинт не откатывается назад"
     );
 
+    // --- Ключ источника и статусы реестра (ADR-0005, тикет #30) ----------
+
+    // Все строки журнала помечены ключом источника из реестра.
+    let (total, foreign): (i64, i64) =
+        sqlx::query_as("SELECT count(*), count(*) FILTER (WHERE source <> $1) FROM changes")
+            .bind(&source_key)
+            .fetch_one(&audit)
+            .await
+            .expect("подсчёт строк журнала по ключу источника");
+    assert!(total >= 10, "журнал полон");
+    assert_eq!(
+        foreign, 0,
+        "все строки журнала несут ключ источника из реестра"
+    );
+
+    // Статусы источника: подключён, без ошибок, время последнего события.
+    wait_until(|| async {
+        sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+            "SELECT last_event_at FROM sources WHERE name = $1",
+        )
+        .bind(&source_key)
+        .fetch_one(&audit)
+        .await
+        .unwrap_or(None)
+        .is_some()
+    })
+    .await;
+    let (state, last_error): (String, Option<String>) =
+        sqlx::query_as("SELECT worker_state, last_error FROM sources WHERE name = $1")
+            .bind(&source_key)
+            .fetch_one(&audit)
+            .await
+            .expect("статус источника в реестре");
+    assert_eq!(state, "connected", "задача источника подключена");
+    assert!(
+        last_error.is_none(),
+        "после подключения текст ошибки закрыт: {last_error:?}"
+    );
+
     // Graceful shutdown по CancellationToken: воркер завершается без ошибки.
     token.cancel();
     let result = tokio::time::timeout(Duration::from_secs(30), handle)
@@ -553,5 +594,5 @@ async fn live_replication_ingests_changes_to_journal() {
     );
 
     drop_db(&audit_admin, &audit_name).await;
-    drop_db(&source_admin, &source_name).await;
+    drop_db(&source_admin, &source_db).await;
 }

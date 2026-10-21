@@ -11,18 +11,23 @@ Compose поднимает минимальный стек:
 
 | Сервис | Роль | Порт на хосте |
 | ------ | ---- | ------------- |
-| `db1` | БД аудита Waltrail (таблица `changes` + чекпоинты) | `54399` |
-| `db-src` | Источник CDC — имитация БД клиента (`wal_level=logical`, публикация `audit` создаётся автоматически) | `54398` |
-| `api` | REST API журнала | `8000` |
-| `worker-cdc` | Консюмер логической репликации: слот источника → таблица `changes` | — |
+| `db1` | БД аудита Waltrail (таблица `changes`, реестр источников + чекпоинты) | `54399` |
+| `db-src` | Источник CDC — имитация БД клиента (`wal_level=logical`), подключается регистрацией через API | `54398` |
+| `api` | REST API журнала и реестра источников | `8000` |
+| `worker-cdc` | Супервизор: задача логической репликации на каждый источник реестра | — |
 
 Единственный тракт инжеста — слот логической репликации (ADR-0001): воркер `worker-cdc` читает pgoutput-поток источника и пишет журнал в таблицу `changes`. API читает журнал только из `changes`: `GET /api/changes` (список с пагинацией, сортировкой и фильтрами — источник, `trace_id`, таблица, операция, время, вхождение в `context`) и `GET /api/changes/{id}` (детальная); Swagger — на `/swagger-ui`. Строки журнала помечены ключом источника (`source`): пустая строка — источник неизвестен (строки до переезда на мультиисточность); уникальные констрейнты журнала включают ключ, поэтому LSN/txid разных серверов не коллидируют (ADR-0005).
 
-Реестр источников (ADR-0005) управляется через REST: `POST /api/sources` (регистрация), `GET /api/sources` (список со статусами воркеров), `GET /api/sources/{name}`, `PATCH /api/sources/{name}` (только служебные таблицы, префикс MESSAGE и размер батча — URL неизменяем), `DELETE /api/sources/{name}` (помечает к удалению, `202`; слот и публикацию у клиента дропает воркер).
+Реестр источников (ADR-0005) управляется через REST: `POST /api/sources` (регистрация), `GET /api/sources` (список со статусами воркеров), `GET /api/sources/{name}`, `PATCH /api/sources/{name}` (только служебные таблицы, префикс MESSAGE и размер батча — URL неизменяем), `DELETE /api/sources/{name}` (помечает к удалению, `202`; слот и публикацию у клиента дропает воркер). Воркер-супервизор опрашивает реестр и держит по задаче на каждый источник: зарегистрированный источник подхватывается без перезапуска — воркер сам создаёт у клиента публикацию `audit_<имя>` и слот `waltrail_<имя>`, помечает строки журнала ключом источника и пишет статус (подключен/ошибка, время последнего события) обратно в реестр.
 
-Сквозной сценарий «эмит → журнал → REST-фильтр по trace_id»:
+Сквозной сценарий «регистрация источника → эмит → журнал → REST-фильтр по trace_id»:
 
 ```bash
+# Регистрируем db-src как источник журнала: воркер подхватит его без
+# перезапуска и сам создаст у клиента публикацию и слот
+curl -s http://localhost:8000/api/sources -H 'content-type: application/json' \
+  -d '{"name":"demo","url":"postgresql://postgres:postgres@db-src:5432/postgres"}'
+
 # Демо-таблица на источнике (публикация FOR ALL TABLES подхватит её сама)
 docker compose exec db-src psql -U postgres -c \
   "CREATE TABLE IF NOT EXISTS demo (id int PRIMARY KEY, note text)"
@@ -36,17 +41,20 @@ docker compose exec db-src psql -U postgres -c \
 
 # Журнал: фильтр по trace_id возвращает строку INSERT с контекстом MESSAGE
 curl 'http://localhost:8000/api/changes?trace_id=demo-1'
+
+# Статус источника: worker_state=connected, время последнего события
+curl 'http://localhost:8000/api/sources/demo'
 ```
 
-Воркер сам создаёт слот репликации и применяет миграции, после остановки (Ctrl+C/SIGTERM) возобновляет с чекпоинта. Настройки — переменными окружения: `CDC_SLOT`, `CDC_PUBLICATION`, `CDC_MESSAGE_PREFIX` (префикс MESSAGE-канала контекста, ADR-0004), `CDC_IGNORE_TABLES`, `CDC_BATCH_SIZE` (значения по умолчанию — в [`env.example`](env.example)).
+Воркер-супервизор применяет миграции и держит по задаче репликации на каждый источник реестра: подхват новых источников — без перезапуска, после остановки (Ctrl+C/SIGTERM) каждая задача возобновляет со своего чекпоинта. Настройки источников — в реестре (REST API, ADR-0005): строки подключения, служебные таблицы, префикс MESSAGE, размер батча; из окружения читаются только глобальные настройки — `CDC_RECONNECT_INITIAL_BACKOFF_MS`, `CDC_RECONNECT_MAX_BACKOFF_MS` (значения по умолчанию — в [`env.example`](env.example)).
 
-> Слот удерживает WAL источника: если воркер на dev-стенде больше не нужен, удалите слот, чтобы WAL не копился:
+> Слоты удерживают WAL источников: если воркер на dev-стенде больше не нужен, удалите источники через API (воркер дропнет слоты и публикации у клиентов) либо снесите слоты руками, чтобы WAL не копился:
 >
 > ```SQL
-> SELECT pg_drop_replication_slot('waltrail');
+> SELECT pg_drop_replication_slot('waltrail_demo');
 > ```
 
-Подготовка источника для dev: публикация создаётся init-скриптом [`docker/init-source/01_публикация_аудита.sql`](docker/init-source/01_публикация_аудита.sql) при первом создании volume. Слот репликации создаётся воркером CDC автоматически при старте.
+Подготовка источника для dev: достаточно `wal_level=logical` — публикация и слот создаются воркером автоматически при подхвате источника (регистрация — `POST /api/sources`, см. сквозной сценарий выше).
 
 ### PoC-бенчмарк пропускной способности
 
@@ -77,24 +85,24 @@ docker compose down -v && docker compose up -d
 
 __Обязательно нужно перезагрузить postgres!!!__
 
-2. Создайте публикацию и полную репликационную идентичность таблиц:
+2. Зарегистрируйте источник через API (`POST /api/sources`): воркер сам создаст у клиента публикацию `audit_<имя>` (FOR ALL TABLES) и слот `waltrail_<имя>` при подхвате. Если предпочитаете создать публикацию руками — воркер переиспользует существующую:
 ```SQL
--- Публикация "audit" для всех таблиц
-CREATE PUBLICATION audit FOR ALL TABLES;
+-- Публикация "audit_<имя>" для всех таблиц (обычно не нужна — создаётся воркером)
+CREATE PUBLICATION audit_<имя> FOR ALL TABLES;
 
 -- Или только для выбранных таблиц
-CREATE PUBLICATION audit FOR TABLE [table1], [table2];
+CREATE PUBLICATION audit_<имя> FOR TABLE [table1], [table2];
 
 -- Полная репликационная идентичность: в журнал попадают образы "до" (UPDATE/DELETE)
 ALTER TABLE [table1] REPLICA IDENTITY FULL;
 ALTER TABLE [table2] REPLICA IDENTITY FULL;
 
 -- Чтобы включить отслеживание изменений данных для новой таблицы:
-ALTER PUBLICATION audit ADD TABLE [table3];
+ALTER PUBLICATION audit_<имя> ADD TABLE [table3];
 ALTER TABLE [table3] REPLICA IDENTITY FULL;
 
 -- Чтобы остановить отслеживание изменений данных для таблицы:
-ALTER PUBLICATION audit DROP TABLE [table3];
+ALTER PUBLICATION audit_<имя> DROP TABLE [table3];
 ALTER TABLE [table3] REPLICA IDENTITY DEFAULT;
 ```
 

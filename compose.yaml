@@ -38,7 +38,9 @@ services:
       start_period: 60s
       timeout: 10s
 
-  # Источник CDC — имитация БД клиента (wal_level=logical, публикация создаётся из ./docker/init-source)
+  # Источник CDC — имитация БД клиента (wal_level=logical); подключается
+  # к журналу регистрацией через REST API (POST /api/sources): воркер сам
+  # создаст публикацию audit_<имя> и слот waltrail_<имя> при подхвате
   db-src:
     image: postgres:17.4
     restart: always
@@ -90,7 +92,7 @@ services:
       start_period: 60s
       timeout: 20s
 
-  # Консюмер логической репликации: слот источника → таблица changes
+  # Консюмер логической репликации: реестр источников → задачи источников → changes
   worker-cdc:
     build:
       context: .
@@ -103,8 +105,6 @@ services:
       - app-logs:/app/logs
     depends_on:
       db1:
-        condition: service_healthy
-      db-src:
         condition: service_healthy
 
     networks:
