@@ -60,7 +60,7 @@ cargo test --workspace
 
 ### Issue tracker
 
-Issues live in GitHub Issues (`gh` CLI) at `stalexsm/pg-audit-trail`. See `docs/agents/issue-tracker.md`.
+Issues live in GitHub Issues (`gh` CLI) at `stalexsm/waltrail`. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
