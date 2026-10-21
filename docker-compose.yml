@@ -1,8 +1,11 @@
+name: waltrail
+
 networks:
   default:
     driver: bridge
   shared-network:
     external: true
+
 services:
   kafka-ui:
     image: provectuslabs/kafka-ui
