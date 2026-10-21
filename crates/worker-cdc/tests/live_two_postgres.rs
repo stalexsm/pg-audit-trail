@@ -6,140 +6,34 @@
 //! I/U/D/T, MESSAGE и вставки в игнорируемые таблицы; ассерты — по
 //! содержимому журнала `changes` в БД аудита.
 
+mod common;
+
 use std::time::Duration;
 
+use common::{
+    audit_admin_url, cleanup_leftovers, connect_db, drop_db, setup_source, source_admin_url,
+    spawn_db, wait_until,
+};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use worker_cdc::WorkerConfig;
 
-/// Подключение к тестовой БД аудита (db1).
-fn audit_admin_url() -> String {
-    std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql://postgres:postgres@localhost:54399/postgres".to_string())
-}
-
-/// Подключение к тестовому источнику CDC (db-src).
-fn source_admin_url() -> String {
-    std::env::var("TEST_SOURCE_DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql://postgres:postgres@localhost:54398/postgres".to_string())
-}
-
-/// Гигиена стенда: сносит тестовые БД прошлых прогонов (вместе с их слотами —
-/// DROP DATABASE FORCE на PG 16+ удаляет и логические слоты). Незакрытые
-/// после падения прогонов слоты, привязанные к чужим БД, блокировали бы
-/// START_REPLICATION нового прогона.
-async fn cleanup_leftovers(admin: &PgPool, pattern: &str) {
-    let names: Vec<String> = sqlx::query_scalar(
-        "SELECT datname FROM pg_database WHERE datname LIKE $1 AND datname != current_database()",
-    )
-    .bind(pattern)
-    .fetch_all(admin)
-    .await
-    .unwrap_or_default();
-    for name in names {
-        let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
-            .execute(admin)
-            .await;
-    }
-}
-
-/// Создаёт уникальную БД на администраторском пуле, возвращает её URL.
-async fn spawn_db(admin: &PgPool, base_url: &str, prefix: &str) -> (String, String) {
-    let db_name = format!("{prefix}_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
-        .execute(admin)
+/// Подключение к администраторскому пулу стенда (db1 / db-src).
+async fn connect_admin(url: &str) -> PgPool {
+    PgPoolOptions::new()
+        .max_connections(2)
+        .connect(url)
         .await
-        .expect("создание тестовой БД");
-
-    let (prefix_url, _) = base_url
-        .rsplit_once('/')
-        .expect("URL должен содержать путь к БД");
-    let url = format!("{prefix_url}/{db_name}");
-    (url, db_name)
-}
-
-async fn drop_db(admin: &PgPool, db_name: &str) {
-    sqlx::query(&format!(
-        "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-    ))
-    .execute(admin)
-    .await
-    .expect("удаление тестовой БД");
-}
-
-/// Готовит источник: публикация `audit` на все таблицы и тестовые таблицы.
-async fn setup_source(source: &PgPool) {
-    sqlx::query("CREATE PUBLICATION audit FOR ALL TABLES")
-        .execute(source)
-        .await
-        .expect("создание публикации");
-
-    sqlx::query(
-        "CREATE TABLE orders (
-            id BIGINT PRIMARY KEY,
-            amount NUMERIC(10,2),
-            note TEXT,
-            created_at TIMESTAMPTZ
-        )",
-    )
-    .execute(source)
-    .await
-    .expect("создание orders");
-    sqlx::query("ALTER TABLE orders REPLICA IDENTITY FULL")
-        .execute(source)
-        .await
-        .expect("REPLICA IDENTITY FULL для orders");
-
-    sqlx::query("CREATE TABLE events (id BIGINT PRIMARY KEY, kind TEXT)")
-        .execute(source)
-        .await
-        .expect("создание events");
-
-    sqlx::query("CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY, name TEXT)")
-        .execute(source)
-        .await
-        .expect("создание schema_migrations");
-
-    // Составной ключ: primary_key должен собраться из key-флагов Relation.
-    sqlx::query("CREATE TABLE composite (a INT, b INT, payload TEXT, PRIMARY KEY (a, b))")
-        .execute(source)
-        .await
-        .expect("создание composite");
-    sqlx::query("ALTER TABLE composite REPLICA IDENTITY FULL")
-        .execute(source)
-        .await
-        .expect("REPLICA IDENTITY FULL для composite");
-}
-
-/// Ждёт, пока предикат не выполнится (опрос БД аудита).
-async fn wait_until<F, Fut>(mut predicate: F)
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    for _ in 0..120 {
-        if predicate().await {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    panic!("не дождались ожидаемого состояния журнала за 60 секунд");
+        .expect("нет подключения к стенду — поднимите `docker compose up -d`")
 }
 
 #[tokio::test]
 async fn live_replication_ingests_changes_to_journal() {
-    let audit_admin = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&audit_admin_url())
-        .await
-        .expect("нет подключения к db1 — поднимите `docker compose up -d`");
-    let source_admin = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&source_admin_url())
-        .await
-        .expect("нет подключения к db-src — поднимите `docker compose up -d`");
+    let audit_admin = connect_admin(&audit_admin_url()).await;
+    let source_admin = connect_admin(&source_admin_url()).await;
 
     // Остатки упавших прогонов (БД + их слоты) мешают новому прогону.
+    // Префиксы этого сценария: параллельные тесты не задевают друг друга.
     cleanup_leftovers(&audit_admin, "waltrail_audit_%").await;
     cleanup_leftovers(&source_admin, "waltrail_src_%").await;
 
@@ -151,11 +45,7 @@ async fn live_replication_ingests_changes_to_journal() {
     // Слот уникален на прогон: остатки прошлых запусков не должны мешать.
     let slot_name = format!("waltrail_test_{}", uuid::Uuid::new_v4().simple());
 
-    let source = PgPoolOptions::new()
-        .max_connections(3)
-        .connect(&source_url)
-        .await
-        .expect("подключение к уникальному источнику");
+    let source = connect_db(&source_url).await;
     setup_source(&source).await;
 
     let config = WorkerConfig {
@@ -167,6 +57,8 @@ async fn live_replication_ingests_changes_to_journal() {
         // Маленький чанк, чтобы батчевая вставка разбивалась на несколько
         // push_values внутри одной транзакции.
         batch_size: 2,
+        reconnect_initial_backoff_ms: 1_000,
+        reconnect_max_backoff_ms: 30_000,
     };
 
     let token = tokio_util::sync::CancellationToken::new();
@@ -174,11 +66,7 @@ async fn live_replication_ingests_changes_to_journal() {
     let handle = tokio::spawn(worker_cdc::run(config, worker_token));
 
     // Пул к журналу аудита: воркер применит миграции, таблица появится чуть позже.
-    let audit = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&audit_url)
-        .await
-        .expect("подключение к уникальной БД аудита");
+    let audit = connect_db(&audit_url).await;
 
     // Бутстрап воркера обязан создать слот, раз его нет.
     let slot_check = slot_name.clone();

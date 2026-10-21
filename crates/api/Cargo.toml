@@ -6,39 +6,27 @@ description = "Ядро приложения журнала событий"
 
 [dependencies]
 anyhow.workspace = true
-axum-valid = { workspace = true, features = ["into_json", "json"] }
 axum.workspace = true
+axum-valid.workspace = true
 base64.workspace = true
-casbin = { workspace = true, features = ["tokio"] }
-chrono = { workspace = true, features = ["serde"] }
+casbin.workspace = true
+chrono.workspace = true
 dotenv.workspace = true
 env_logger.workspace = true
 hyper.workspace = true
 infer.workspace = true
-jsonwebtoken = {workspace = true, features = ["rust_crypto"]}
+jsonwebtoken.workspace = true
 parking_lot.workspace = true
-serde = { workspace = true, features = ["derive"] }
+serde.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
 sqlx-cli.workspace = true
-sqlx = { workspace = true, features = [
-    "uuid",
-    "chrono",
-    "runtime-tokio-rustls",
-    "postgres",
-    "migrate",
-    "json",
-    "any",
-] }
-tokio = { workspace = true, features = ["full"] }
-tower-http = { workspace = true, features = [
-    "cors",
-    "compression-gzip",
-    "trace",
-] }
-tracing-appender.workspace = true
-tracing-subscriber = { workspace = true, features = ["chrono", "env-filter"] }
+tokio.workspace = true
+tower-http.workspace = true
 tracing.workspace = true
-utoipa-swagger-ui = { workspace = true, features = ["axum"] }
-utoipa =  { workspace = true, features = ["uuid", "chrono", "axum_extras"] }
-uuid = { workspace = true, features = ["serde", "v4"] }
-validator = { workspace = true, features = ["derive"] }
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+utoipa.workspace = true
+utoipa-swagger-ui.workspace = true
+uuid.workspace = true
+validator.workspace = true

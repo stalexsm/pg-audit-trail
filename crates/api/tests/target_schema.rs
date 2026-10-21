@@ -17,10 +17,13 @@ fn admin_url() -> String {
 async fn spawn_migrated_db(admin: &PgPool) -> (PgPool, String) {
     let db_name = format!("waltrail_schema_test_{}", uuid::Uuid::new_v4().simple());
 
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
-        .execute(admin)
-        .await
-        .expect("не удалось создать временную тестовую БД");
+    // Имя БД генерируется из UUID здесь же — инъекции нет (аудит).
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE \"{db_name}\""
+    )))
+    .execute(admin)
+    .await
+    .expect("не удалось создать временную тестовую БД");
 
     let base_url = admin_url();
     let (prefix, _) = base_url
@@ -43,9 +46,10 @@ async fn spawn_migrated_db(admin: &PgPool) -> (PgPool, String) {
 }
 
 async fn drop_test_db(admin: &PgPool, db_name: &str) {
-    sqlx::query(&format!(
+    // Имя БД — из фикстуры этого же теста, без пользовательского ввода (аудит).
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-    ))
+    )))
     .execute(admin)
     .await
     .expect("не удалось удалить временную тестовую БД");

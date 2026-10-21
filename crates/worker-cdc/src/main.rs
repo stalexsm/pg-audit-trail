@@ -57,9 +57,9 @@ async fn main() -> anyhow::Result<()> {
     let shutdown_token = cancellation_token.clone();
     tokio::spawn(async move {
         let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("Failed to register SIGTERM handler");
+            .expect("Не удалось зарегистрировать обработчик SIGTERM");
         let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
-            .expect("Failed to register SIGINT handler");
+            .expect("Не удалось зарегистрировать обработчик SIGINT");
 
         tokio::select! {
             _ = sigterm.recv() => {

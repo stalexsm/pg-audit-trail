@@ -6,24 +6,19 @@ description.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-chrono = { workspace = true, features = ["serde"] }
+chrono.workspace = true
 config.workspace = true
-pgoutput = { path = "../pgoutput" }
+pgoutput.workspace = true
 pgwire-replication.workspace = true
-serde = { workspace = true, features = ["derive"] }
+serde.workspace = true
 serde_json.workspace = true
-sqlx = { workspace = true, features = [
-    "chrono",
-    "runtime-tokio-rustls",
-    "postgres",
-    "json",
-] }
-tokio = { workspace = true, features = ["full"] }
+sqlx.workspace = true
+tokio.workspace = true
 tokio-util.workspace = true
 tracing-appender.workspace = true
-tracing-subscriber = { workspace = true, features = ["chrono", "env-filter"] }
+tracing-subscriber.workspace = true
 tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
-uuid = { workspace = true, features = ["v4"] }
+uuid.workspace = true
