@@ -55,3 +55,17 @@ cargo test --workspace
 - Conventional Commits с русским описанием: `feat:`, `fix:`, `doc:`, `build:`, `chore(deps):`.
 - `CHANGELOG.md` генерируется git-cliff по `cliff.toml` — не редактируй его вручную.
 - Версия задаётся один раз в `[workspace.package]`; релиз — тег вида `v0.3.0`.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues (`gh` CLI) at `stalexsm/pg-audit-trail`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Standard five-role vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `GLOSSARY.md` at the repo root + `docs/adr/`. See `docs/agents/domain.md`.
