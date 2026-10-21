@@ -1,7 +1,8 @@
 # Конфиг сканера skylos: гейт CI (джоба skylos в .github/workflows/ci.yml)
 # запускается командой:
 #   skylos . --secrets --danger --gate --config-file skylos.toml \
-#     --exclude target --exclude README.md
+#     --exclude target --exclude README.md --exclude AGENTS.md \
+#     --exclude GLOSSARY.md --exclude CHANGELOG.md
 # Исключения папок передаются ТОЛЬКО через CLI: при --config-file ключ
 # exclude в этом файле перекрывает CLI-флаги, а на md-скан (SKY-D260/D266)
 # TOML-exclude не действует вовсе (проверено на skylos 4.50.1).

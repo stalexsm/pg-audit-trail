@@ -1,4 +1,4 @@
-# Гейты CI/CD для PR и main.
+# Гейты CI/CD для PR.
 #
 # Обязательные проверки (гейты), джоба gates — зелёная только когда все зелёные:
 #   fmt     — форматирование (cargo fmt --check);
@@ -17,10 +17,11 @@
 
 name: CI
 
+# Гейты гоняются только на PR: GitHub проверяет merge-превью коммит, то есть
+# ровно то, что войдёт в main; повторный полный прогон на main после мерджа
+# ничего не добавляет. workflow_dispatch — ручной прогон, когда нужен.
 on:
   pull_request:
-    branches: [main]
-  push:
     branches: [main]
   workflow_dispatch:
 
@@ -114,11 +115,13 @@ jobs:
       # Мёртвый код, секреты, уязвимости Python-кода (scripts/loadgen) и
       # собственно workflow; подавления правил — в skylos.toml и inline
       # `# skylos: ignore[...]` с обоснованиями. Исключения — только через
-      # CLI (при --config-file exclude из файла перекрывает CLI-флаги).
+      # CLI (при --config-file exclude из файла перекрывает CLI-флаги):
+      # артефакты сборки и MD-доки — кириллица даёт ложняки гомоглифов.
       - name: Скан skylos (гейт)
         run: >
           skylos . --secrets --danger --gate --config-file skylos.toml
-          --exclude target --exclude README.md
+          --exclude target --exclude README.md --exclude AGENTS.md
+          --exclude GLOSSARY.md --exclude CHANGELOG.md
 
   semgrep:
     name: semgrep
