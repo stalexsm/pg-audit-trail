@@ -467,13 +467,14 @@ async fn handle_xlog(
     Ok(())
 }
 
-/// Обрабатывает MESSAGE префикса `_audit` (ADR-0004): payload целиком
-/// становится контекстом транзакции, строковое значение ключа `trace_id`
-/// верхнего уровня — колонкой и далее всеми строками этой транзакции.
-/// Строку журнала MESSAGE не создаёт: единственное содержимое журнала —
-/// изменения строк. Контрактом payload является JSON: не-JSON payload
-/// порождает warn и контекста не меняет, на поток репликации это не
-/// влияет (индекс события уже потрачен).
+/// Обрабатывает MESSAGE настроенного префикса (`CDC_MESSAGE_PREFIX`, по
+/// умолчанию `_audit`) как канал контекста транзакции (ADR-0004): payload
+/// целиком становится контекстом транзакции, строковое значение ключа
+/// `trace_id` верхнего уровня — колонкой и далее всеми строками этой
+/// транзакции. Строку журнала MESSAGE не создаёт: единственное содержимое
+/// журнала — изменения строк. Контрактом payload является JSON: не-JSON
+/// payload порождает warn и контекста не меняет, на поток репликации это
+/// не влияет (индекс события уже потрачен).
 fn handle_audit_message(buf: &mut TransactionBuffer, content: &[u8], lsn: Lsn) {
     let payload: Value = match std::str::from_utf8(content)
         .map_err(|e| anyhow::anyhow!("не-UTF8 payload: {e}"))
@@ -486,14 +487,7 @@ fn handle_audit_message(buf: &mut TransactionBuffer, content: &[u8], lsn: Lsn) {
             return;
         }
     };
-    if payload
-        .get(ingest::TRACE_ID_KEY)
-        .is_some_and(|value| !value.is_string())
-    {
-        warn!(%lsn, "ключ trace_id в payload MESSAGE не строка — в колонку не попал");
-    }
-    let trace_id = ingest::trace_id_from_payload(&payload);
-    buf.push_message(payload, trace_id);
+    buf.push_message(payload);
     metrics::add_event();
     debug!(%lsn, "MESSAGE принят как контекст транзакции");
 }

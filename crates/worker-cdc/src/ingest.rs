@@ -86,11 +86,12 @@ impl TransactionBuffer {
 
     /// Регистрирует MESSAGE транзакции (ADR-0004): payload становится
     /// контекстом транзакции, а строковое значение ключа `trace_id` —
-    /// колонкой всех её строк. Строк журнала MESSAGE не создаёт:
-    /// единственное содержимое журнала — изменения строк. Строкам изменений
-    /// достаётся контекст последнего MESSAGE: повторный MESSAGE в одной
-    /// транзакции — коллизия контекста, warn в лог.
-    pub fn push_message(&mut self, context: Value, trace_id: Option<String>) {
+    /// колонкой всех её строк (извлекается здесь — контракт ключа живёт
+    /// в одном месте). Строк журнала MESSAGE не создаёт: единственное
+    /// содержимое журнала — изменения строк. Строкам изменений достаётся
+    /// контекст последнего MESSAGE: повторный MESSAGE в одной транзакции —
+    /// коллизия контекста, warn в лог.
+    pub fn push_message(&mut self, context: Value) {
         if self.message_seen {
             warn!(
                 xid = self.xid,
@@ -98,8 +99,8 @@ impl TransactionBuffer {
             );
         }
         self.message_seen = true;
+        self.trace_id = trace_id_from_payload(&context);
         self.context = context;
-        self.trace_id = trace_id;
     }
 
     /// Проставляет контекст последнего MESSAGE (payload и `trace_id`)
@@ -150,24 +151,38 @@ pub fn is_ignored(ignore_tables: &[String], schema: &str, table: &str) -> bool {
 ///
 /// В колонку попадает только строковое значение ключа `trace_id`; сам
 /// payload сохраняется в `context` дословно, без вырезания ключа.
-/// Значение длиннее `MAX_TRACE_ID_LEN` обрезается по границе символов:
-/// вставка исходной длины уронила бы всю транзакцию вставки.
-pub fn trace_id_from_payload(payload: &Value) -> Option<String> {
-    let trace_id = payload.get(TRACE_ID_KEY)?.as_str()?;
-    if trace_id.len() <= MAX_TRACE_ID_LEN {
-        return Some(trace_id.to_owned());
+/// Отсутствие ключа — не ошибка (колонка остаётся пустой), значение не
+/// строки — warn и пустая колонка. Значение длиннее `MAX_TRACE_ID_LEN`
+/// обрезается по границе символов: вставка исходной длины уронила бы всю
+/// транзакцию вставки.
+fn trace_id_from_payload(payload: &Value) -> Option<String> {
+    match payload.get(TRACE_ID_KEY) {
+        None => None,
+        // Значение не строка — warn: клиент нарушает контракт payload,
+        // колонка остаётся пустой.
+        Some(value) if !value.is_string() => {
+            warn!("ключ trace_id в payload MESSAGE не строка — в колонку не попал");
+            None
+        }
+        Some(value) => {
+            let trace_id = value.as_str().expect("проверено is_string выше");
+            if trace_id.len() <= MAX_TRACE_ID_LEN {
+                Some(trace_id.to_owned())
+            } else {
+                // Срез по границе символов: отступаем от байтового предела
+                // назад, чтобы не рвать многобайтные символы.
+                let mut cutoff = MAX_TRACE_ID_LEN;
+                while !trace_id.is_char_boundary(cutoff) {
+                    cutoff -= 1;
+                }
+                warn!(
+                    original_len = trace_id.len(),
+                    "trace_id длиннее {MAX_TRACE_ID_LEN} байт — обрезан"
+                );
+                Some(trace_id[..cutoff].to_owned())
+            }
+        }
     }
-    // Срез по границе символов: отступаем от байтового предела назад,
-    // чтобы не рвать многобайтные символы.
-    let mut cutoff = MAX_TRACE_ID_LEN;
-    while !trace_id.is_char_boundary(cutoff) {
-        cutoff -= 1;
-    }
-    warn!(
-        original_len = trace_id.len(),
-        "trace_id длиннее {MAX_TRACE_ID_LEN} байт — обрезан"
-    );
-    Some(trace_id[..cutoff].to_owned())
 }
 
 /// Вставляет строки батчами (`push_values`) в одной транзакции с чекпоинтом.
@@ -348,7 +363,7 @@ mod tests {
     fn message_creates_no_journal_row_and_enriches_change_rows() {
         let mut buffer = TransactionBuffer::new(7);
         buffer.push_row(journal_row_fixture("CREATE"));
-        buffer.push_message(json!({"trace_id": "op-1"}), Some("op-1".into()));
+        buffer.push_message(json!({"trace_id": "op-1"}));
         buffer.push_row(journal_row_fixture("UPDATE"));
 
         buffer.apply_transaction_context();
@@ -366,11 +381,8 @@ mod tests {
     fn last_message_wins_for_change_rows() {
         let mut buffer = TransactionBuffer::new(7);
         buffer.push_row(journal_row_fixture("CREATE"));
-        buffer.push_message(json!({"trace_id": "op-1"}), Some("op-1".into()));
-        buffer.push_message(
-            json!({"trace_id": "op-2", "user": "bob"}),
-            Some("op-2".into()),
-        );
+        buffer.push_message(json!({"trace_id": "op-1"}));
+        buffer.push_message(json!({"trace_id": "op-2", "user": "bob"}));
 
         buffer.apply_transaction_context();
         let rows = buffer.take_rows();
@@ -385,7 +397,7 @@ mod tests {
     fn message_without_trace_id_leaves_column_empty() {
         let mut buffer = TransactionBuffer::new(1);
         buffer.push_row(journal_row_fixture("UPDATE"));
-        buffer.push_message(json!({"user": "bob"}), None);
+        buffer.push_message(json!({"user": "bob"}));
 
         buffer.apply_transaction_context();
         let rows = buffer.take_rows();
@@ -399,7 +411,7 @@ mod tests {
         // MESSAGE расходует индекс события, но строку журнала не создаёт:
         // индекс остаётся детерминированной функцией содержимого транзакции.
         buffer.next_index();
-        buffer.push_message(json!({"trace_id": "op-1"}), Some("op-1".into()));
+        buffer.push_message(json!({"trace_id": "op-1"}));
         buffer.apply_transaction_context();
         assert!(
             buffer.take_rows().is_empty(),
@@ -410,7 +422,7 @@ mod tests {
     #[test]
     fn transaction_context_does_not_leak_into_next_buffer() {
         let mut buffer = TransactionBuffer::new(1);
-        buffer.push_message(json!({"trace_id": "op-1"}), Some("op-1".into()));
+        buffer.push_message(json!({"trace_id": "op-1"}));
         buffer.apply_transaction_context();
 
         // Новая транзакция без MESSAGE — строки с пустым контекстом.
