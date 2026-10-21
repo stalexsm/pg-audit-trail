@@ -36,6 +36,18 @@ cargo run -p worker-cdc
 SELECT pg_drop_replication_slot('waltrail');
 ```
 
+### PoC-бенчмарк пропускной способности
+
+Генератор потока (200+ тыс. событий/сек узкими строками) и монитор стенда — в [`scripts/loadgen/`](scripts/loadgen); сводки по трём ступеням конвейера (walsender → intake → вставка) воркер пишет в лог каждые 10 с (цель `worker_cdc::metrics`):
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r scripts/loadgen/requirements.txt
+.venv/bin/python scripts/loadgen/generate.py --duration 60 --sessions 3 --rows-per-tx 10000 --payload-bytes 100
+.venv/bin/python scripts/loadgen/monitor.py --duration 120 > monitor.csv
+```
+
+Методика, числа и вердикт гейта — в [`docs/benchmarks/0007-poc-пропускная-способность.md`](docs/benchmarks/0007-poc-пропускная-способность.md) (вердикт продублирован в [ADR-0003](docs/adr/0003-гейт-производительности-no-go-вставка-в-changes.md)).
+
 **Внимание:** история миграций переписана под целевую схему журнала (без накопленных ALTER-шагов), а данные сервисов живут в именованных volumes. Если у вас остался старый volume — пересоздайте его:
 
 ```bash

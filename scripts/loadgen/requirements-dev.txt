@@ -1,0 +1,6 @@
+# Инструменты проверки Python-скриптов (scripts/loadgen):
+#   .venv/bin/pip install -r scripts/loadgen/requirements-dev.txt
+#   .venv/bin/ruff check scripts/loadgen && .venv/bin/ruff format --check scripts/loadgen
+#   .venv/bin/ty check scripts/loadgen
+ruff==0.17.1
+ty==0.0.90

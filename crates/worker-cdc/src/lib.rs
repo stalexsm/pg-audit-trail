@@ -9,6 +9,7 @@
 pub mod bootstrap;
 pub mod config;
 pub mod ingest;
+mod metrics;
 pub mod replicate;
 
 /// Псевдоним ошибок крейта по конвенции репозитория (AGENTS.md).
