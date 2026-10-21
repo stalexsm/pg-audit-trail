@@ -21,15 +21,22 @@ Compose поднимает минимальный стек:
 Сквозной сценарий «эмит → журнал → REST-фильтр по trace_id»:
 
 ```bash
-# Эмит события приложения на источнике — pg_logical_emit_message в транзакции (ADR-0002)
+# Демо-таблица на источнике (публикация FOR ALL TABLES подхватит её сама)
 docker compose exec db-src psql -U postgres -c \
-  "SELECT pg_logical_emit_message(true, '_audit', '{\"trace_id\":\"demo-1\"}');"
+  "CREATE TABLE IF NOT EXISTS demo (id int PRIMARY KEY, note text)"
 
-# Журнал: фильтр по trace_id
+# Изменение + контекст операции: pg_logical_emit_message в той же транзакции (ADR-0004).
+# MESSAGE строк журнала не создаёт — обогащает context и trace_id строк своей транзакции.
+docker compose exec db-src psql -U postgres -c \
+  "BEGIN; INSERT INTO demo VALUES (1, 'демо'); \
+   SELECT pg_logical_emit_message(true, '_audit', \
+   '{\"trace_id\":\"demo-1\",\"user\":\"alice\"}'); COMMIT;"
+
+# Журнал: фильтр по trace_id возвращает строку INSERT с контекстом MESSAGE
 curl 'http://localhost:8000/api/changes?trace_id=demo-1'
 ```
 
-Воркер сам создаёт слот репликации и применяет миграции, после остановки (Ctrl+C/SIGTERM) возобновляет с чекпоинта. Настройки — переменными окружения: `CDC_SLOT`, `CDC_PUBLICATION`, `CDC_IGNORE_TABLES`, `CDC_BATCH_SIZE` (значения по умолчанию — в [`env.example`](env.example)).
+Воркер сам создаёт слот репликации и применяет миграции, после остановки (Ctrl+C/SIGTERM) возобновляет с чекпоинта. Настройки — переменными окружения: `CDC_SLOT`, `CDC_PUBLICATION`, `CDC_MESSAGE_PREFIX` (префикс MESSAGE-канала контекста, ADR-0004), `CDC_IGNORE_TABLES`, `CDC_BATCH_SIZE` (значения по умолчанию — в [`env.example`](env.example)).
 
 > Слот удерживает WAL источника: если воркер на dev-стенде больше не нужен, удалите слот, чтобы WAL не копился:
 >
@@ -89,7 +96,7 @@ ALTER PUBLICATION audit DROP TABLE [table3];
 ALTER TABLE [table3] REPLICA IDENTITY DEFAULT;
 ```
 
-3. Контекст приложения и события передаются через `pg_logical_emit_message` в собственной транзакции клиента (ADR-0002): ключ `trace_id` верхнего уровня payload становится колонкой журнала и объединяет все строки одной операции:
+3. Контекст операции передаётся через `pg_logical_emit_message` в собственной транзакции клиента (ADR-0004): ключ `trace_id` верхнего уровня payload становится колонкой журнала, а весь payload — контекстом всех изменений этой транзакции. MESSAGE строк журнала не создаёт: единственное содержимое журнала — изменения строк, событие без изменений строк в него не попадает (журнал событий приложение ведёт само):
 
 ```SQL
 BEGIN;

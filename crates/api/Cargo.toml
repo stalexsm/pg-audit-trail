@@ -2,7 +2,7 @@
 name = "api"
 version.workspace = true
 edition.workspace = true
-description = "Ядро приложения журнала событий"
+description = "REST API журнала аудита изменений PostgreSQL"
 
 [dependencies]
 anyhow.workspace = true

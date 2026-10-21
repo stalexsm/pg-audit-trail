@@ -59,6 +59,7 @@ fn worker_config(
         source_database_url: source_url,
         slot,
         publication: "audit".to_owned(),
+        message_prefix: "_audit".to_owned(),
         ignore_tables: vec!["public.schema_migrations".to_owned()],
         batch_size: 2,
         reconnect_initial_backoff_ms: initial_backoff_ms,
@@ -435,34 +436,30 @@ async fn sigterm_restart_keeps_journal_complete() {
         "журнал полон: каждая строка источника на месте"
     );
 
-    // Replay транзакции с MESSAGE: ровно одна строка события, payload и
-    // trace_id на месте (AC тикета #8).
+    // Replay транзакции с MESSAGE (ADR-0004): MESSAGE строку журнала не
+    // создаёт — транзакция переиграна ровно один раз как строка INSERT
+    // orders 4 с контекстом и trace_id из MESSAGE.
     let message_rows: i64 =
         sqlx::query_scalar("SELECT count(*) FROM changes WHERE operation = 'MESSAGE'")
             .fetch_one(&audit)
             .await
             .expect("подсчёт MESSAGE-строк после рестарта");
     assert_eq!(
-        message_rows, 1,
-        "транзакция с MESSAGE должна быть переиграна ровно один раз"
+        message_rows, 0,
+        "MESSAGE строк журнала не создаёт (ADR-0004)"
     );
-    let (trace_id, context): (Option<String>, serde_json::Value) =
-        sqlx::query_as("SELECT trace_id, context FROM changes WHERE operation = 'MESSAGE'")
-            .fetch_one(&audit)
-            .await
-            .expect("строка MESSAGE после рестарта");
-    assert_eq!(trace_id.as_deref(), Some("op-sigterm"));
-    assert_eq!(context, serde_json::json!({"trace_id": "op-sigterm"}));
-    let order4_context: serde_json::Value = sqlx::query_scalar(
-        "SELECT context FROM changes WHERE \"table\" = 'orders' AND after->>'id' = '4'",
+    let (trace_id, context): (Option<String>, serde_json::Value) = sqlx::query_as(
+        "SELECT trace_id, context FROM changes \
+         WHERE \"table\" = 'orders' AND after->>'id' = '4'",
     )
     .fetch_one(&audit)
     .await
     .expect("строка orders 4 после рестарта");
+    assert_eq!(trace_id.as_deref(), Some("op-sigterm"));
     assert_eq!(
-        order4_context,
+        context,
         serde_json::json!({"trace_id": "op-sigterm"}),
-        "строка изменения получила контекст MESSAGE своей транзакции"
+        "строка изменения получила payload MESSAGE своей транзакции"
     );
 
     shutdown_cleanly(token2, handle2).await;

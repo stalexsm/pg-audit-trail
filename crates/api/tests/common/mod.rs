@@ -131,21 +131,6 @@ impl SeedRow {
             created_at,
         }
     }
-
-    /// Строка события приложения (ADR-0002): не привязано к таблице,
-    /// образов нет, payload — в `context`.
-    pub fn message(payload: Value, created_at: DateTime<Utc>) -> Self {
-        let trace_id = payload
-            .get("trace_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        let mut row = Self::new("MESSAGE", created_at);
-        row.schema = String::new();
-        row.table = String::new();
-        row.context = payload;
-        row.trace_id = trace_id;
-        row
-    }
 }
 
 /// Вставляет строку журнала чистым SQL; позиция в WAL уникальна в пределах

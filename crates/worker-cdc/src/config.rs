@@ -21,6 +21,12 @@ pub struct WorkerConfig {
     #[serde(default = "default_publication")]
     pub publication: String,
 
+    /// Префикс MESSAGE, интерпретируемого как канал контекста транзакции
+    /// (`CDC_MESSAGE_PREFIX`); MESSAGE с другими префиксами только расходует
+    /// индекс события, строкам контекст не меняет.
+    #[serde(default = "default_message_prefix")]
+    pub message_prefix: String,
+
     /// Игнорируемые (служебные) таблицы источника в виде `schema.table`
     /// (`CDC_IGNORE_TABLES`, через запятую).
     #[serde(default = "default_ignore_tables")]
@@ -47,6 +53,12 @@ fn default_slot() -> String {
 
 fn default_publication() -> String {
     "audit".to_owned()
+}
+
+/// Префикс MESSAGE контекста транзакции: исторически `_audit`, как
+/// в легаси-пайплайне.
+fn default_message_prefix() -> String {
+    "_audit".to_owned()
 }
 
 /// Служебные таблицы типовых миграторов: в журнал они не попадают.
@@ -114,8 +126,19 @@ mod tests {
         assert_eq!(config.slot, "survival-slot");
         assert_eq!(config.publication, "audit");
         assert_eq!(
+            config.message_prefix, "_audit",
+            "без CDC_MESSAGE_PREFIX — исторический дефолт"
+        );
+        assert_eq!(
             config.ignore_tables,
             vec!["public.a".to_owned(), "public.b".to_owned()]
         );
+
+        // Префикс MESSAGE-канала контекста переопределяется из окружения.
+        unsafe {
+            std::env::set_var("CDC_MESSAGE_PREFIX", "_ctx");
+        }
+        let config = WorkerConfig::from_env().expect("конфиг из окружения");
+        assert_eq!(config.message_prefix, "_ctx");
     }
 }

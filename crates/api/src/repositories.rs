@@ -31,8 +31,8 @@ pub(crate) struct JournalQuery {
 
 /// Репозиторий журнала: единственная сущность — `changes` (ADR-0002).
 ///
-/// Изменения строк и события приложения (операция MESSAGE) читаются
-/// из одной таблицы.
+/// Читаются только изменения строк: MESSAGE строк журнала не создаёт
+/// (ADR-0004), он лишь обогащает их `context` и `trace_id`.
 #[derive(Debug)]
 pub(crate) struct ChangeRepo;
 
@@ -144,7 +144,7 @@ impl ChangeRepo {
 
 /// Добавляет условия фильтров к запросу со сквозным псевдонимом `c`.
 fn push_filters(builder: &mut QueryBuilder<Postgres>, q: &JournalQuery) {
-    // Фильтр «вся операция» — равенство по колонке trace_id (ADR-0002).
+    // Фильтр «вся операция» — равенство по колонке trace_id (ADR-0004):
     if let Some(val) = &q.trace_id {
         builder.push(" AND c.trace_id = ").push_bind(val);
     }
