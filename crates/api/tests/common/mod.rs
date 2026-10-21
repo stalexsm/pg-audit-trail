@@ -88,25 +88,12 @@ pub async fn connect_admin(url: &str) -> PgPool {
         .expect("нет подключения к стенду — поднимите `docker compose up -d`")
 }
 
-/// Готовит журнал тестовой БД: применяет миграции и снимает легаси —
-/// таблицу `audits` и колонку `request_id`. После этого любой запрос API,
-/// обращённый к ним, упал бы с ошибкой: тесты сами доказывают, что API
-/// читает только `changes`.
+/// Готовит журнал тестовой БД: применяет миграции.
 pub async fn setup_journal(pool: &PgPool) {
     sqlx::migrate!("../../migrations")
         .run(pool)
         .await
         .expect("применение миграций");
-
-    sqlx::query("DROP TABLE IF EXISTS audits")
-        .execute(pool)
-        .await
-        .expect("удаление легаси-таблицы audits");
-
-    sqlx::query("ALTER TABLE changes DROP COLUMN IF EXISTS request_id")
-        .execute(pool)
-        .await
-        .expect("удаление легаси-колонки request_id");
 }
 
 /// Строка журнала для сидирования чистым SQL.

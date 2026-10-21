@@ -1,29 +1,21 @@
 # syntax=docker/dockerfile:1
 
-# Comments are provided throughout this file to help you get started.
-# If you need more help, visit the Dockerfile reference guide at
-# https://docs.docker.com/go/dockerfile-reference/
-
-# Want to help us make this template better? Share your feedback here: https://forms.gle/ybq9Krt8jtBL3iCk7
-
-ARG RUST_VERSION=1.90.0
-ARG APP_NAME=api
-ARG WORKER_APP_NAME=worker-app
-ARG WORKER_DEBEZIUM_NAME=worker-debezium
+ARG RUST_VERSION=1.99.1
+ARG API_NAME=api
+ARG WORKER_CDC_NAME=worker-cdc
 
 ################################################################################
 # Create a stage for building the application.
 
 FROM rust:${RUST_VERSION}-alpine AS build
 
-ARG APP_NAME
-ARG WORKER_APP_NAME
-ARG WORKER_DEBEZIUM_NAME
+ARG API_NAME
+ARG WORKER_CDC_NAME
 
 WORKDIR /app
 
 # Install host build dependencies.
-RUN apk add --no-cache clang lld musl-dev git openssl-dev pkgconfig cmake make g++ curl openssl-libs-static
+RUN apk add --no-cache clang lld musl-dev git openssl-dev pkgconfig curl openssl-libs-static
 
 # Build the application.
 # Leverage a cache mount to /usr/local/cargo/registry/
@@ -33,34 +25,28 @@ RUN apk add --no-cache clang lld musl-dev git openssl-dev pkgconfig cmake make g
 # Leverage a bind mount to the src directory to avoid having to copy the
 # source code into the container. Once built, copy the executable to an
 # output directory before the cache mounted /app/target is unmounted.
+# Каталог migrations нужен на этапе сборки: макрос sqlx::migrate! встраивает
+# миграции в бинарник при компиляции.
 RUN --mount=type=bind,source=crates,target=crates \
     --mount=type=bind,source=Cargo.toml,target=Cargo.toml \
     --mount=type=bind,source=Cargo.lock,target=Cargo.lock,rw \
-    --mount=type=bind,source=start.sh,target=start.sh \
     --mount=type=bind,source=migrations,target=migrations \
     --mount=type=cache,target=/app/target/ \
     --mount=type=cache,target=/usr/local/cargo/git/db \
     --mount=type=cache,target=/usr/local/cargo/registry/ \
     cargo build --release && \
-    cp ./target/release/$APP_NAME /bin/ && \
-    cp ./target/release/$WORKER_APP_NAME /bin/ && \
-    cp ./target/release/$WORKER_DEBEZIUM_NAME /bin/ && \
-    cp ./start.sh /bin/start.sh
+    cp ./target/release/$API_NAME /bin/ && \
+    cp ./target/release/$WORKER_CDC_NAME /bin/
 
 ################################################################################
 # Create a new stage for running the application that contains the minimal
 # runtime dependencies for the application. This often uses a different base
 # image from the build stage where the necessary files are copied from the build
 # stage.
-#
-# The example below uses the alpine image as the foundation for running the app.
-# By specifying the "3.18" tag, it will use version 3.18 of alpine. If
-# reproducibility is important, consider using a digest
-# (e.g., alpine@sha256:664888ac9cfd28068e062c991ebcff4b4c7307dc8dd4df9e728bedde5c449d91).
 FROM alpine:3.18 AS final
 
-# Установить tini в runtime образе
-RUN apk add --no-cache tini
+# curl — healthcheck сервиса api
+RUN apk add --no-cache curl
 
 WORKDIR /app
 
@@ -69,17 +55,18 @@ RUN mkdir -p /app/logs
 
 # Copy the executable from the "build" stage.
 COPY --from=build /bin/api /app/
-COPY --from=build /bin/worker-app /app/
-COPY --from=build /bin/worker-debezium /app/
-COPY --from=build /bin/start.sh /app/
+COPY --from=build /bin/worker-cdc /app/
 
 # Expose the port that the application listens on.
 EXPOSE 8000
 
 # Make executables executable
-RUN chmod +x /app/api /app/worker-app /app/worker-debezium /app/start.sh
+RUN chmod +x /app/api /app/worker-cdc
 
-ENTRYPOINT ["tini", "--"]
+# Контейнер запускает процесс как PID 1 без init: ядро не доставляет сигналы
+# с дефолтной диспетчеризацией PID 1, поэтому оба сервиса сами обрабатывают
+# SIGTERM/SIGINT (worker-cdc — через tokio::signal, api — graceful shutdown).
 
-# What the container should run when it is started.
-CMD ["/app/start.sh"]
+# Что запускает контейнер по умолчанию; сервис worker-cdc в compose.yaml
+# переопределяет команду на /app/worker-cdc.
+CMD ["/app/api"]

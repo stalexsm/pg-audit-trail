@@ -136,7 +136,7 @@ impl TransactionBuffer {
 }
 
 /// Имя операции в журнале для типа изменения pgoutput.
-/// Вставка в журнал называется CREATE — так было в Debezium-пайплайне.
+/// Вставка строки в журнал традиционно называется CREATE.
 pub fn operation_name(kind: ChangeKind) -> &'static str {
     match kind {
         ChangeKind::Insert => "CREATE",

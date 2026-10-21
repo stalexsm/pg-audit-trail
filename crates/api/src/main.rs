@@ -5,6 +5,7 @@ use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::get}
 use serde::Serialize;
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
+use tokio::signal;
 use tower_http::{
     compression::CompressionLayer,
     cors::{Any, CorsLayer},
@@ -86,19 +87,32 @@ async fn main() -> anyhow::Result<()> {
             .merge(api_router())
             .fallback(handler_404)
             .layer(TraceLayer::new_for_http())
-            .layer(
-                CorsLayer::new()
-                    .allow_origin(Any)
-                    .allow_headers(Any)
-                    .allow_headers(Any),
-            )
+            .layer(CorsLayer::new().allow_origin(Any).allow_headers(Any))
             .layer(CompressionLayer::new())
             .with_state(pool)
             .into_make_service(),
     )
+    // В контейнере процесс — PID 1 без init: без установленного обработчика
+    // ядро не доставит SIGTERM, и `docker stop` ждал бы таймаута до SIGKILL.
+    .with_graceful_shutdown(shutdown_signal())
     .await?;
 
     Ok(())
+}
+
+/// Остановка api по SIGTERM/SIGINT: сервер перестаёт принимать новые
+/// соединения и дождивается активных запросов (конвенция остановки по
+/// сигналам — как у worker-cdc).
+async fn shutdown_signal() {
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+        .expect("Не удалось зарегистрировать обработчик SIGTERM");
+    let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
+        .expect("Не удалось зарегистрировать обработчик SIGINT");
+
+    tokio::select! {
+        _ = sigterm.recv() => info!("Получен SIGTERM, останавливаем api"),
+        _ = sigint.recv() => info!("Получен SIGINT (Ctrl+C), останавливаем api"),
+    }
 }
 
 #[derive(Debug, Serialize)]

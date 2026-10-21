@@ -1,42 +1,28 @@
 @startuml
-
-!include <logos/kafka>
-!include <logos/java>
 !include <logos/postgresql>
 !include <logos/rust>
 
 actor Client #black
 
-package Debezium {
-  rectangle "<$java>\n\n   API" as Api_D
-  rectangle "  <$java>\n\nDebezium\n Connect" as D
-}
-
 package M_Audit {
-   rectangle  "<$rust>\n\nWorker" as W
-   rectangle "<$rust>\n\n   Api" as A
-   database "<$postgresql>" as PG
+  rectangle "<$rust>\n\nWorker CDC" as W
+  rectangle "<$rust>\n\n   Api" as A
+  database "<$postgresql>" as PG
 
-   A <-down-> PG: Read
-   W -down-> PG: Write
+  A <-right-> PG: Read
+  W -> PG: Write
 }
 
 package M_Any {
-   database "<$postgresql>" as PG_ANY
-   rectangle "Api" as A_Any
+  database "<$postgresql>" as PG_ANY
+  rectangle "Api" as A_Any
 
-   A_Any <-> PG_ANY: Write/Read
+  A_Any <-> PG_ANY: Write/Read
 }
 
-queue "<$kafka>" as K
+Client -> A
 
-M_Any ..> Api_D: Добавление данных о БД в коннектор.
-PG_ANY -> D: CDC.
-D -down-> K: Debezium скидывает данные по топикам в kafka.
-
-K -> W: Worker читает топики и обрабатывает.
-A_Any ..down..> K: Данные о выполнении запроса
-
-A <-right-> Client
+A_Any -> PG_ANY: pg_logical_emit_message\nв собственной транзакции (ADR-0002).
+PG_ANY ->> W: Логическая репликация pgoutput\n(слот источника, ADR-0001).
 
 @enduml
