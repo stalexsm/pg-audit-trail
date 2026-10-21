@@ -1,0 +1,158 @@
+# Гейты CI/CD для PR и main.
+#
+# Обязательные проверки (гейты), джоба gates — зелёная только когда все зелёные:
+#   fmt     — форматирование (cargo fmt --check);
+#   clippy  — линтер без предупреждений (cargo clippy --all --all-targets -- -D warnings);
+#   test    — все тесты workspace, включая живые интеграционные (два PostgreSQL
+#             поднимаются из compose.yaml: db1 :54399 и db-src :54398);
+#   docker  — сборка образа из Dockerfile (тот же target final, что идёт в compose);
+#   skylos  — Python: мёртвый код, секреты, уязвимости (конфиг — skylos.toml);
+#   semgrep — SAST по правилам p/default (Semgrep Community Edition, без токена).
+#
+# В branch protection достаточно одной required check — «gates»: новые джобы
+# добавляются в needs, настройки защиты не меняются.
+#
+# Actions запинены на полные commit SHA (проверяется гейтом skylos, SKY-D292):
+# обновление — осознанная замена SHA с комментарием версии.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Для одного PR — одна активная сборка: новая отменяет предыдущую
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: rustfmt
+      - name: Форматирование
+        run: cargo fmt --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Линтер (предупреждения запрещены)
+        run: cargo clippy --all --all-targets -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Поднять инфраструктуру (db1 + db-src)
+        run: docker compose up -d --wait --wait-timeout 180 db1 db-src
+
+      # Живые тесты подключаются к дефолтным адресам стенда
+      # (localhost:54399 — db1, localhost:54398 — db-src); миграции
+      # накатываются самими тестами через sqlx::migrate!.
+      - name: Тесты workspace
+        run: cargo test --workspace
+
+  docker:
+    name: docker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Сборка образа (target final)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          target: final
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  skylos:
+    name: skylos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Установка skylos
+        run: pip install skylos==4.50.1
+      # Мёртвый код, секреты, уязвимости Python-кода (scripts/loadgen) и
+      # собственно workflow; подавления правил — в skylos.toml и inline
+      # `# skylos: ignore[...]` с обоснованиями. Исключения — только через
+      # CLI (при --config-file exclude из файла перекрывает CLI-флаги).
+      - name: Скан skylos (гейт)
+        run: >
+          skylos . --secrets --danger --gate --config-file skylos.toml
+          --exclude target --exclude README.md
+
+  semgrep:
+    name: semgrep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Установка semgrep (Community Edition)
+        run: pipx install semgrep==1.181.0
+      # Правила подавлены с обоснованием:
+      # - sqlalchemy-execute-raw-query: ложные срабатывания в scripts/loadgen —
+      #   там psycopg-композиция sql.SQL(...).format(sql.Identifier(...)),
+      #   параметризованная и безопасная;
+      # - missing-user: непривилегированный пользователь в Dockerfile —
+      #   техдолг (#23), смена USER сейчас сломает запись
+      #   в volume ./logs на Linux.
+      - name: SAST-скан semgrep (гейт)
+        run: >
+          semgrep scan --config p/default --error --metrics=off
+          --exclude-rule python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+          --exclude-rule dockerfile.security.missing-user.missing-user
+
+  gates:
+    # Сводный гейт для branch protection: required status check «gates»
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, test, docker, skylos, semgrep]
+    if: always()
+    steps:
+      - name: Все гейты зелёные
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}
+        run: |
+          echo "Результаты гейтов: ${{ toJson(needs.*.result) }}"
+          exit 1
+      - name: Итог
+        run: |
+          echo "Все гейты пройдены: ${{ toJson(needs.*.result) }}"
