@@ -390,9 +390,22 @@ async fn sigterm_restart_keeps_journal_complete() {
     }
     wait_journal_count(&audit, 3).await;
 
-    // Чистая остановка по сигналу с событием «в полёте»: незакоммиченная
-    // транзакция буфера должна быть переиграна слотом после рестарта.
-    emit_order(&source, 4, "в полёте").await;
+    // Чистая остановка по сигналу с транзакцией «в полёте» (INSERT +
+    // MESSAGE): незакоммиченный буфер должен быть переигран слотом после
+    // рестарта — ровно один раз, без дублей и с контекстом.
+    let mut tx = source.begin().await.expect("транзакция в полёте");
+    sqlx::query("INSERT INTO orders VALUES (4, 1.00, 'в полёте', now())")
+        .execute(&mut *tx)
+        .await
+        .expect("insert orders 4");
+    sqlx::query(
+        "SELECT pg_logical_emit_message(true, '_audit', \
+         '{\"trace_id\": \"op-sigterm\"}')",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("emit_message _audit в полёте");
+    tx.commit().await.expect("коммит транзакции в полёте");
     tokio::time::sleep(Duration::from_millis(100)).await;
     shutdown_cleanly(token, handle).await;
 
@@ -420,6 +433,36 @@ async fn sigterm_restart_keeps_journal_complete() {
     assert_eq!(
         distinct_ids, 6,
         "журнал полон: каждая строка источника на месте"
+    );
+
+    // Replay транзакции с MESSAGE: ровно одна строка события, payload и
+    // trace_id на месте (AC тикета #8).
+    let message_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM changes WHERE operation = 'MESSAGE'")
+            .fetch_one(&audit)
+            .await
+            .expect("подсчёт MESSAGE-строк после рестарта");
+    assert_eq!(
+        message_rows, 1,
+        "транзакция с MESSAGE должна быть переиграна ровно один раз"
+    );
+    let (trace_id, context): (Option<String>, serde_json::Value) =
+        sqlx::query_as("SELECT trace_id, context FROM changes WHERE operation = 'MESSAGE'")
+            .fetch_one(&audit)
+            .await
+            .expect("строка MESSAGE после рестарта");
+    assert_eq!(trace_id.as_deref(), Some("op-sigterm"));
+    assert_eq!(context, serde_json::json!({"trace_id": "op-sigterm"}));
+    let order4_context: serde_json::Value = sqlx::query_scalar(
+        "SELECT context FROM changes WHERE \"table\" = 'orders' AND after->>'id' = '4'",
+    )
+    .fetch_one(&audit)
+    .await
+    .expect("строка orders 4 после рестарта");
+    assert_eq!(
+        order4_context,
+        serde_json::json!({"trace_id": "op-sigterm"}),
+        "строка изменения получила контекст MESSAGE своей транзакции"
     );
 
     shutdown_cleanly(token2, handle2).await;

@@ -8,6 +8,16 @@ use tracing::warn;
 
 use crate::Result;
 
+/// Операция журнала для событий приложения (ADR-0002).
+pub const MESSAGE_OPERATION: &str = "MESSAGE";
+
+/// Ключ payload MESSAGE с идентификатором сквозной операции (ADR-0002).
+pub const TRACE_ID_KEY: &str = "trace_id";
+
+/// Ширина колонки `trace_id` (VARCHAR(255)): более длинные значения
+/// обрезаются, иначе вставка транзакции падала бы целиком.
+pub const MAX_TRACE_ID_LEN: usize = 255;
+
 /// Строка журнала, подготовленная к вставке в `changes`.
 #[derive(Debug, Clone)]
 pub struct ChangeRow {
@@ -18,11 +28,15 @@ pub struct ChangeRow {
     pub operation: &'static str,
     pub before: Value,
     pub after: Value,
+    /// Контекст приложения: payload MESSAGE (ADR-0002).
+    pub context: Value,
     pub committed_at: DateTime<Utc>,
     pub queued_at: DateTime<Utc>,
     pub transaction_id: i64,
     pub position: i64,
     pub event_index: i32,
+    /// Идентификатор сквозной операции: копия ключа `trace_id` payload.
+    pub trace_id: Option<String>,
 }
 
 /// Буфер одной транзакции источника: события копятся между Begin и Commit
@@ -31,6 +45,13 @@ pub struct TransactionBuffer {
     pub xid: i64,
     rows: Vec<ChangeRow>,
     event_index: i32,
+    /// Контекст последнего MESSAGE транзакции — его payload (ADR-0002).
+    context: Value,
+    /// trace_id последнего MESSAGE с этим ключом: проставляется всем
+    /// строкам транзакции при коммите.
+    trace_id: Option<String>,
+    /// Был ли уже MESSAGE: повторный — коллизия контекста (warn).
+    message_seen: bool,
 }
 
 impl TransactionBuffer {
@@ -39,6 +60,9 @@ impl TransactionBuffer {
             xid: i64::from(xid),
             rows: Vec::new(),
             event_index: 0,
+            context: json!({}),
+            trace_id: None,
+            message_seen: false,
         }
     }
 
@@ -57,6 +81,37 @@ impl TransactionBuffer {
 
     pub fn push_row(&mut self, row: ChangeRow) {
         self.rows.push(row);
+    }
+
+    /// Регистрирует MESSAGE-событие приложения (ADR-0002): строка события
+    /// попадает в журнал, её payload дословно становится контекстом
+    /// транзакции, а ключ `trace_id` — колонкой всех её строк. Строкам
+    /// изменений достаётся контекст последнего MESSAGE: повторный MESSAGE
+    /// — коллизия, warn в лог.
+    pub fn push_message(&mut self, row: ChangeRow) {
+        if self.message_seen {
+            warn!(
+                xid = self.xid,
+                "в транзакции несколько MESSAGE — строкам изменений достанется контекст последнего"
+            );
+        }
+        self.message_seen = true;
+        self.context = row.context.clone();
+        self.trace_id = row.trace_id.clone();
+        self.rows.push(row);
+    }
+
+    /// Проставляет контекст последнего MESSAGE (payload и `trace_id`)
+    /// всем строкам изменений транзакции — включая события до MESSAGE.
+    /// Вызывается при коммите; сами MESSAGE-строки хранят свой payload
+    /// без изменений.
+    pub fn apply_transaction_context(&mut self) {
+        for row in &mut self.rows {
+            if row.operation != MESSAGE_OPERATION {
+                row.context = self.context.clone();
+                row.trace_id = self.trace_id.clone();
+            }
+        }
     }
 
     pub fn rows(&self) -> &[ChangeRow] {
@@ -90,6 +145,28 @@ pub fn operation_name(kind: ChangeKind) -> &'static str {
 pub fn is_ignored(ignore_tables: &[String], schema: &str, table: &str) -> bool {
     let qualified = format!("{schema}.{table}");
     ignore_tables.iter().any(|entry| entry == &qualified)
+}
+
+/// Извлекает `trace_id` верхнего уровня payload MESSAGE (ADR-0002).
+///
+/// В колонку попадает только строковое значение ключа `trace_id`; сам
+/// payload сохраняется в `context` дословно, без вырезания ключа.
+/// Значение длиннее `MAX_TRACE_ID_LEN` (VARCHAR(255)) обрезается:
+/// вставка исходной длины уронила бы всю транзакцию вставки.
+pub fn trace_id_from_payload(payload: &Value) -> Option<String> {
+    let trace_id = payload.get(TRACE_ID_KEY)?.as_str()?;
+    if trace_id.len() <= MAX_TRACE_ID_LEN {
+        return Some(trace_id.to_owned());
+    }
+    let mut cutoff = MAX_TRACE_ID_LEN;
+    while !trace_id.is_char_boundary(cutoff) {
+        cutoff -= 1;
+    }
+    warn!(
+        original_len = trace_id.len(),
+        "trace_id длиннее {MAX_TRACE_ID_LEN} байт — обрезан"
+    );
+    Some(trace_id[..cutoff].to_owned())
 }
 
 /// Вставляет строки батчами (`push_values`) в одной транзакции с чекпоинтом.
@@ -132,7 +209,8 @@ async fn flush_once(
         let mut builder = QueryBuilder::new(
             "INSERT INTO changes \
              (database, schema, \"table\", primary_key, operation, before, after, context, \
-              committed_at, queued_at, transaction_id, position, commit_lsn, event_index) ",
+              committed_at, queued_at, transaction_id, position, commit_lsn, event_index, \
+              trace_id) ",
         );
         builder.push_values(chunk, |mut b, row| {
             b.push_bind(&row.database)
@@ -142,14 +220,14 @@ async fn flush_once(
                 .push_bind(row.operation)
                 .push_bind(&row.before)
                 .push_bind(&row.after)
-                // Контекст из MESSAGE подставляется тикетом #8 (ADR-0002).
-                .push_bind(json!({}))
+                .push_bind(&row.context)
                 .push_bind(row.committed_at)
                 .push_bind(row.queued_at)
                 .push_bind(row.transaction_id)
                 .push_bind(row.position)
                 .push_bind(commit_end_lsn)
-                .push_bind(row.event_index);
+                .push_bind(row.event_index)
+                .push_bind(&row.trace_id);
         });
         builder.push(" ON CONFLICT DO NOTHING");
         builder.build().execute(&mut *tx).await?;
@@ -173,6 +251,35 @@ async fn flush_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Строка журнала с заданной операцией для тестов агрегатора.
+    fn journal_row_fixture(operation: &'static str) -> ChangeRow {
+        ChangeRow {
+            database: "db".into(),
+            schema: "public".into(),
+            table: "t".into(),
+            primary_key: None,
+            operation,
+            before: json!({}),
+            after: json!({}),
+            context: json!({}),
+            committed_at: Utc::now(),
+            queued_at: Utc::now(),
+            transaction_id: 1,
+            position: 1,
+            event_index: 0,
+            trace_id: None,
+        }
+    }
+
+    /// MESSAGE-строка с заданным payload: context и trace_id заполняются
+    /// как в продовом обработчике (ADR-0002).
+    fn message_row_fixture(payload: Value) -> ChangeRow {
+        let mut row = journal_row_fixture(MESSAGE_OPERATION);
+        row.context = payload.clone();
+        row.trace_id = trace_id_from_payload(&payload);
+        row
+    }
 
     #[test]
     fn operation_naming_matches_journal_vocabulary() {
@@ -202,25 +309,85 @@ mod tests {
     fn take_rows_empties_buffer_but_keeps_counter() {
         let mut buffer = TransactionBuffer::new(1);
         buffer.next_index();
-        buffer.push_row(ChangeRow {
-            database: "db".into(),
-            schema: "public".into(),
-            table: "t".into(),
-            primary_key: None,
-            operation: "TRUNCATE",
-            before: json!({}),
-            after: json!({}),
-            committed_at: Utc::now(),
-            queued_at: Utc::now(),
-            transaction_id: 1,
-            position: 42,
-            event_index: 0,
-        });
+        buffer.push_row(journal_row_fixture("TRUNCATE"));
         assert_eq!(buffer.rows().len(), 1);
         let rows = buffer.take_rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].event_index, 0);
         assert!(buffer.rows().is_empty());
         assert_eq!(buffer.next_index(), 1, "счётчик событий не сбрасывается");
+    }
+
+    #[test]
+    fn trace_id_is_extracted_from_top_level_string() {
+        let payload = json!({"trace_id": "op-1", "user": "alice"});
+        assert_eq!(trace_id_from_payload(&payload).as_deref(), Some("op-1"));
+        // Payload не мутируется: context хранит его дословно (ADR-0002).
+        assert_eq!(payload["trace_id"], "op-1");
+        assert_eq!(payload["user"], "alice");
+    }
+
+    #[test]
+    fn trace_id_requires_top_level_string_key() {
+        assert_eq!(trace_id_from_payload(&json!({"user": "bob"})), None);
+        assert_eq!(trace_id_from_payload(&json!({})), None);
+        // Нестроковые значения в колонку не попадают.
+        assert_eq!(trace_id_from_payload(&json!({"trace_id": 42})), None);
+        assert_eq!(trace_id_from_payload(&json!({"trace_id": ["op"]})), None);
+    }
+
+    #[test]
+    fn trace_id_is_truncated_to_column_width() {
+        let long = "x".repeat(MAX_TRACE_ID_LEN + 10);
+        let extracted = trace_id_from_payload(&json!({ "trace_id": long }));
+        assert_eq!(extracted.expect("строка").len(), MAX_TRACE_ID_LEN);
+    }
+
+    #[test]
+    fn last_message_wins_for_change_rows() {
+        let mut buffer = TransactionBuffer::new(7);
+        buffer.push_row(journal_row_fixture("CREATE"));
+        buffer.push_message(message_row_fixture(json!({"trace_id": "op-1"})));
+        buffer.push_message(message_row_fixture(
+            json!({"trace_id": "op-2", "user": "bob"}),
+        ));
+
+        buffer.apply_transaction_context();
+        let rows = buffer.take_rows();
+        assert_eq!(rows.len(), 3);
+        // Строка изменения: контекст последнего MESSAGE, даже если она
+        // была до него.
+        assert_eq!(rows[0].context, json!({"trace_id": "op-2", "user": "bob"}));
+        assert_eq!(rows[0].trace_id.as_deref(), Some("op-2"));
+        // MESSAGE-строки хранят свои payload без изменений.
+        assert_eq!(rows[1].context, json!({"trace_id": "op-1"}));
+        assert_eq!(rows[1].trace_id.as_deref(), Some("op-1"));
+        assert_eq!(rows[2].context, json!({"trace_id": "op-2", "user": "bob"}));
+        assert_eq!(rows[2].trace_id.as_deref(), Some("op-2"));
+    }
+
+    #[test]
+    fn message_without_trace_id_leaves_column_empty() {
+        let mut buffer = TransactionBuffer::new(1);
+        buffer.push_row(journal_row_fixture("UPDATE"));
+        buffer.push_message(message_row_fixture(json!({"user": "bob"})));
+
+        buffer.apply_transaction_context();
+        let rows = buffer.take_rows();
+        assert_eq!(rows[1].trace_id, None, "колонка пустая без ключа");
+        assert_eq!(rows[1].context, json!({"user": "bob"}));
+        // Строке изменения достаётся payload, но не trace_id.
+        assert_eq!(rows[0].context, json!({"user": "bob"}));
+        assert_eq!(rows[0].trace_id, None);
+    }
+
+    #[test]
+    fn change_rows_without_messages_keep_empty_context() {
+        let mut buffer = TransactionBuffer::new(1);
+        buffer.push_row(journal_row_fixture("UPDATE"));
+        buffer.apply_transaction_context();
+        let rows = buffer.take_rows();
+        assert_eq!(rows[0].context, json!({}));
+        assert_eq!(rows[0].trace_id, None);
     }
 }

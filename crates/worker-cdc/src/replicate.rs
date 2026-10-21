@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Эпоха PostgreSQL: метки времени протокола репликации — микросекунды
 /// с 2000-01-01 00:00:00 UTC.
@@ -25,6 +25,10 @@ const PG_EPOCH_SECONDS: i64 = 946_684_800;
 /// application_name до 63 байт (NAMEDATALEN) — длинные имена слотов
 /// в статистике будут с «хвостом на срез».
 const APPLICATION_NAME_PREFIX: &str = "waltrail-cdc";
+
+/// Префикс MESSAGE-сообщений, интерпретируемых как события приложения
+/// (ADR-0002): сравнение точное, как в легаси-пайплайне.
+const AUDIT_MESSAGE_PREFIX: &str = "_audit";
 
 /// Размер пула к БД аудита: вставки батчами + чтение чекпоинта.
 const AUDIT_POOL_MAX_CONNECTIONS: u32 = 5;
@@ -205,25 +209,30 @@ async fn stream_session(
                     }
                 }
                 Ok(Some(ReplicationEvent::Message { transactional, prefix, lsn, content, .. })) => {
-                    // Событие приложения (ADR-0002) на этом этапе игнорируется:
-                    // строки с операцией MESSAGE — тикет #8. Индекс расходуется,
-                    // чтобы нумерация событий транзакции оставалась детерминированной
-                    // для replay-дедупликации.
-                    if transactional
-                        && let Some(buf) = buffer.as_mut()
-                    {
-                        buf.next_index();
+                    if !transactional {
+                        debug!(%prefix, %lsn, bytes = content.len(), "внетранзакционный MESSAGE пропущен");
+                        continue;
                     }
-                    info!(
-                        %prefix, %lsn, %transactional, bytes = content.len(),
-                        "MESSAGE пропущен (события приложения — тикет #8)"
-                    );
+                    let Some(buf) = buffer.as_mut() else {
+                        debug!(%prefix, %lsn, bytes = content.len(), "MESSAGE вне Begin пропущен");
+                        continue;
+                    };
+                    // Индекс расходуется на любой транзакционный MESSAGE:
+                    // нумерация событий транзакции детерминирована потоком
+                    // WAL — на этом держится replay-дедупликация.
+                    let event_index = buf.next_index();
+                    if prefix == AUDIT_MESSAGE_PREFIX {
+                        handle_audit_message(boot, buf, &content, lsn, event_index);
+                    }
                 }
                 Ok(Some(ReplicationEvent::Commit { end_lsn, commit_time_micros, .. })) => {
                     let Some(mut buf) = buffer.take() else {
                         continue;
                     };
                     buf.set_committed_at(pg_micros_to_utc(commit_time_micros));
+                    // Контекст последнего MESSAGE (ADR-0002) проставляется
+                    // строкам изменений строго перед вставкой батча.
+                    buf.apply_transaction_context();
                     let rows = buf.take_rows();
                     match ingest::flush(
                         audit,
@@ -437,6 +446,48 @@ async fn handle_xlog(
     Ok(())
 }
 
+/// Обрабатывает MESSAGE префикса `_audit` (ADR-0002): строка события
+/// приложения попадает в журнал, payload целиком — в `context`, строковое
+/// значение ключа `trace_id` верхнего уровня — в колонку и далее всем
+/// строкам транзакции. Контрактом payload является JSON: не-JSON payload
+/// порождает warn и в журнал не попадает, на поток репликации это не
+/// влияет (индекс события уже потрачен).
+fn handle_audit_message(
+    boot: &Bootstrap,
+    buf: &mut TransactionBuffer,
+    content: &[u8],
+    lsn: Lsn,
+    event_index: i32,
+) {
+    let payload: Value = match std::str::from_utf8(content)
+        .map_err(|e| anyhow::anyhow!("не-UTF8 payload: {e}"))
+        .and_then(|text| {
+            serde_json::from_str(text).map_err(|e| anyhow::anyhow!("payload не JSON: {e}"))
+        }) {
+        Ok(payload) => payload,
+        Err(e) => {
+            warn!(%lsn, error = %e, "payload MESSAGE пропущен: контракт — JSON (ADR-0002)");
+            return;
+        }
+    };
+    if payload
+        .get(ingest::TRACE_ID_KEY)
+        .is_some_and(|value| !value.is_string())
+    {
+        warn!(%lsn, "ключ trace_id в payload MESSAGE не строка — в колонку не попал");
+    }
+    let trace_id = ingest::trace_id_from_payload(&payload);
+    buf.push_message(message_row(
+        boot,
+        payload,
+        trace_id,
+        lsn,
+        event_index,
+        buf.xid,
+    ));
+    debug!(%lsn, "MESSAGE сохранён в журнал");
+}
+
 /// Строка журнала из декодированного события: метаданные источника,
 /// время чтения из WAL и LSN события (`position`).
 #[allow(clippy::too_many_arguments)] // все поля — данные одного события
@@ -459,11 +510,43 @@ fn journal_row(
         operation,
         before,
         after,
+        // Контекст последнего MESSAGE проставляется при коммите (ADR-0002).
+        context: json!({}),
         committed_at: Utc::now(), // перезаписывается временем коммита
         queued_at: Utc::now(),
         transaction_id: xid,
         position: wal_start.as_u64() as i64, // LSN события: u64 влезает в i64
         event_index,
+        trace_id: None,
+    }
+}
+
+/// Строка журнала для события приложения MESSAGE (ADR-0002): событие не
+/// привязано к таблице (схема и таблица пустые), образов нет, payload —
+/// в `context`, `trace_id` — в одноимённую колонку.
+fn message_row(
+    boot: &Bootstrap,
+    payload: Value,
+    trace_id: Option<String>,
+    lsn: Lsn,
+    event_index: i32,
+    xid: i64,
+) -> ChangeRow {
+    ChangeRow {
+        database: boot.source_database.clone(),
+        schema: String::new(),
+        table: String::new(),
+        primary_key: None,
+        operation: ingest::MESSAGE_OPERATION,
+        before: json!({}),
+        after: json!({}),
+        context: payload,
+        committed_at: Utc::now(), // перезаписывается временем коммита
+        queued_at: Utc::now(),
+        transaction_id: xid,
+        position: lsn.as_u64() as i64, // LSN события: u64 влезает в i64
+        event_index,
+        trace_id,
     }
 }
 
