@@ -1,15 +1,33 @@
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
 use serde_json::{Map, Value, json};
 use sqlx::{PgPool, Postgres, QueryBuilder};
-use tracing::error;
 use uuid::Uuid;
 
-use crate::dto::{ChangeDetailDTO, ChangeRowDTO, QChange};
+use crate::{
+    AppResult,
+    dto::{ChangeDetailDTO, ChangeRowDTO, TimeRange},
+};
 
 /// Число ключей в краткой сводке образов строки списка.
 const CHANGES_SUMMARY_KEYS: i64 = 4;
+
+/// Типизированный запрос списка журнала: вход репозитория. Всё, что
+/// приходит извне, проверено и разобрано на уровне axum (axum-valid +
+/// обработчик): здесь только чистые данные, без парсинга строк.
+pub(crate) struct JournalQuery {
+    pub page: i32,
+    pub per_page: i32,
+    pub trace_id: Option<String>,
+    pub table: Option<String>,
+    pub operation: Option<String>,
+    /// Диапазон времени сохранения (нижняя и верхняя границы).
+    pub time_range: TimeRange,
+    /// Направление сортировки: `true` — от свежих к старым.
+    pub descending: bool,
+    /// Фильтры вхождения в `context`.
+    pub context_filters: HashMap<String, String>,
+}
 
 /// Репозиторий журнала: единственная сущность — `changes` (ADR-0002).
 ///
@@ -24,10 +42,12 @@ impl ChangeRepo {
     ///
     /// Сортировка — по времени сохранения в журнал; направление задаётся
     /// параметром `sortable` (`created_at:asc|desc`, по умолчанию desc).
-    pub(crate) async fn get_list_paginate(pool: &PgPool, q: &QChange) -> (Vec<ChangeRowDTO>, i64) {
-        let page = q.normalized_page();
-        let per_page = q.normalized_per_page();
-        let offset = (page - 1) * per_page;
+    /// Ошибка БД — ошибкой запроса (500), а не пустой страницей.
+    pub(crate) async fn get_list_paginate(
+        pool: &PgPool,
+        q: &JournalQuery,
+    ) -> AppResult<(Vec<ChangeRowDTO>, i64)> {
+        let offset = (q.page - 1) * q.per_page;
 
         let mut builder = QueryBuilder::new(
             "
@@ -71,46 +91,32 @@ impl ChangeRepo {
 
         push_filters(&mut builder, q);
 
-        // Сортировка по времени сохранения: направление — из параметра,
-        // всё кроме asc трактуется как desc (естественный порядок журнала).
-        let direction = match q.sortable.split_once(':') {
-            Some((_, order)) if order.eq_ignore_ascii_case("asc") => "ASC",
-            _ => "DESC",
-        };
+        // Сортировка по времени сохранения. Тай-брейк по id: TIMESTAMPTZ(0)
+        // даёт совпадения внутри секунды, без него порядок строк страницы
+        // недетерминирован.
+        let direction = if q.descending { "DESC" } else { "ASC" };
         builder.push(" ORDER BY c.created_at ").push(direction);
+        builder.push(", c.id ").push(direction);
 
         builder.push(" OFFSET ").push_bind(offset);
-        builder.push(" LIMIT ").push_bind(per_page);
+        builder.push(" LIMIT ").push_bind(q.per_page);
 
-        let rows: Vec<ChangeRowDTO> = builder
-            .build_query_as()
-            .fetch_all(pool)
-            .await
-            .unwrap_or_else(|e| {
-                error!(error=%e, "Ошибка запроса списка журнала!");
-                vec![]
-            });
+        let rows: Vec<ChangeRowDTO> = builder.build_query_as().fetch_all(pool).await?;
 
         let mut builder = QueryBuilder::new("SELECT COUNT(*) FROM changes AS c WHERE true");
         push_filters(&mut builder, q);
 
-        let cnt: i64 = builder
-            .build_query_scalar()
-            .fetch_one(pool)
-            .await
-            .unwrap_or_else(|e| {
-                error!(error=%e, "Ошибка подсчёта журнала!");
-                0
-            });
+        let cnt: i64 = builder.build_query_scalar().fetch_one(pool).await?;
 
-        let pages = (cnt as f64 / per_page as f64).ceil() as i64;
+        let pages = (cnt as f64 / q.per_page as f64).ceil() as i64;
 
-        (rows, pages)
+        Ok((rows, pages))
     }
 
-    /// Детальная строка журнала по идентификатору.
-    pub(crate) async fn get_by_id(pool: &PgPool, id: Uuid) -> Option<ChangeDetailDTO> {
-        sqlx::query_as(
+    /// Детальная строка журнала по идентификатору; ошибка БД — ошибкой
+    /// запроса (500), отличие от `Ok(None)` — записи нет (404).
+    pub(crate) async fn get_by_id(pool: &PgPool, id: Uuid) -> AppResult<Option<ChangeDetailDTO>> {
+        let found = sqlx::query_as(
             "
             SELECT
                 c.id,
@@ -131,16 +137,14 @@ impl ChangeRepo {
         )
         .bind(id)
         .fetch_optional(pool)
-        .await
-        .unwrap_or_else(|e| {
-            error!(error=%e, "Ошибка запроса детальной журнала!");
-            None
-        })
+        .await?;
+
+        Ok(found)
     }
 }
 
 /// Добавляет условия фильтров к запросу со сквозным псевдонимом `c`.
-fn push_filters(builder: &mut QueryBuilder<Postgres>, q: &QChange) {
+fn push_filters(builder: &mut QueryBuilder<Postgres>, q: &JournalQuery) {
     // Фильтр «вся операция» — равенство по колонке trace_id (ADR-0002).
     if let Some(val) = &q.trace_id {
         builder.push(" AND c.trace_id = ").push_bind(val);
@@ -158,19 +162,12 @@ fn push_filters(builder: &mut QueryBuilder<Postgres>, q: &QChange) {
             .push_bind(val.to_lowercase());
     }
 
-    // Диапазон времени сохранения: `start..end`, одна граница — нижняя.
-    if let Some(val) = &q.created_at {
-        if let Some((start, end)) = val.split_once("..") {
-            if let Ok(dt) = start.parse::<DateTime<Utc>>() {
-                builder.push(" AND c.created_at >= ").push_bind(dt);
-            }
-
-            if let Ok(dt) = end.parse::<DateTime<Utc>>() {
-                builder.push(" AND c.created_at <= ").push_bind(dt);
-            }
-        } else if let Ok(dt) = val.parse::<DateTime<Utc>>() {
-            builder.push(" AND c.created_at >= ").push_bind(dt);
-        }
+    // Диапазон времени сохранения: границы уже разобраны на входе.
+    if let Some(start) = q.time_range.0 {
+        builder.push(" AND c.created_at >= ").push_bind(start);
+    }
+    if let Some(end) = q.time_range.1 {
+        builder.push(" AND c.created_at <= ").push_bind(end);
     }
 
     // Вхождение в контекст (GIN-индекс `changes_context_index`): варианты

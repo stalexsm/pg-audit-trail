@@ -3,6 +3,7 @@ use axum::{
     extract::{Path, Query, State},
     routing::get,
 };
+use axum_valid::Valid;
 use sqlx::{PgPool, Pool, Postgres};
 use utoipa::OpenApi;
 use uuid::Uuid;
@@ -43,9 +44,9 @@ pub fn api_router() -> Router<Pool<Postgres>> {
 )]
 pub async fn get_list_changes(
     State(pool): State<PgPool>,
-    Query(q): Query<QChange>,
+    Valid(Query(q)): Valid<Query<QChange>>,
 ) -> AppResult<Json<ChangePageDTO>> {
-    let res = s::get_list_changes(State(pool), Query(q)).await?;
+    let res = s::get_list_changes(State(pool), Valid(Query(q))).await?;
 
     Ok(Json(res))
 }

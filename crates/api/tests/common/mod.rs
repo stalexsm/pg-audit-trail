@@ -194,6 +194,14 @@ pub async fn insert_row(pool: &PgPool, row: &SeedRow) {
 
 /// GET-запрос к роутеру API; возвращает статус и разобранный JSON-ответ.
 pub async fn get_json(router: Router, uri: &str) -> (StatusCode, Value) {
+    let (status, body) = get_raw(router, uri).await;
+    let json = serde_json::from_str(&body).expect("JSON-ответ");
+    (status, json)
+}
+
+/// GET-запрос к роутеру API без разбора тела: rejection-и axum (400)
+/// отвечают не во всех случаях JSON'ом.
+pub async fn get_raw(router: Router, uri: &str) -> (StatusCode, String) {
     let response = router
         .oneshot(
             Request::builder()
@@ -208,7 +216,5 @@ pub async fn get_json(router: Router, uri: &str) -> (StatusCode, Value) {
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("тело ответа");
-    let json = serde_json::from_slice(&body).expect("JSON-ответ");
-
-    (status, json)
+    (status, String::from_utf8_lossy(&body).into_owned())
 }

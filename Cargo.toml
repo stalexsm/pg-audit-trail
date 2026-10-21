@@ -47,6 +47,9 @@ lazy_static = "1.5.1"
 axum = "0.8.9"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7.1", features = ["cors", "compression-gzip", "trace"] }
+axum-valid = { version = "0.25.0", features = ["into_json", "json", "validator"] }
+# Версия обязана совпадать с validator внутри axum-valid (иначе трейт Validate — другой)
+validator = { version = "0.20.0", features = ["derive"] }
 utoipa = { version = "6.0.0", features = ["uuid", "chrono", "axum_extras"] }
 utoipa-swagger-ui = { version = "10.0.2", features = ["axum"] }
 pgwire-replication = "0.5"

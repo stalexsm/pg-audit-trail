@@ -12,7 +12,15 @@ pub mod routes;
 
 pub type AppResult<T, E = AppError> = core::result::Result<T, E>;
 
+#[derive(Debug)]
 pub struct AppError(StatusCode, anyhow::Error);
+
+impl AppError {
+    /// Ошибка запроса клиента: некорректные параметры (400).
+    pub(crate) fn bad_request(message: impl Into<String>) -> Self {
+        Self(StatusCode::BAD_REQUEST, anyhow::anyhow!(message.into()))
+    }
+}
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {

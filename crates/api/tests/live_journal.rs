@@ -16,15 +16,15 @@ use axum::http::StatusCode;
 use chrono::{TimeZone, Utc};
 use common::{
     SeedRow, audit_admin_url, cleanup_leftovers, connect_admin, connect_db, drop_db, get_json,
-    insert_row, setup_journal, spawn_db,
+    get_raw, insert_row, setup_journal, spawn_db,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use api::routes::api_router;
 
-/// Логи внутри теста: ошибки SQL глушатся в репозитории и видны только
-/// в трейсинге. Вызывать в начале каждого теста.
+/// Логи внутри теста: видны трейсы на случай отладки. Вызывать в начале
+/// каждого теста.
 static INIT_LOGGING: Once = Once::new();
 fn init_logging() {
     INIT_LOGGING.call_once(|| {
@@ -113,11 +113,32 @@ async fn list_paginates_and_sorts_by_created_at() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["rows"][0]["id"], json!(early.id));
 
-    // Некорректный номер страницы нормализуется к первой.
-    let (status, body) = get_json(router.clone(), "/api/changes?per_page=2&page=0").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["page"], 1);
-    assert_eq!(body["rows"][0]["id"], json!(late.id));
+    drop_db(&connect_admin(&audit_admin_url()).await, &db_name).await;
+}
+
+#[tokio::test]
+async fn invalid_query_params_give_400() {
+    let (_pool, db_name, router) = spawn_env("badparams").await;
+
+    // Всё, что приходит извне, проверяется на уровне axum: любое нарушение
+    // параметров — 400, а не молчаливое игнорирование или нормализация.
+    let cases = [
+        "/api/changes?created_at=not-a-date",
+        "/api/changes?created_at=2025-01-01..wrong",
+        "/api/changes?page=0",
+        "/api/changes?per_page=0",
+        "/api/changes?per_page=500",
+        "/api/changes?sortable=huh",
+        "/api/changes?sortable=committed_at:asc",
+    ];
+    for uri in cases {
+        let (status, body) = get_raw(router.clone(), uri).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "ожидался 400 для {uri}: {body}"
+        );
+    }
 
     drop_db(&connect_admin(&audit_admin_url()).await, &db_name).await;
 }
