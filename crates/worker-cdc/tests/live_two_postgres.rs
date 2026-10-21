@@ -1,9 +1,10 @@
-//! Интеграционный тест шва №1 «живые два Postgres» (эпик #3, тикет #6).
+//! Интеграционный тест шва №1 «живые два Postgres» (эпик #3, тикеты #6 и #8).
 //!
 //! Требует поднятой инфраструктуры: `docker compose up -d` (db1 и db-src
 //! с проброшенными портами). Воркер запускается из библиотечной части
 //! поверх уникальных БД: на источнике эмитится нагрузка чистым SQL —
-//! I/U/D/T, MESSAGE и вставки в игнорируемые таблицы; ассерты — по
+//! I/U/D/T, MESSAGE (`_audit` и чужие префиксы, несколько в одной
+//! транзакции) и вставки в игнорируемые таблицы; ассерты — по
 //! содержимому журнала `changes` в БД аудита.
 
 mod common;
@@ -83,7 +84,8 @@ async fn live_replication_ingests_changes_to_journal() {
 
     // --- SQL-эмиттер ------------------------------------------------------
 
-    // Транзакция 1: два MESSAGE (съедают event_index 0 и 1) + INSERT.
+    // Транзакция 1: два MESSAGE чужого префикса (съедают event_index 0 и 1,
+    // строк в журнале не создают) + INSERT.
     let mut tx = source.begin().await.expect("транзакция 1");
     sqlx::query("SELECT pg_logical_emit_message(true, 'waltrail', '{\"trace_id\":\"op-1\"}')")
         .execute(&mut *tx)
@@ -161,7 +163,8 @@ async fn live_replication_ingests_changes_to_journal() {
     })
     .await;
 
-    // Игнорируемые таблицы и MESSAGE-события в журнал не попадают.
+    // Игнорируемые таблицы и MESSAGE чужих префиксов в журнал не попадают:
+    // до этого места MESSAGE с префиксом `_audit` ещё не эмитились вовсе.
     let ignored: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM changes \
          WHERE \"table\" = 'schema_migrations' OR operation = 'MESSAGE'",
@@ -171,7 +174,7 @@ async fn live_replication_ingests_changes_to_journal() {
     .expect("подсчёт игнорируемых строк");
     assert_eq!(
         ignored, 0,
-        "служебные таблицы и MESSAGE не должны попадать в журнал"
+        "служебные таблицы и MESSAGE без префикса _audit не должны попадать в журнал"
     );
 
     // Строка INSERT orders: полный образ «после», ключ, commit_lsn/event_index.
@@ -373,6 +376,195 @@ async fn live_replication_ingests_changes_to_journal() {
     assert!(
         checkpoint > commit_lsn,
         "чекпоинт = LSN конца последней транзакции"
+    );
+
+    // --- MESSAGE-события приложения (ADR-0002, тикет #8) ------------------
+
+    // AC #1: INSERT + emit_message — строка изменения с контекстом и
+    // trace_id плюс строка события.
+    let mut tx = source.begin().await.expect("транзакция message-insert");
+    sqlx::query("INSERT INTO orders VALUES (3, 7.25, 'с сообщением', now())")
+        .execute(&mut *tx)
+        .await
+        .expect("insert orders 3");
+    sqlx::query(
+        "SELECT pg_logical_emit_message(true, '_audit', \
+         '{\"trace_id\": \"op-3\", \"user\": \"alice\"}')",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("emit_message _audit op-3");
+    tx.commit().await.expect("коммит message-insert");
+
+    // AC #2: событие без изменений строк.
+    sqlx::query(
+        "SELECT pg_logical_emit_message(true, '_audit', \
+         '{\"trace_id\": \"op-4\", \"action\": \"export\"}')",
+    )
+    .execute(&source)
+    .await
+    .expect("emit_message _audit op-4");
+
+    // AC #3: два MESSAGE в одной транзакции + строка изменений.
+    let mut tx = source.begin().await.expect("транзакция two-messages");
+    sqlx::query("SELECT pg_logical_emit_message(true, '_audit', '{\"trace_id\": \"op-5a\"}')")
+        .execute(&mut *tx)
+        .await
+        .expect("emit_message op-5a");
+    sqlx::query(
+        "SELECT pg_logical_emit_message(true, '_audit', \
+         '{\"trace_id\": \"op-5b\", \"step\": 2}')",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("emit_message op-5b");
+    sqlx::query("UPDATE orders SET note = 'после сообщений' WHERE id = 3")
+        .execute(&mut *tx)
+        .await
+        .expect("update orders 3");
+    tx.commit().await.expect("коммит two-messages");
+
+    // AC #4: MESSAGE без trace_id; заодно не-JSON payload — поток не
+    // должен сломаться, строка журнала для него не создаётся.
+    sqlx::query("SELECT pg_logical_emit_message(true, '_audit', '{\"user\": \"bob\"}')")
+        .execute(&source)
+        .await
+        .expect("emit_message _audit без trace_id");
+    sqlx::query("SELECT pg_logical_emit_message(true, '_audit', 'не-json')")
+        .execute(&source)
+        .await
+        .expect("emit_message _audit не-json");
+
+    // 10 строк изменений (orders 6, events 2, composite 2) + 5 MESSAGE
+    // (op-3, op-4, op-5a, op-5b и без trace_id; не-JSON — мимо). Ждём
+    // суммарно: транзакции без изменений строк не видны в подсчёте
+    // таблиц, журнал должен догрузиться целиком.
+    wait_until(|| async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM changes \
+             WHERE operation = 'MESSAGE' OR \"table\" IN ('orders', 'events', 'composite')",
+        )
+        .fetch_one(&audit)
+        .await
+        .unwrap_or(0)
+            == 15
+    })
+    .await;
+    let messages: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM changes WHERE operation = 'MESSAGE'")
+            .fetch_one(&audit)
+            .await
+            .expect("подсчёт MESSAGE-строк");
+    assert_eq!(messages, 5, "в журнал попадают только _audit MESSAGE");
+
+    // AC #1: строка изменения получила payload дословно и trace_id в колонку.
+    let order3_create = sqlx::query(
+        "SELECT context, trace_id FROM changes \
+         WHERE \"table\" = 'orders' AND operation = 'CREATE' AND after->>'id' = '3'",
+    )
+    .fetch_one(&audit)
+    .await
+    .expect("строка CREATE orders 3");
+    let context: serde_json::Value = order3_create.get("context");
+    assert_eq!(
+        context,
+        serde_json::json!({"trace_id": "op-3", "user": "alice"}),
+        "payload MESSAGE сохраняется в контексте строки изменения дословно"
+    );
+    assert_eq!(
+        order3_create
+            .get::<Option<String>, _>("trace_id")
+            .as_deref(),
+        Some("op-3")
+    );
+
+    // MESSAGE-строка: payload и trace_id, пустые привязки к таблице.
+    let op3_event = sqlx::query(
+        "SELECT context, trace_id, schema, \"table\", primary_key, before, after \
+         FROM changes WHERE operation = 'MESSAGE' AND context->>'trace_id' = 'op-3'",
+    )
+    .fetch_one(&audit)
+    .await
+    .expect("строка MESSAGE op-3");
+    let context: serde_json::Value = op3_event.get("context");
+    assert_eq!(
+        context,
+        serde_json::json!({"trace_id": "op-3", "user": "alice"})
+    );
+    assert_eq!(
+        op3_event.get::<Option<String>, _>("trace_id").as_deref(),
+        Some("op-3")
+    );
+    assert_eq!(op3_event.get::<String, _>("schema"), "");
+    assert_eq!(op3_event.get::<String, _>("table"), "");
+    assert_eq!(op3_event.get::<Option<String>, _>("primary_key"), None);
+    assert_eq!(
+        op3_event.get::<serde_json::Value, _>("before"),
+        serde_json::json!({})
+    );
+    assert_eq!(
+        op3_event.get::<serde_json::Value, _>("after"),
+        serde_json::json!({})
+    );
+
+    // AC #2: событие без изменений строк — строкой MESSAGE.
+    let op4_event = sqlx::query(
+        "SELECT trace_id FROM changes \
+         WHERE operation = 'MESSAGE' AND context->>'action' = 'export'",
+    )
+    .fetch_one(&audit)
+    .await
+    .expect("строка MESSAGE op-4");
+    assert_eq!(
+        op4_event.get::<Option<String>, _>("trace_id").as_deref(),
+        Some("op-4")
+    );
+
+    // AC #3: две строки событий; строке изменений — контекст последнего.
+    let update3 = sqlx::query(
+        "SELECT context, trace_id FROM changes \
+         WHERE \"table\" = 'orders' AND operation = 'UPDATE' AND after->>'id' = '3'",
+    )
+    .fetch_one(&audit)
+    .await
+    .expect("строка UPDATE orders 3");
+    let context: serde_json::Value = update3.get("context");
+    assert_eq!(context, serde_json::json!({"trace_id": "op-5b", "step": 2}));
+    assert_eq!(
+        update3.get::<Option<String>, _>("trace_id").as_deref(),
+        Some("op-5b")
+    );
+    let both: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM changes WHERE operation = 'MESSAGE' \
+         AND context->>'trace_id' IN ('op-5a', 'op-5b')",
+    )
+    .fetch_one(&audit)
+    .await
+    .expect("две строки MESSAGE одной транзакции");
+    assert_eq!(both, 2, "каждый MESSAGE транзакции — своя строка");
+
+    // AC #4: без trace_id — колонка пустая, payload дословно.
+    let bob = sqlx::query(
+        "SELECT context, trace_id FROM changes \
+         WHERE operation = 'MESSAGE' AND context->>'user' = 'bob'",
+    )
+    .fetch_one(&audit)
+    .await
+    .expect("строка MESSAGE без trace_id");
+    assert_eq!(bob.get::<Option<String>, _>("trace_id"), None);
+    let context: serde_json::Value = bob.get("context");
+    assert_eq!(context, serde_json::json!({"user": "bob"}));
+
+    // Чекпоинт догнал MESSAGE-транзакции.
+    let final_checkpoint: i64 =
+        sqlx::query_scalar("SELECT last_commit_lsn FROM checkpoints WHERE name = $1")
+            .bind(&slot_name)
+            .fetch_one(&audit)
+            .await
+            .expect("чекпоинт после MESSAGE-транзакций");
+    assert!(
+        final_checkpoint >= checkpoint,
+        "чекпоинт не откатывается назад"
     );
 
     // Graceful shutdown по CancellationToken: воркер завершается без ошибки.
