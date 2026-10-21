@@ -1,9 +1,8 @@
-use std::{env, path::PathBuf, time::Duration};
-
 use api::routes::{ApiDoc, api_router};
 use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::get};
 use serde::Serialize;
 use sqlx::postgres::PgPoolOptions;
+use std::{env, path::PathBuf, time::Duration};
 use tokio::net::TcpListener;
 use tokio::signal;
 use tower_http::{
@@ -21,8 +20,6 @@ use utoipa_swagger_ui::SwaggerUi;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenv::dotenv().ok();
-
     // Определение правильного пути к файлам
     let base_dir = if cfg!(debug_assertions) {
         // В режиме разработки используем корень проекта

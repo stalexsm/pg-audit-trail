@@ -28,7 +28,7 @@ cargo test --workspace
 
 ## Локальный запуск
 
-1. `cp env.example .env` — заполненный `.env` подхватывается автоматически (dotenv).
+1. `cp env.example .env` — заполненный `.env` читает compose (`env_file` сервисов); для локального `cargo run` экспортируйте переменные окружения.
 2. `docker compose up -d` — поднимает минимальный стек: два PostgreSQL, api, worker-cdc.
 3. `cargo run -p api` (или `-p worker-cdc`).
 

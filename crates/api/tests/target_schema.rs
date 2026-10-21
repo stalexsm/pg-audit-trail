@@ -106,8 +106,12 @@ async fn target_changes_schema_is_applied() {
     .expect("список таблиц схемы public");
     assert_eq!(
         tables,
-        vec!["changes".to_string(), "checkpoints".to_string()],
-        "в public должны быть только таблицы журнала и чекпоинтов (кроме служебной _sqlx_migrations)"
+        vec![
+            "changes".to_string(),
+            "checkpoints".to_string(),
+            "sources".to_string(),
+        ],
+        "в public должны быть только таблицы журнала, чекпоинтов и реестра источников (кроме служебной _sqlx_migrations)"
     );
 
     let columns: Vec<String> = sqlx::query_scalar(
@@ -156,6 +160,48 @@ async fn target_changes_schema_is_applied() {
         trace_id_index.to_uppercase().contains("USING BTREE")
             && trace_id_index.to_uppercase().contains("TRACE_ID"),
         "changes_trace_id_index должен быть btree по trace_id: {trace_id_index}"
+    );
+
+    // Реестр источников (ADR-0005, тикет #28): состав колонок и правило
+    // имён слотов на уровне схемы.
+    let source_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'sources' \
+         ORDER BY ordinal_position",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("список колонок sources");
+    assert_eq!(
+        source_columns,
+        vec![
+            "name",
+            "url",
+            "ignore_tables",
+            "message_prefix",
+            "batch_size",
+            "worker_state",
+            "last_event_at",
+            "last_error",
+            "deleted_at",
+            "created_at",
+            "updated_at",
+        ],
+        "неожиданный состав колонок sources"
+    );
+
+    let slot_rule: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid) \
+         FROM pg_constraint \
+         WHERE conrelid = 'public.sources'::regclass \
+           AND conname = 'sources_name_slot_rule'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("констрейнт sources_name_slot_rule не найден");
+    assert!(
+        slot_rule.contains("^[a-z0-9_]+$"),
+        "правило имён слотов в схеме: {slot_rule}"
     );
 
     // Уникальный констрейнт дедупликации по (commit_lsn, event_index).

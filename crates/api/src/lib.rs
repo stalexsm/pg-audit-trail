@@ -20,6 +20,17 @@ impl AppError {
     pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self(StatusCode::BAD_REQUEST, anyhow::anyhow!(message.into()))
     }
+
+    /// Ресурс не найден (404).
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
+        Self(StatusCode::NOT_FOUND, anyhow::anyhow!(message.into()))
+    }
+
+    /// Конфликт состояния (409): например, правка источника,
+    /// помеченного к удалению (ADR-0005).
+    pub(crate) fn conflict(message: impl Into<String>) -> Self {
+        Self(StatusCode::CONFLICT, anyhow::anyhow!(message.into()))
+    }
 }
 
 impl IntoResponse for AppError {

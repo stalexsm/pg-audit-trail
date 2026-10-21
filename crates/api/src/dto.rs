@@ -235,6 +235,176 @@ fn default_sortable() -> String {
     "created_at:desc".to_string()
 }
 
+// === Реестр источников (ADR-0005, тикет #28) ===
+
+/// Префикс слота репликации: слот источника — `waltrail_<имя>`.
+const SLOT_PREFIX: &str = "waltrail_";
+
+/// Максимальная длина имени источника: слот `waltrail_<имя>` обязан
+/// помещаться в NAMEDATALEN-1 (63 символа PostgreSQL) без молчаливой
+/// усечки — иначе два длинных имени дали бы один слот.
+const MAX_SOURCE_NAME_LEN: usize = 63 - SLOT_PREFIX.len();
+
+/// Максимальная длина префикса MESSAGE: предел NAMEDATALEN-1 для префикса
+/// `pg_logical_emit_message` (ADR-0004); u64 — под сигнатуру валидатора длины.
+const MAX_MESSAGE_PREFIX_LEN: u64 = 63;
+
+/// Границы размера батча: не меньше одной строки, верх — защита от
+/// необдуманного батча на гигабайт (дефолт исторический — 500).
+const MIN_BATCH_SIZE: i32 = 1;
+const MAX_BATCH_SIZE: i32 = 10_000;
+
+/// Источник журнала: строка реестра (ADR-0005). Поля статуса воркера
+/// пишет воркер (тикет подхвата), API только читает.
+#[derive(Debug, Clone, Serialize, FromRow, ToSchema)]
+pub struct SourceDTO {
+    pub name: String,
+    /// Строка подключения к базе клиента с кредами; неизменяема после создания.
+    pub url: String,
+    /// Служебные таблицы источника в виде `schema.table`, не попадающие в журнал.
+    pub ignore_tables: Vec<String>,
+    /// Префикс MESSAGE-канала контекста (ADR-0004).
+    pub message_prefix: String,
+    /// Размер чанка батчевой вставки строк в журнал.
+    pub batch_size: i32,
+    /// Состояние задачи воркера источника: `pending` — ждёт подхвата.
+    pub worker_state: String,
+    /// Когда воркер источника сохранил последнее изменение в журнал.
+    pub last_event_at: Option<DateTime<chrono::Utc>>,
+    /// Текст последней ошибки задачи воркера источника.
+    pub last_error: Option<String>,
+    /// Когда источник помечен к удалению; `NULL` — не помечен.
+    pub deleted_at: Option<DateTime<chrono::Utc>>,
+    pub created_at: DateTime<chrono::Utc>,
+    pub updated_at: DateTime<chrono::Utc>,
+}
+
+/// Регистрация источника: POST /api/sources. Имя проверяется правилом
+/// имён слотов репликации; URL неизменяем после создания.
+#[derive(Deserialize, Debug, Validate, ToSchema)]
+pub struct QSourceCreate {
+    /// Имя источника: латиница нижним регистром, цифры, подчёркивание.
+    /// Слот — `waltrail_<имя>`, публикация — `audit_<имя>` (ADR-0005).
+    #[schema(max_length = 54)]
+    #[validate(custom(function = "validate_slot_name"))]
+    pub name: String,
+
+    /// Строка подключения к базе клиента с кредами: схема postgres(q),
+    /// непустой хост; неизменяема после создания.
+    #[validate(custom(function = "validate_source_url"))]
+    pub url: String,
+
+    /// Служебные таблицы источника в виде `schema.table`; по умолчанию —
+    /// таблицы типовых миграторов.
+    #[serde(default = "default_ignore_tables")]
+    #[validate(custom(function = "validate_ignore_tables"))]
+    pub ignore_tables: Vec<String>,
+
+    /// Префикс MESSAGE-канала контекста (ADR-0004); исторический дефолт — `_audit`.
+    #[schema(max_length = 63)]
+    #[serde(default = "default_message_prefix")]
+    #[validate(length(min = 1, max = MAX_MESSAGE_PREFIX_LEN))]
+    pub message_prefix: String,
+
+    /// Размер чанка батчевой вставки строк в журнал; по умолчанию 500.
+    #[schema(minimum = 1, maximum = 10_000)]
+    #[serde(default = "default_batch_size")]
+    #[validate(range(min = MIN_BATCH_SIZE, max = MAX_BATCH_SIZE))]
+    pub batch_size: i32,
+}
+
+/// Правка настроек источника: PATCH /api/sources/{name}. Меняются только
+/// служебные таблицы, префикс MESSAGE и размер батча; URL неизменяем
+/// (ADR-0005: смена сервера — удалить и создать заново). Опущенное поле
+/// остаётся без изменений.
+#[derive(Deserialize, Debug, Validate, ToSchema)]
+pub struct QSourcePatch {
+    #[validate(custom(function = "validate_ignore_tables"))]
+    pub ignore_tables: Option<Vec<String>>,
+
+    #[schema(max_length = 63)]
+    #[validate(length(min = 1, max = MAX_MESSAGE_PREFIX_LEN))]
+    pub message_prefix: Option<String>,
+
+    #[schema(minimum = 1, maximum = 10_000)]
+    #[validate(range(min = MIN_BATCH_SIZE, max = MAX_BATCH_SIZE))]
+    pub batch_size: Option<i32>,
+}
+
+/// Проверка имени источника правилом имён слотов репликации:
+/// латиница нижним регистром, цифры, подчёркивание; не пусто и не длиннее
+/// `MAX_SOURCE_NAME_LEN` (слот `waltrail_<имя>` обязан влезать в 63).
+fn validate_slot_name(name: &str) -> Result<(), ValidationError> {
+    let valid = !name.is_empty()
+        && name.len() <= MAX_SOURCE_NAME_LEN
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+
+    if valid {
+        Ok(())
+    } else {
+        Err(ValidationError::new(
+            "имя источника: латиница нижним регистром, цифры, подчёркивание; не пусто и не длиннее 54 символов — слот waltrail_<имя> обязан помещаться в 63 символа",
+        ))
+    }
+}
+
+/// Проверка строки подключения: схема postgres(q), непустой хост.
+fn validate_source_url(url: &str) -> Result<(), ValidationError> {
+    let valid = url::Url::parse(url).is_ok_and(|parsed| {
+        matches!(parsed.scheme(), "postgres" | "postgresql")
+            && parsed.host_str().is_some_and(|host| !host.is_empty())
+    });
+
+    if valid {
+        Ok(())
+    } else {
+        Err(ValidationError::new(
+            "строка подключения: postgresql://user:password@host:port/db",
+        ))
+    }
+}
+
+/// Проверка списка служебных таблиц: каждая — квалифицированное имя
+/// `schema.table` без пробелов (воркер сопоставляет его с полным именем
+/// отношения источника).
+fn validate_ignore_tables(tables: &[String]) -> Result<(), ValidationError> {
+    for table in tables {
+        let valid = matches!(table.split_once('.'), Some((schema, name))
+            if !schema.is_empty() && !name.is_empty() && !table.chars().any(char::is_whitespace));
+
+        if !valid {
+            return Err(ValidationError::new(
+                "служебные таблицы — в виде schema.table, например public._sqlx_migrations",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Служебные таблицы источника по умолчанию: типовые миграторы,
+/// как в дефолте конфигурации воркера.
+fn default_ignore_tables() -> Vec<String> {
+    vec![
+        "public.alembic_version".to_owned(),
+        "public.schema_migrations".to_owned(),
+        "public._sqlx_migrations".to_owned(),
+        "public.django_migrations".to_owned(),
+    ]
+}
+
+/// Префикс MESSAGE по умолчанию: исторический `_audit`.
+fn default_message_prefix() -> String {
+    "_audit".to_owned()
+}
+
+/// Размер батча по умолчанию.
+fn default_batch_size() -> i32 {
+    500
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,5 +485,136 @@ mod tests {
         assert!(query("created_at:DESC", None).descending());
         assert!(!query("created_at:asc", None).descending());
         assert!(!query("created_at:ASC", None).descending());
+    }
+
+    /// Тело создания источника с именем и URL, остальное — дефолты.
+    fn create_body(name: &str, url: &str) -> QSourceCreate {
+        serde_json::from_value(serde_json::json!({ "name": name, "url": url }))
+            .expect("тело создания")
+    }
+
+    #[test]
+    fn slot_name_accepts_lowercase_digits_underscore() {
+        assert!(validate_slot_name("client_a").is_ok());
+        assert!(validate_slot_name("a").is_ok());
+        assert!(validate_slot_name("a1_").is_ok());
+        assert!(validate_slot_name(&"a".repeat(54)).is_ok());
+
+        assert!(validate_slot_name("").is_err());
+        assert!(validate_slot_name("Client").is_err());
+        assert!(validate_slot_name("with-dash").is_err());
+        assert!(validate_slot_name("with space").is_err());
+        assert!(validate_slot_name("кириллица").is_err());
+        assert!(
+            validate_slot_name(&"a".repeat(55)).is_err(),
+            "слот не влезает в 63"
+        );
+    }
+
+    #[test]
+    fn source_url_requires_postgres_scheme_and_host() {
+        assert!(validate_source_url("postgresql://user:pass@host:5432/db").is_ok());
+        assert!(validate_source_url("postgres://host/db").is_ok());
+
+        assert!(validate_source_url("").is_err());
+        assert!(validate_source_url("not-a-url").is_err());
+        assert!(validate_source_url("mysql://user:pass@host/db").is_err());
+        assert!(validate_source_url("postgresql://").is_err(), "нет хоста");
+    }
+
+    #[test]
+    fn ignore_tables_require_qualified_names() {
+        assert!(
+            validate_ignore_tables(&[
+                "public.alembic_version".to_owned(),
+                "app.schema_migrations".to_owned(),
+                "private._log".to_owned(),
+            ])
+            .is_ok()
+        );
+
+        assert!(validate_ignore_tables(&["no_dot".to_owned()]).is_err());
+        assert!(validate_ignore_tables(&["".to_owned()]).is_err());
+        assert!(validate_ignore_tables(&["public.".to_owned()]).is_err());
+        assert!(validate_ignore_tables(&[".table".to_owned()]).is_err());
+        assert!(validate_ignore_tables(&["public .a".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn create_body_defaults_match_worker_defaults() {
+        // Литералы дефолтов воркера (worker-cdc/src/config.rs) — на случай,
+        // если чей-то дефолт изменится, а второй останется как был.
+        let body = create_body("client_a", "postgresql://u:p@h:5432/db");
+        assert_eq!(
+            body.ignore_tables,
+            vec![
+                "public.alembic_version".to_owned(),
+                "public.schema_migrations".to_owned(),
+                "public._sqlx_migrations".to_owned(),
+                "public.django_migrations".to_owned(),
+            ]
+        );
+        assert_eq!(body.message_prefix, "_audit");
+        assert_eq!(body.batch_size, 500);
+    }
+
+    #[test]
+    fn create_body_validates() {
+        assert!(
+            create_body("client_a", "postgresql://u:p@h/db")
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            create_body("bad name", "postgresql://u:p@h/db")
+                .validate()
+                .is_err()
+        );
+        assert!(create_body("client_a", "mysql://h/db").validate().is_err());
+
+        // Границы размера батча и длины префикса MESSAGE.
+        let mut body = create_body("client_a", "postgresql://u:p@h/db");
+        body.batch_size = MAX_BATCH_SIZE + 1;
+        assert!(body.validate().is_err());
+        body.batch_size = MIN_BATCH_SIZE - 1;
+        assert!(body.validate().is_err());
+        body.batch_size = MAX_BATCH_SIZE;
+        assert!(body.validate().is_ok());
+        body.message_prefix = "x".repeat(MAX_MESSAGE_PREFIX_LEN as usize + 1);
+        assert!(body.validate().is_err());
+        body.message_prefix = "x".repeat(MAX_MESSAGE_PREFIX_LEN as usize);
+        assert!(body.validate().is_ok(), "верхняя граница включительна");
+    }
+
+    #[test]
+    fn patch_validates_only_provided_fields() {
+        // Пустая правка валидна: опущенные поля остаются без изменений.
+        let patch: QSourcePatch = serde_json::from_str("{}").expect("пустая правка");
+        assert!(patch.validate().is_ok());
+
+        let patch: QSourcePatch =
+            serde_json::from_str("{\"batch_size\": 100}").expect("правка батча");
+        assert!(patch.validate().is_ok());
+
+        let patch: QSourcePatch =
+            serde_json::from_str("{\"message_prefix\": \"\"}").expect("пустой префикс");
+        assert!(patch.validate().is_err());
+
+        let patch: QSourcePatch =
+            serde_json::from_str("{\"ignore_tables\": [\"no_dot\"]}").expect("таблицы");
+        assert!(patch.validate().is_err());
+    }
+
+    #[test]
+    fn patch_ignores_unknown_fields_like_url() {
+        // Неизвестные поля тела (включая url) serde молча игнорирует:
+        // неизменяемость URL проверяется интеграционным тестом шва.
+        let patch: QSourcePatch = serde_json::from_value(serde_json::json!({
+            "url": "postgresql://evil/x",
+            "batch_size": 100,
+        }))
+        .expect("правка с лишним url");
+        assert_eq!(patch.batch_size, Some(100));
+        assert!(patch.validate().is_ok());
     }
 }
