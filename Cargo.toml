@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/api", "crates/worker-debezium", "crates/worker-app"]
+members = ["crates/api", "crates/worker-debezium", "crates/worker-app", "crates/pgoutput", "crates/worker-cdc"]
 
 resolver = "3"
 
@@ -8,7 +8,7 @@ version = "0.3.0"
 edition = "2024"
 description = "Waltrail — журнал аудита изменений PostgreSQL"
 
-rust-version = "1.95"
+rust-version = "1.99.1"
 
 [workspace.dependencies]
 anyhow = "1.0.102"
@@ -44,3 +44,7 @@ infer = "0.19.0"
 hyper = "1.9.0"
 casbin = "2.20.0"
 parking_lot = "0.12.5"
+pgwire-replication = "0.5"
+bytes = "1"
+config = { version = "0.15", default-features = false }
+url = "2.5"

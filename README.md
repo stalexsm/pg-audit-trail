@@ -14,12 +14,26 @@ Compose поднимает два PostgreSQL:
 | `db1` | БД аудита Waltrail (таблицы `changes`, `audits`) | `54399` |
 | `db-src` | Источник CDC — имитация БД клиента (`wal_level=logical`, публикация `audit` создаётся автоматически) | `54398` |
 
-Остальные сервисы (Kafka, Redis, Debezium, kafka-ui) и три крейта (`api`, `worker-app`, `worker-debezium`) работают как раньше — переход на CDC через pgoutput идёт поэтапно (см. issue #3).
+Остальные сервисы (Kafka, Redis, Debezium, kafka-ui) и крейты (`api`, `worker-app`, `worker-debezium`) работают как раньше — переход на CDC через pgoutput идёт поэтапно (см. issue #3). Новый воркер CDC уже готов к использованию:
 
-Подготовка источника для dev: публикация создаётся init-скриптом [`docker/init-source/01_публикация_аудита.sql`](docker/init-source/01_публикация_аудита.sql) при первом создании volume. Слот репликации создаётся вручную, когда понадобится:
+```bash
+export SOURCE_DATABASE_URL=postgresql://postgres:postgres@localhost:54398/postgres
+export DATABASE_URL=postgresql://postgres:postgres@localhost:54399/postgres
+cargo run -p worker-cdc
+```
+
+Воркер сам создаёт слот репликации и применяет миграции, после остановки (Ctrl+C/SIGTERM) возобновляет с чекпоинта. Настройки — переменными окружения: `CDC_SLOT`, `CDC_PUBLICATION`, `CDC_IGNORE_TABLES`, `CDC_BATCH_SIZE` (значения по умолчанию — в [`env.example`](env.example)).
+
+> Слот удерживает WAL источника: если воркер на dev-стенде больше не нужен, удалите слот, чтобы WAL не копился:
+>
+> ```SQL
+> SELECT pg_drop_replication_slot('waltrail');
+> ```
+
+Подготовка источника для dev: публикация создаётся init-скриптом [`docker/init-source/01_публикация_аудита.sql`](docker/init-source/01_публикация_аудита.sql) при первом создании volume. Слот репликации создаётся воркером CDC автоматически при старте. Удалить (например, после пересоздания стенда):
 
 ```SQL
-SELECT pg_create_logical_replication_slot('waltrail', 'pgoutput');
+SELECT pg_drop_replication_slot('waltrail');
 ```
 
 **Внимание:** история миграций переписана под целевую схему журнала (без накопленных ALTER-шагов), а данные сервисов живут в именованных volumes. Если у вас остался старый volume — пересоздайте его:
