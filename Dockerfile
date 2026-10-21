@@ -17,21 +17,19 @@ WORKDIR /app
 # Install host build dependencies.
 RUN apk add --no-cache clang lld musl-dev git openssl-dev pkgconfig curl openssl-libs-static
 
+# Исходники и миграции копируются COPY (не bind mounts): содержимое COPY
+# участвует в ключе кэша слоя, а bind mounts слой не инвалидируют — без этого
+# слой переиспользовался бы со старым бинарником (например, с устаревшим
+# набором миграций, встроенных макросом sqlx::migrate! при компиляции).
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY migrations ./migrations
+
 # Build the application.
-# Leverage a cache mount to /usr/local/cargo/registry/
-# for downloaded dependencies, a cache mount to /usr/local/cargo/git/db
-# for git repository dependencies, and a cache mount to /app/target/ for
-# compiled dependencies which will speed up subsequent builds.
-# Leverage a bind mount to the src directory to avoid having to copy the
-# source code into the container. Once built, copy the executable to an
-# output directory before the cache mounted /app/target is unmounted.
+# Кэш-маунты (target, git db, registry) дают инкрементальность между сборками.
 # Каталог migrations нужен на этапе сборки: макрос sqlx::migrate! встраивает
 # миграции в бинарник при компиляции.
-RUN --mount=type=bind,source=crates,target=crates \
-    --mount=type=bind,source=Cargo.toml,target=Cargo.toml \
-    --mount=type=bind,source=Cargo.lock,target=Cargo.lock,rw \
-    --mount=type=bind,source=migrations,target=migrations \
-    --mount=type=cache,target=/app/target/ \
+RUN --mount=type=cache,target=/app/target/ \
     --mount=type=cache,target=/usr/local/cargo/git/db \
     --mount=type=cache,target=/usr/local/cargo/registry/ \
     cargo build --release && \
@@ -48,10 +46,21 @@ FROM alpine:3.18 AS final
 # curl — healthcheck сервиса api
 RUN apk add --no-cache curl
 
+# Непривилегированный пользователь сервисов с фиксированными UID/GID:
+# стабильные идентификаторы нужны, чтобы владелец каталога логов совпадал
+# между образом и томом, а на хосте файлы тома имели предсказуемого
+# владельца (10001:10001).
+ARG APP_UID=10001
+ARG APP_GID=10001
+RUN addgroup -g "$APP_GID" app && adduser -D -H -u "$APP_UID" -G app app
+
 WORKDIR /app
 
-# Создать директорию для логов
-RUN mkdir -p /app/logs
+# Каталог логов принадлежит пользователю сервиса: named volume из compose.yaml
+# при первом подключении инициализируется содержимым и владельцем из образа,
+# поэтому запись в логи не зависит от владельца на хосте (bind mount перекрыл
+# бы chown правами своего каталога).
+RUN mkdir -p /app/logs && chown app:app /app/logs
 
 # Copy the executable from the "build" stage.
 COPY --from=build /bin/api /app/
@@ -62,6 +71,10 @@ EXPOSE 8000
 
 # Make executables executable
 RUN chmod +x /app/api /app/worker-cdc
+
+# Сервисам не нужен root: из привилегий — только порт 8000 (> 1024) и запись в
+# /app/logs; бинарники остаются во владении root (только чтение и исполнение).
+USER app:app
 
 # Контейнер запускает процесс как PID 1 без init: ядро не доставляет сигналы
 # с дефолтной диспетчеризацией PID 1, поэтому оба сервиса сами обрабатывают

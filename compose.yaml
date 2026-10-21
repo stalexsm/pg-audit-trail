@@ -7,6 +7,11 @@ networks:
 volumes:
   db1-data:
   db-src-data:
+  # Логи api и worker-cdc: named volume, а не bind mount, потому что контейнеры
+  # работают под непривилегированным пользователем (UID 10001 из Dockerfile):
+  # том при первом подключении наследует владельца из образа, bind mount с хоста
+  # на Linux перекрыл бы её владельцем хоста, и запись в логи сломалась бы.
+  app-logs:
 
 services:
   # БД аудита Waltrail
@@ -70,7 +75,7 @@ services:
     env_file:
       - ./.env
     volumes:
-      - ./logs:/app/logs
+      - app-logs:/app/logs
     depends_on:
       db1:
         condition: service_healthy
@@ -95,7 +100,7 @@ services:
     env_file:
       - ./.env
     volumes:
-      - ./logs:/app/logs
+      - app-logs:/app/logs
     depends_on:
       db1:
         condition: service_healthy
