@@ -56,7 +56,7 @@ cargo test --workspace
 ## Ветки, коммиты и релизы
 
 - Любая работа — в новой ветке, созданной от актуального `main`; прямые коммиты в `main` запрещены. Имя ветки — `тип/краткое-описание` латиницей, по типу будущего коммита: `feat/enrich-response-body`, `fix/worker-reconnect`.
-- Conventional Commits с русским описанием: `feat:`, `fix:`, `doc:`, `build:`, `chore(deps):`.
+- Conventional Commits с русским описанием: `feat:`, `fix:`, `doc:`, `build:`, `ci:`, `chore(deps):`.
 - `CHANGELOG.md` генерируется git-cliff по `cliff.toml` — не редактируй его вручную.
 - Версия задаётся один раз в `[workspace.package]`; релиз — тег вида `v0.3.0`.
 

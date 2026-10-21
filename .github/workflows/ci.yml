@@ -114,11 +114,13 @@ jobs:
       # Мёртвый код, секреты, уязвимости Python-кода (scripts/loadgen) и
       # собственно workflow; подавления правил — в skylos.toml и inline
       # `# skylos: ignore[...]` с обоснованиями. Исключения — только через
-      # CLI (при --config-file exclude из файла перекрывает CLI-флаги).
+      # CLI (при --config-file exclude из файла перекрывает CLI-флаги):
+      # артефакты сборки и MD-доки — кириллица даёт ложняки гомоглифов.
       - name: Скан skylos (гейт)
         run: >
           skylos . --secrets --danger --gate --config-file skylos.toml
-          --exclude target --exclude README.md
+          --exclude target --exclude README.md --exclude AGENTS.md
+          --exclude GLOSSARY.md --exclude CHANGELOG.md
 
   semgrep:
     name: semgrep

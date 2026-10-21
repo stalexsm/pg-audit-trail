@@ -39,6 +39,13 @@ ROLL_SCALE = 10_000  # единицы броска: 100 единиц = 1 про�
 
 TABLE_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)?$")
 
+# Payload генератора собирается из 32-байтовых блоков md5: меньший размер
+# дополняется «хвостом», меньше блока — запрещено валидацией аргументов.
+MD5_BLOCK_BYTES = 32
+# Период опроса статистики в основном цикле и таймаут ожидания потоков.
+MONITOR_INTERVAL_S = 1.0
+THREAD_JOIN_TIMEOUT_S = 60.0
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -91,8 +98,14 @@ def parse_args():
     # ранняя валидация аргумента, экранирование делает psycopg.
     if not TABLE_NAME_RE.match(args.table):
         parser.error(f"--table: ожидается schema.table, получено {args.table!r}")
-    if args.sessions < 1 or args.rows_per_tx < 1 or args.payload_bytes < 32:
-        parser.error("--sessions/--rows-per-tx >= 1, --payload-bytes >= 32")
+    if (
+        args.sessions < 1
+        or args.rows_per_tx < 1
+        or args.payload_bytes < MD5_BLOCK_BYTES
+    ):
+        parser.error(
+            f"--sessions/--rows-per-tx >= 1, --payload-bytes >= {MD5_BLOCK_BYTES}"
+        )
     if not (
         0.0 <= args.update_percent <= 100.0 and 0.0 <= args.delete_percent <= 100.0
     ):
@@ -113,8 +126,8 @@ def payload_expr(bytes_size: int) -> sql.Composable:
     Числа подставляются через sql.Literal (композиция psycopg) — строкового
     вклеивания нет.
     """
-    blocks = max(1, bytes_size // 32)
-    remainder = bytes_size - blocks * 32
+    blocks = max(1, bytes_size // MD5_BLOCK_BYTES)
+    remainder = bytes_size - blocks * MD5_BLOCK_BYTES
     expr = sql.SQL("repeat(md5(random()::text), {})").format(sql.Literal(blocks))
     if remainder:
         expr += sql.SQL(" || left(md5(random()::text), {})").format(
@@ -289,7 +302,7 @@ def main():
     previous_rows, previous_at = 0, started
     peak_rate = 0.0
     while time.monotonic() - started < args.duration and not stop.is_set():
-        time.sleep(1.0)
+        time.sleep(MONITOR_INTERVAL_S)
         now = time.monotonic()
         rows = stats.totals()[0]
         rate = (rows - previous_rows) / max(now - previous_at, 1e-9)
@@ -302,7 +315,7 @@ def main():
 
     stop.set()
     for thread in threads:
-        thread.join(timeout=60)
+        thread.join(timeout=THREAD_JOIN_TIMEOUT_S)
 
     elapsed = time.monotonic() - started
     rows, transactions, messages = stats.totals()
