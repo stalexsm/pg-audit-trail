@@ -1,18 +1,16 @@
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::Result;
 use crate::bootstrap::{self, Bootstrap};
-use crate::config::WorkerConfig;
-use crate::ingest::{self, ChangeRow, TransactionBuffer};
+use crate::ingest::{self, TransactionBuffer};
 use crate::metrics;
+use crate::registry::{SourceRecord, StatusWriter};
 use anyhow::Context;
 use chrono::{DateTime, TimeZone, Utc};
 use pgoutput::{ChangeKind, DecodedEvent, Relation, RelationCache, ReplicaIdentity, decode};
-use pgwire_replication::error::PgWireError;
 use pgwire_replication::{Lsn, ReplicationClient, ReplicationConfig, ReplicationEvent};
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -27,164 +25,26 @@ const PG_EPOCH_SECONDS: i64 = 946_684_800;
 /// в статистике будут с «хвостом на срез».
 const APPLICATION_NAME_PREFIX: &str = "waltrail-cdc";
 
-/// Размер пула к БД аудита: вставки батчами + чтение чекпоинта.
-const AUDIT_POOL_MAX_CONNECTIONS: u32 = 5;
-
-/// Размер пула к источнику: только чтение каталога (первичные ключи).
-const SOURCE_POOL_MAX_CONNECTIONS: u32 = 2;
-
-/// Таймаут взятия соединения из пулов, секунды.
-const DB_ACQUIRE_TIMEOUT_SECS: u64 = 30;
-
 /// Чем закончилась сессия репликации — одно подключение к walsender.
-enum SessionEnd {
-    /// Остановка по `CancellationToken`: штатный выход из `run` без реконнекта.
+pub(crate) enum SessionEnd {
+    /// Остановка по `CancellationToken`: штатный выход задачи без реконнекта.
     Cancelled,
     /// Сессия прервалась (обрыв соединения, ошибка потока, закрытие сервером):
     /// реконнект с backoff и продолжением с чекпоинта.
     Reconnect(anyhow::Error),
 }
 
-/// Запускает воркер CDC до отмены `CancellationToken`.
-///
-/// Применяет миграции к БД аудита, бутстрапит слот и чекпоинт, читает поток
-/// репликации и вставляет события в `changes` батчами в одной транзакции
-/// с чекпоинтом; слот подтверждается только после коммита вставки.
-///
-/// Воркер переживает сбои и рестарты (тикет #7): истина старта — чекпоинт
-/// в БД аудита, каждая сессия стартует от меньшей из координат (чекпоинт,
-/// `confirmed_flush_lsn` слота); прерванная сессия сменяется реконнектом
-/// с экспоненциальным backoff, replay-дубли гасятся дедупликацией по
-/// `UNIQUE(commit_lsn, event_index)`. Нелечимые ошибки конфигурации
-/// (неверные креды, TLS) завершают воркер с ошибкой.
-pub async fn run(config: WorkerConfig, token: CancellationToken) -> Result<()> {
-    let audit = PgPoolOptions::new()
-        .max_connections(AUDIT_POOL_MAX_CONNECTIONS)
-        .acquire_timeout(Duration::from_secs(DB_ACQUIRE_TIMEOUT_SECS))
-        .connect(&config.database_url)
-        .await
-        .context("подключение к БД аудита")?;
-    sqlx::migrate!("../../migrations")
-        .run(&audit)
-        .await
-        .context("миграции БД аудита")?;
-
-    // Пул источника живёт весь цикл: по нему читается каталог для
-    // первичных ключей таблиц с REPLICA IDENTITY FULL.
-    let source_pool = PgPoolOptions::new()
-        .max_connections(SOURCE_POOL_MAX_CONNECTIONS)
-        .acquire_timeout(Duration::from_secs(DB_ACQUIRE_TIMEOUT_SECS))
-        .connect(&config.source_database_url)
-        .await
-        .context("подключение к источнику CDC")?;
-
-    // Счётчик подряд идущих неудач подключения: сбрасывается каждой
-    // удавшейся сессией, задаёт экспоненту backoff.
-    let mut attempt: u32 = 0;
-
-    // Сводные метрики конвейера (walsender → intake → вставка) пишутся
-    // в лог до остановки воркера.
-    let reporter = tokio::spawn(metrics::report_loop(token.clone()));
-
-    let result: Result<()> = loop {
-        if token.is_cancelled() {
-            info!("остановка запрошена до подключения: воркер завершён");
-            break Ok(());
-        }
-
-        // Чекпоинт перечитывается перед каждой сессией: после сбоя
-        // продолжение идёт именно с него, а не с позиций прошлой сессии.
-        let boot = match bootstrap::bootstrap(&audit, &source_pool, &config.slot).await {
-            Ok(boot) => boot,
-            Err(e) => {
-                attempt += 1;
-                if !backoff_after_failure(&token, &config, attempt, "бутстрап не удался", &e).await
-                {
-                    break Ok(());
-                }
-                continue;
-            }
-        };
-        info!(
-            slot = %config.slot,
-            publication = %config.publication,
-            source_database = %boot.source_database,
-            start_lsn = %boot.start_lsn,
-            "бутстрап завершён, подключаемся к репликации"
-        );
-
-        let mut client = match connect_replication(&config, boot.start_lsn).await {
-            Ok(client) => client,
-            Err(e) if has_fatal_config_error(&e) => break Err(e),
-            Err(e) => {
-                attempt += 1;
-                if !backoff_after_failure(&token, &config, attempt, "подключение не удалось", &e)
-                    .await
-                {
-                    break Ok(());
-                }
-                continue;
-            }
-        };
-        if let Err(e) = client.wait_started().await {
-            let err = anyhow::Error::new(e).context("старт репликации не подтверждён сервером");
-            if has_fatal_config_error(&err) {
-                break Err(err);
-            }
-            // Например, слот занят другим консюмером: ждём освобождения.
-            attempt += 1;
-            if !backoff_after_failure(&token, &config, attempt, "старт не подтверждён", &err).await
-            {
-                break Ok(());
-            }
-            continue;
-        }
-        // Подключение и старт удались: счётчик неудач сбрасывается.
-        attempt = 0;
-        info!("репликация запущена");
-
-        let end = stream_session(&mut client, &audit, &source_pool, &boot, &config, &token).await;
-        if matches!(end, SessionEnd::Cancelled)
-            && let Err(e) = client.shutdown().await
-        {
-            warn!(error = %e, "штатное закрытие репликации завершилось с ошибкой");
-        }
-        match end {
-            SessionEnd::Cancelled => {
-                info!("воркер остановлен по CancellationToken: позиции сохранены чекпоинтом");
-                break Ok(());
-            }
-            SessionEnd::Reconnect(e) => {
-                attempt += 1;
-                if !backoff_after_failure(
-                    &token,
-                    &config,
-                    attempt,
-                    "сессия репликации прервана — продолжение с чекпоинта",
-                    &e,
-                )
-                .await
-                {
-                    break Ok(());
-                }
-            }
-        }
-    };
-
-    reporter.abort();
-    result
-}
-
-/// Одна сессия репликации: чтение потока до отмены, ошибки или закрытия
-/// сервером. Кэш отношений и буфер транзакции живут внутри сессии —
+/// Одна сессия репликации источника: чтение потока до отмены, ошибки или
+/// закрытия сервером. Кэш отношений и буфер транзакции живут внутри сессии —
 /// новое подключение получает Relation заново, недоконченная транзакция
 /// переигрывается слотом от последнего чекпоинта.
-async fn stream_session(
+pub(crate) async fn stream_session(
     client: &mut ReplicationClient,
     audit: &PgPool,
     source_pool: &PgPool,
     boot: &Bootstrap,
-    config: &WorkerConfig,
+    record: &SourceRecord,
+    status: &StatusWriter<'_>,
     token: &CancellationToken,
 ) -> SessionEnd {
     let mut cache = RelationCache::new(boot.server_major);
@@ -193,7 +53,7 @@ async fn stream_session(
     loop {
         tokio::select! {
             _ = token.cancelled() => {
-                info!("получен сигнал остановки: незакоммиченная транзакция будет переиграна слотом");
+                info!(source = %record.name, "получен сигнал остановки: незакоммиченная транзакция будет переиграна слотом");
                 return SessionEnd::Cancelled;
             }
             event = client.recv() => match event {
@@ -209,7 +69,7 @@ async fn stream_session(
                     // Чистое время ступени intake: декодирование и сборка строк.
                     let intake_started = Instant::now();
                     let outcome =
-                        handle_xlog(source_pool, boot, config, &mut cache, buf, &data, wal_start)
+                        handle_xlog(source_pool, boot, record, &mut cache, buf, &data, wal_start)
                             .await;
                     metrics::add_intake_time(intake_started.elapsed());
                     if let Err(e) = outcome {
@@ -231,10 +91,11 @@ async fn stream_session(
                     // событий транзакции детерминирована потоком WAL —
                     // на этом держится replay-дедупликация.
                     buf.next_index();
-                    // Только MESSAGE с настроенным префиксом (по умолчанию
-                    // `_audit`) интерпретируется как канал контекста
-                    // (ADR-0004): чужие префиксы строкам контекст не меняют.
-                    if prefix == config.message_prefix {
+                    // Только MESSAGE с префиксом из реестра источника
+                    // (исторический дефолт `_audit`) интерпретируется как
+                    // канал контекста (ADR-0004): чужие префиксы строкам
+                    // контекст не меняют.
+                    if prefix == record.message_prefix {
                         let intake_started = Instant::now();
                         handle_audit_message(buf, &content, lsn);
                         metrics::add_intake_time(intake_started.elapsed());
@@ -255,15 +116,18 @@ async fn stream_session(
                     match ingest::flush(
                         audit,
                         &rows,
-                        &config.slot,
+                        &record.slot(),
                         end_lsn.as_u64() as i64,
-                        config.batch_size,
+                        record.batch_size,
                     )
                     .await
                     {
                         Ok(()) => {
                             metrics::add_flush(flush_started.elapsed(), rows.len());
-                            info!(rows = rows.len(), end_lsn = %end_lsn, "транзакция источника сохранена в журнал");
+                            info!(source = %record.name, rows = rows.len(), end_lsn = %end_lsn, "транзакция источника сохранена в журнал");
+                            // Статус источника: время последнего события
+                            // (обновляется с троттлингом, ошибку не прокидывает).
+                            status.event_saved().await;
                             // Ack слоту строго после коммита транзакции вставки.
                             client.update_applied_lsn(end_lsn);
                         }
@@ -281,53 +145,6 @@ async fn stream_session(
     }
 }
 
-/// Задержка перед (пере)подключением по номеру подряд идущей попытки.
-fn reconnect_delay(config: &WorkerConfig, attempt: u32) -> Duration {
-    backoff_delay(
-        Duration::from_millis(config.reconnect_initial_backoff_ms),
-        Duration::from_millis(config.reconnect_max_backoff_ms),
-        attempt,
-    )
-}
-
-/// Единая реакция на неудачную попытку: warn-лог с причиной и пауза backoff,
-/// прерываемая остановкой воркера. `false` — сигнал остановки пришёл в паузе.
-async fn backoff_after_failure(
-    token: &CancellationToken,
-    config: &WorkerConfig,
-    attempt: u32,
-    reason: &str,
-    error: &anyhow::Error,
-) -> bool {
-    warn!(attempt, reason, error = %error, "повтор с backoff");
-    wait_reconnect(token, reconnect_delay(config, attempt)).await
-}
-
-/// Экспоненциальный backoff `initial * 2^attempt`, ограниченный сверху `max`;
-/// ниже `initial` не опускается даже при `max < initial`.
-fn backoff_delay(initial: Duration, max: Duration, attempt: u32) -> Duration {
-    // Потолок степени защищает от переполнения при больших номерах попыток.
-    let doubling = initial.saturating_mul(2u32.saturating_pow(attempt.min(30)));
-    doubling.min(max).max(initial)
-}
-
-/// Пауза перед реконнектом, прерываемая остановкой воркера:
-/// `false` — пока шла пауза, поступил сигнал остановки.
-async fn wait_reconnect(token: &CancellationToken, delay: Duration) -> bool {
-    tokio::select! {
-        _ = token.cancelled() => false,
-        _ = tokio::time::sleep(delay) => true,
-    }
-}
-
-/// Ошибка подключения не лечится реконнектом: неверные креды или TLS-конфиг.
-/// Остальное (обрывы, занятый слот, перезапуск источника) — повторять.
-fn has_fatal_config_error(err: &anyhow::Error) -> bool {
-    err.chain()
-        .filter_map(|cause| cause.downcast_ref::<PgWireError>())
-        .any(|e| e.is_auth() || e.is_tls())
-}
-
 /// Подключение к walsender источника: `START_REPLICATION … messages 'true'`.
 ///
 /// Обязательство спеки «отвечать на все keepalive с reply_requested и слать
@@ -339,11 +156,15 @@ fn has_fatal_config_error(err: &anyhow::Error) -> bool {
 /// Подтверждаемая слоту позиция (`ack_lsn`) — точка старта сессии: слот
 /// не продвигается дальше durable-чекпоинта, пока вставки не закоммичены
 /// и не вызван `update_applied_lsn`.
-async fn connect_replication(config: &WorkerConfig, start_lsn: Lsn) -> Result<ReplicationClient> {
-    let url = url::Url::parse(&config.source_database_url).context("разбор SOURCE_DATABASE_URL")?;
+pub(crate) async fn connect_replication(
+    record: &SourceRecord,
+    start_lsn: Lsn,
+) -> Result<ReplicationClient> {
+    let slot = record.slot();
+    let url = url::Url::parse(&record.url).context("разбор URL источника")?;
     let host = url
         .host_str()
-        .context("в SOURCE_DATABASE_URL нет хоста")?
+        .context("в URL источника нет хоста")?
         .to_owned();
     let port = url.port_or_known_default().context("порт источника")?;
     let user = if url.username().is_empty() {
@@ -359,15 +180,15 @@ async fn connect_replication(config: &WorkerConfig, start_lsn: Lsn) -> Result<Re
         user,
         password,
         database,
-        config.slot.clone(),
-        config.publication.clone(),
+        slot.clone(),
+        record.publication(),
     )
     .with_port(port)
     .with_start_lsn(start_lsn);
     // Durable-позиция воркера: слот не подтверждается дальше чекпоинта.
     repl_config.ack_lsn = Some(start_lsn);
     // Имя соединения для pg_stat_replication: мониторинг и тесты.
-    repl_config.application_name = Some(format!("{APPLICATION_NAME_PREFIX}-{}", config.slot));
+    repl_config.application_name = Some(format!("{APPLICATION_NAME_PREFIX}-{slot}"));
 
     let client = ReplicationClient::connect(repl_config)
         .await
@@ -379,7 +200,7 @@ async fn connect_replication(config: &WorkerConfig, start_lsn: Lsn) -> Result<Re
 async fn handle_xlog(
     source: &PgPool,
     boot: &Bootstrap,
-    config: &WorkerConfig,
+    record: &SourceRecord,
     cache: &mut RelationCache,
     buf: &mut TransactionBuffer,
     data: &[u8],
@@ -408,7 +229,7 @@ async fn handle_xlog(
             let relation = cache
                 .relation(change.relation_oid)
                 .with_context(|| format!("нет Relation для OID {}", change.relation_oid))?;
-            if ingest::is_ignored(&config.ignore_tables, &relation.schema, &relation.name) {
+            if ingest::is_ignored(&record.ignore_tables, &relation.schema, &relation.name) {
                 return Ok(());
             }
 
@@ -428,6 +249,7 @@ async fn handle_xlog(
 
             buf.push_row(journal_row(
                 boot,
+                record,
                 relation,
                 ingest::operation_name(change.kind),
                 primary_key,
@@ -445,11 +267,12 @@ async fn handle_xlog(
                 let relation = cache
                     .relation(oid)
                     .with_context(|| format!("Truncate: нет Relation для OID {oid}"))?;
-                if ingest::is_ignored(&config.ignore_tables, &relation.schema, &relation.name) {
+                if ingest::is_ignored(&record.ignore_tables, &relation.schema, &relation.name) {
                     continue;
                 }
                 buf.push_row(journal_row(
                     boot,
+                    record,
                     relation,
                     "TRUNCATE",
                     None,
@@ -467,10 +290,10 @@ async fn handle_xlog(
     Ok(())
 }
 
-/// Обрабатывает MESSAGE настроенного префикса (`CDC_MESSAGE_PREFIX`, по
-/// умолчанию `_audit`) как канал контекста транзакции (ADR-0004): payload
-/// целиком становится контекстом транзакции, строковое значение ключа
-/// `trace_id` верхнего уровня — колонкой и далее всеми строками этой
+/// Обрабатывает MESSAGE настроенного префикса источника (из реестра,
+/// по умолчанию `_audit`) как канал контекста транзакции (ADR-0004):
+/// payload целиком становится контекстом транзакции, строковое значение
+/// ключа `trace_id` верхнего уровня — колонкой и далее всеми строками этой
 /// транзакции. Строку журнала MESSAGE не создаёт: единственное содержимое
 /// журнала — изменения строк. Контрактом payload является JSON: не-JSON
 /// payload порождает warn и контекста не меняет, на поток репликации это
@@ -497,6 +320,7 @@ fn handle_audit_message(buf: &mut TransactionBuffer, content: &[u8], lsn: Lsn) {
 #[allow(clippy::too_many_arguments)] // все поля — данные одного события
 fn journal_row(
     boot: &Bootstrap,
+    record: &SourceRecord,
     relation: &Relation,
     operation: &'static str,
     primary_key: Option<String>,
@@ -505,8 +329,10 @@ fn journal_row(
     wal_start: Lsn,
     event_index: i32,
     xid: i64,
-) -> ChangeRow {
-    ChangeRow {
+) -> ingest::ChangeRow {
+    ingest::ChangeRow {
+        // Ключ источника из реестра: дедуп-ключи журнала включают источник.
+        source: record.name.clone(),
         database: boot.source_database.clone(),
         schema: relation.schema.clone(),
         table: relation.name.clone(),
@@ -538,35 +364,36 @@ fn pg_micros_to_utc(micros: i64) -> DateTime<Utc> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn backoff_starts_at_initial_and_doubles() {
-        let initial = Duration::from_millis(200);
-        let max = Duration::from_secs(30);
-        assert_eq!(backoff_delay(initial, max, 0), initial);
-        assert_eq!(backoff_delay(initial, max, 1), Duration::from_millis(400));
-        assert_eq!(backoff_delay(initial, max, 2), Duration::from_millis(800));
-        assert_eq!(backoff_delay(initial, max, 3), Duration::from_millis(1600));
+    /// Строка журнала с заданными метаданными источника для тестов.
+    fn journal_row_fixture(source: &str, database: &str) -> ingest::ChangeRow {
+        ingest::ChangeRow {
+            source: source.to_owned(),
+            database: database.to_owned(),
+            schema: "public".into(),
+            table: "t".into(),
+            primary_key: None,
+            operation: "CREATE",
+            before: json!({}),
+            after: json!({}),
+            context: json!({}),
+            committed_at: Utc::now(),
+            queued_at: Utc::now(),
+            transaction_id: 1,
+            position: 1,
+            event_index: 0,
+            trace_id: None,
+        }
     }
 
+    /// Строки журнала одного источника несут его ключ в колонке `source`:
+    /// дедуп-ключи журнала включают источник, чтение фильтруется по нему.
     #[test]
-    fn backoff_is_capped_at_max() {
-        let initial = Duration::from_secs(1);
-        let max = Duration::from_secs(30);
-        assert_eq!(backoff_delay(initial, max, 5), max);
-        assert_eq!(
-            backoff_delay(initial, max, 100),
-            max,
-            "переполнение степени не должно пробить верхнюю границу"
-        );
-    }
+    fn journal_rows_carry_source_key() {
+        let row = journal_row_fixture("client_a", "clientdb");
+        assert_eq!(row.source, "client_a");
+        assert_eq!(row.database, "clientdb");
 
-    #[test]
-    fn backoff_floor_is_initial_even_when_max_is_smaller() {
-        let initial = Duration::from_secs(5);
-        assert_eq!(
-            backoff_delay(initial, Duration::from_secs(1), 3),
-            initial,
-            "нулевая пауза реконнекта недопустима"
-        );
+        let other = journal_row_fixture("client_b", "otherdb");
+        assert_ne!(row.source, other.source);
     }
 }

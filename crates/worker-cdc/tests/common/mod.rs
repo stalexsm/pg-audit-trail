@@ -74,13 +74,10 @@ pub async fn drop_db(admin: &PgPool, db_name: &str) {
     .expect("удаление тестовой БД");
 }
 
-/// Готовит источник: публикация `audit` на все таблицы и тестовые таблицы.
+/// Готовит источник: тестовые таблицы. Публикацию не создаёт: бутстрап
+/// воркера обязан сам создать публикацию и слот при подхвате источника
+/// (ADR-0005) — это часть проверяемого поведения.
 pub async fn setup_source(source: &PgPool) {
-    sqlx::query("CREATE PUBLICATION audit FOR ALL TABLES")
-        .execute(source)
-        .await
-        .expect("создание публикации");
-
     sqlx::query(
         "CREATE TABLE orders (
             id BIGINT PRIMARY KEY,
@@ -155,4 +152,123 @@ pub async fn connect_db(url: &str) -> PgPool {
         .connect(url)
         .await
         .expect("подключение к тестовой БД")
+}
+
+/// Уникальное имя источника реестра для прогона: правило имён слотов
+/// `[a-z0-9_]` (ADR-0005), длина влезает в колонку (54) — из имени
+/// деривируются слот и публикация.
+pub fn source_name(prefix: &str) -> String {
+    let id = &uuid::Uuid::new_v4().simple().to_string()[..12];
+    format!("{prefix}_{id}")
+}
+
+/// Слот логической репликации источника, деривированный из имени (ADR-0005).
+pub fn source_slot(name: &str) -> String {
+    format!("waltrail_{name}")
+}
+
+/// Публикация источника на клиенте, деривированная из имени (ADR-0005).
+pub fn source_publication(name: &str) -> String {
+    format!("audit_{name}")
+}
+
+/// application_name walsender-соединения задачи источника (replicate.rs).
+pub fn application_name(slot: &str) -> String {
+    format!("waltrail-cdc-{slot}")
+}
+
+/// Регистрирует источник в реестре БД аудита (как POST /api/sources):
+/// неизменяемые поля — имя и URL, остальное — дефолты схемы.
+pub async fn register_source(audit: &PgPool, name: &str, url: &str) {
+    sqlx::query("INSERT INTO sources (name, url) VALUES ($1, $2)")
+        .bind(name)
+        .bind(url)
+        .execute(audit)
+        .await
+        .expect("регистрация источника в реестре");
+}
+
+/// Регистрирует источник с явными настройками (игнор-таблицы, префикс
+/// MESSAGE, размер батча) — для сценариев, проверяющих чтение настроек
+/// из реестра.
+pub async fn register_source_with(
+    audit: &PgPool,
+    name: &str,
+    url: &str,
+    ignore_tables: &[&str],
+    message_prefix: &str,
+    batch_size: i32,
+) {
+    let tables: Vec<String> = ignore_tables.iter().map(|t| t.to_string()).collect();
+    sqlx::query(
+        "INSERT INTO sources (name, url, ignore_tables, message_prefix, batch_size) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(name)
+    .bind(url)
+    .bind(&tables)
+    .bind(message_prefix)
+    .bind(batch_size)
+    .execute(audit)
+    .await
+    .expect("регистрация источника в реестре");
+}
+
+/// Ждёт, пока воркер применит миграции к БД аудита (таблица реестра).
+pub async fn wait_sources_table(audit: &PgPool) {
+    wait_until(|| async {
+        sqlx::query_scalar::<_, bool>("SELECT to_regclass('public.sources') IS NOT NULL")
+            .fetch_one(audit)
+            .await
+            .unwrap_or(false)
+    })
+    .await;
+}
+
+/// Ждёт, пока у источника появится слот репликации (бутстрап воркера).
+pub async fn wait_slot(source: &PgPool, slot: &str) {
+    let slot = slot.to_owned();
+    wait_until(|| async {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+        )
+        .bind(&slot)
+        .fetch_one(source)
+        .await
+        .unwrap_or(false)
+    })
+    .await;
+}
+
+/// Ждёт, пока у источника появится публикация (бутстрап воркера).
+pub async fn wait_publication(source: &PgPool, publication: &str) {
+    let publication = publication.to_owned();
+    wait_until(|| async {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)",
+        )
+        .bind(&publication)
+        .fetch_one(source)
+        .await
+        .unwrap_or(false)
+    })
+    .await;
+}
+
+/// Ждёт, пока задача источника перейдёт в заданное состояние реестра
+/// (`sources.worker_state` — пишет воркер).
+pub async fn wait_source_state(audit: &PgPool, name: &str, state: &str) {
+    let expected = state.to_owned();
+    let source = name.to_owned();
+    wait_until(|| async {
+        sqlx::query_scalar::<_, Option<String>>("SELECT worker_state FROM sources WHERE name = $1")
+            .bind(&source)
+            .fetch_one(audit)
+            .await
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some(expected.as_str())
+    })
+    .await;
 }

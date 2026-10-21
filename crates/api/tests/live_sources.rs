@@ -241,6 +241,57 @@ async fn list_and_one_return_registry_fields_with_worker_status() {
     drop_db(&connect_admin(&audit_admin_url()).await, &db_name).await;
 }
 
+/// Статусы, записанные воркером (подключен/ошибка, время последнего
+/// события, текст ошибки), видны в ответах API — тикет #30. Воркер в тесте
+/// имитируется прямой записью в реестр — тем же UPDATE, что делает
+/// StatusWriter; шов проверяет проход значений из БД в HTTP-ответ.
+#[tokio::test]
+async fn worker_written_statuses_are_visible_in_api_responses() {
+    let (pool, db_name, router) = spawn_env("sources_status").await;
+
+    create_source(router.clone(), "client_a").await;
+
+    // Воркер: источник подключён, время последнего события зафиксировано.
+    sqlx::query(
+        "UPDATE sources SET worker_state = 'connected', last_event_at = now() \
+         WHERE name = $1",
+    )
+    .bind("client_a")
+    .execute(&pool)
+    .await
+    .expect("статус connected от воркера");
+
+    let (status, body) = get_json(router.clone(), "/api/sources/client_a").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["worker_state"], "connected");
+    assert!(
+        body["last_event_at"].is_string(),
+        "время последнего события в ответе: {}",
+        body["last_event_at"]
+    );
+    assert_eq!(body["last_error"], Value::Null);
+
+    // Воркер: попытка не удалась — состояние и текст ошибки в реестре.
+    sqlx::query(
+        "UPDATE sources SET worker_state = 'error', \
+         last_error = 'подключение к БД источника не удалось' WHERE name = $1",
+    )
+    .bind("client_a")
+    .execute(&pool)
+    .await
+    .expect("статус error от воркера");
+
+    let (status, body) = get_json(router, "/api/sources/client_a").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["worker_state"], "error");
+    assert_eq!(
+        body["last_error"], "подключение к БД источника не удалось",
+        "текст ошибки виден в ответе API"
+    );
+
+    drop_db(&connect_admin(&audit_admin_url()).await, &db_name).await;
+}
+
 #[tokio::test]
 async fn patch_updates_only_provided_fields_and_keeps_url() {
     let (pool, db_name, router) = spawn_env("sources_patch").await;
