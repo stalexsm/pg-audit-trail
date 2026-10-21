@@ -1,10 +1,10 @@
-//! Интеграционный тест шва №2 «HTTP у api» (эпик #3, тикет #9).
+//! Интеграционный тест шва №2 «HTTP у api» (эпик #3, тикеты #9 и #20).
 //!
 //! Требует поднятой инфраструктуры: `docker compose up -d`. Роутер axum
 //! проверяется против живого тестового Postgres; журнал сидируется чистым
 //! SQL. Истина — HTTP-ответы: список журнала с пагинацией, сортировкой и
 //! фильтрами (trace_id, таблица, операция, время, вхождение в `context`),
-//! MESSAGE-строки наравне с изменениями, детальная, 404.
+//! только изменения строк (ADR-0004), детальная, 404.
 
 mod common;
 
@@ -145,18 +145,21 @@ async fn invalid_query_params_give_400() {
 async fn trace_id_returns_whole_operation() {
     let (pool, db_name, router) = spawn_env("trace").await;
 
-    // Операция op-a: изменение строк и событие приложения с одним trace_id.
-    let mut change = row("CREATE", "orders", json!({}), at(11, 9));
-    change.trace_id = Some("op-a".to_string());
-    change.after = json!({"id": 1});
-    let event = SeedRow::message(json!({"trace_id": "op-a", "user": "alice"}), at(11, 9));
+    // Операция op-a: два изменения строк одной операции (создание и
+    // последующее обновление той же строки заказа).
+    let mut create = row("CREATE", "orders", json!({}), at(11, 9));
+    create.trace_id = Some("op-a".to_string());
+    create.after = json!({"id": 1});
+    let mut update = row("UPDATE", "orders", json!({}), at(11, 9));
+    update.trace_id = Some("op-a".to_string());
+    update.after = json!({"id": 1});
 
     // Чужая операция и строка без trace_id.
     let mut other = row("UPDATE", "orders", json!({}), at(11, 10));
     other.trace_id = Some("op-b".to_string());
     let orphan = row("DELETE", "orders", json!({}), at(11, 10));
 
-    for r in [&change, &event, &other, &orphan] {
+    for r in [&create, &update, &other, &orphan] {
         insert_row(&pool, r).await;
     }
 
@@ -170,23 +173,20 @@ async fn trace_id_returns_whole_operation() {
         .iter()
         .map(|r| r["id"].clone())
         .collect();
-    assert_eq!(ids.len(), 2, "вся операция: изменение и событие");
-    assert!(ids.contains(&json!(change.id)));
-    assert!(ids.contains(&json!(event.id)));
-
-    // Событие приложения читается наравне с изменениями: строка MESSAGE
-    // с payload в context и пустой сводкой образов.
-    let message_row = body["rows"]
-        .as_array()
-        .expect("rows")
-        .iter()
-        .find(|r| r["operation"] == "MESSAGE")
-        .expect("MESSAGE-строка в списке");
     assert_eq!(
-        message_row["context"],
-        json!({"trace_id": "op-a", "user": "alice"})
+        ids.len(),
+        2,
+        "вся операция: только изменения строк (ADR-0004)"
     );
-    assert_eq!(message_row["changes"], json!([]));
+    assert!(ids.contains(&json!(create.id)));
+    assert!(ids.contains(&json!(update.id)));
+
+    // В журнале нет MESSAGE-строк: единственное содержимое журнала —
+    // изменения строк; событие приложения без изменений строк в него
+    // не попадает.
+    for r in body["rows"].as_array().expect("rows") {
+        assert_ne!(r["operation"], "MESSAGE");
+    }
 
     drop_db(&connect_admin(&audit_admin_url()).await, &db_name).await;
 }
@@ -197,8 +197,8 @@ async fn filters_by_table_operation_and_time() {
 
     let orders = row("CREATE", "orders", json!({}), at(12, 9));
     let users = row("UPDATE", "users", json!({}), at(12, 11));
-    let event = SeedRow::message(json!({"kind": "ping"}), at(12, 13));
-    for r in [&orders, &users, &event] {
+    let truncate = row("TRUNCATE", "events", json!({}), at(12, 13));
+    for r in [&orders, &users, &truncate] {
         insert_row(&pool, r).await;
     }
 
@@ -208,11 +208,11 @@ async fn filters_by_table_operation_and_time() {
     assert_eq!(body["rows"].as_array().expect("rows").len(), 1);
     assert_eq!(body["rows"][0]["table"], "orders");
 
-    // Операция — без учёта регистра; MESSAGE — полноценный фильтр.
-    let (status, body) = get_json(router.clone(), "/api/changes?operation=message").await;
+    // Операция — без учёта регистра; TRUNCATE — полноценный фильтр.
+    let (status, body) = get_json(router.clone(), "/api/changes?operation=truncate").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["rows"].as_array().expect("rows").len(), 1);
-    assert_eq!(body["rows"][0]["operation"], "MESSAGE");
+    assert_eq!(body["rows"][0]["operation"], "TRUNCATE");
 
     // Время: нижняя граница.
     let (status, body) = get_json(
@@ -340,20 +340,6 @@ async fn detail_returns_full_row_and_masks_password() {
     assert_eq!(body["context"], json!({"app": "BORiY"}));
     assert_eq!(body["created_at"], "2025-01-14T09:00:00Z");
     assert_eq!(body["committed_at"], "2025-01-14T09:00:00Z");
-
-    // MESSAGE-строка в детальной: payload целиком в context.
-    let payload = json!({"trace_id": "op-c", "event": "login", "password": "p"});
-    let event = SeedRow::message(payload, at(14, 9));
-    insert_row(&pool, &event).await;
-
-    let (status, body) = get_json(router.clone(), &format!("/api/changes/{}", event.id)).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["operation"], "MESSAGE");
-    assert_eq!(
-        body["context"],
-        json!({"trace_id": "op-c", "event": "login", "password": "p"}),
-        "payload MESSAGE хранится дословно (ADR-0002)"
-    );
 
     // Несуществующая запись — 404 с пояснением.
     let unknown = Uuid::new_v4();

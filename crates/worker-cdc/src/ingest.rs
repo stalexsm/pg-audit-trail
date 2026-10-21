@@ -8,10 +8,7 @@ use tracing::warn;
 
 use crate::Result;
 
-/// Операция журнала для событий приложения (ADR-0002).
-pub const MESSAGE_OPERATION: &str = "MESSAGE";
-
-/// Ключ payload MESSAGE с идентификатором сквозной операции (ADR-0002).
+/// Ключ payload MESSAGE с идентификатором сквозной операции (ADR-0004).
 pub const TRACE_ID_KEY: &str = "trace_id";
 
 /// Предел длины `trace_id` под колонку `trace_id` VARCHAR(255).
@@ -32,7 +29,7 @@ pub struct ChangeRow {
     pub operation: &'static str,
     pub before: Value,
     pub after: Value,
-    /// Контекст приложения: payload MESSAGE (ADR-0002).
+    /// Контекст приложения: payload MESSAGE (ADR-0004).
     pub context: Value,
     pub committed_at: DateTime<Utc>,
     pub queued_at: DateTime<Utc>,
@@ -49,7 +46,7 @@ pub struct TransactionBuffer {
     pub xid: i64,
     rows: Vec<ChangeRow>,
     event_index: i32,
-    /// Контекст последнего MESSAGE транзакции — его payload (ADR-0002).
+    /// Контекст последнего MESSAGE транзакции — его payload (ADR-0004).
     context: Value,
     /// trace_id последнего MESSAGE с этим ключом: проставляется всем
     /// строкам транзакции при коммите.
@@ -87,12 +84,13 @@ impl TransactionBuffer {
         self.rows.push(row);
     }
 
-    /// Регистрирует MESSAGE-событие приложения (ADR-0002): строка события
-    /// попадает в журнал, её payload дословно становится контекстом
-    /// транзакции, а ключ `trace_id` — колонкой всех её строк. Строкам
-    /// изменений достаётся контекст последнего MESSAGE: повторный MESSAGE
-    /// — коллизия, warn в лог.
-    pub fn push_message(&mut self, row: ChangeRow) {
+    /// Регистрирует MESSAGE транзакции (ADR-0004): payload становится
+    /// контекстом транзакции, а строковое значение ключа `trace_id` —
+    /// колонкой всех её строк. Строк журнала MESSAGE не создаёт:
+    /// единственное содержимое журнала — изменения строк. Строкам изменений
+    /// достаётся контекст последнего MESSAGE: повторный MESSAGE в одной
+    /// транзакции — коллизия контекста, warn в лог.
+    pub fn push_message(&mut self, context: Value, trace_id: Option<String>) {
         if self.message_seen {
             warn!(
                 xid = self.xid,
@@ -100,21 +98,18 @@ impl TransactionBuffer {
             );
         }
         self.message_seen = true;
-        self.context = row.context.clone();
-        self.trace_id = row.trace_id.clone();
-        self.rows.push(row);
+        self.context = context;
+        self.trace_id = trace_id;
     }
 
     /// Проставляет контекст последнего MESSAGE (payload и `trace_id`)
-    /// всем строкам изменений транзакции — включая события до MESSAGE.
-    /// Вызывается при коммите; сами MESSAGE-строки хранят свой payload
-    /// без изменений.
+    /// всем строкам изменений транзакции — включая строки до MESSAGE.
+    /// Вызывается при коммите. Контекст не выходит за пределы буфера своей
+    /// транзакции: строки других транзакций он не затрагивает.
     pub fn apply_transaction_context(&mut self) {
         for row in &mut self.rows {
-            if row.operation != MESSAGE_OPERATION {
-                row.context = self.context.clone();
-                row.trace_id = self.trace_id.clone();
-            }
+            row.context = self.context.clone();
+            row.trace_id = self.trace_id.clone();
         }
     }
 
@@ -151,7 +146,7 @@ pub fn is_ignored(ignore_tables: &[String], schema: &str, table: &str) -> bool {
     ignore_tables.iter().any(|entry| entry == &qualified)
 }
 
-/// Извлекает `trace_id` верхнего уровня payload MESSAGE (ADR-0002).
+/// Извлекает `trace_id` верхнего уровня payload MESSAGE (ADR-0004).
 ///
 /// В колонку попадает только строковое значение ключа `trace_id`; сам
 /// payload сохраняется в `context` дословно, без вырезания ключа.
@@ -278,15 +273,6 @@ mod tests {
         }
     }
 
-    /// MESSAGE-строка с заданным payload: context и trace_id заполняются
-    /// как в продовом обработчике (ADR-0002).
-    fn message_row_fixture(payload: Value) -> ChangeRow {
-        let mut row = journal_row_fixture(MESSAGE_OPERATION);
-        row.context = payload.clone();
-        row.trace_id = trace_id_from_payload(&payload);
-        row
-    }
-
     #[test]
     fn operation_naming_matches_journal_vocabulary() {
         assert_eq!(operation_name(ChangeKind::Insert), "CREATE");
@@ -328,7 +314,7 @@ mod tests {
     fn trace_id_is_extracted_from_top_level_string() {
         let payload = json!({"trace_id": "op-1", "user": "alice"});
         assert_eq!(trace_id_from_payload(&payload).as_deref(), Some("op-1"));
-        // Payload не мутируется: context хранит его дословно (ADR-0002).
+        // Payload не мутируется: context хранит его дословно (ADR-0004).
         assert_eq!(payload["trace_id"], "op-1");
         assert_eq!(payload["user"], "alice");
     }
@@ -359,40 +345,80 @@ mod tests {
     }
 
     #[test]
-    fn last_message_wins_for_change_rows() {
+    fn message_creates_no_journal_row_and_enriches_change_rows() {
         let mut buffer = TransactionBuffer::new(7);
         buffer.push_row(journal_row_fixture("CREATE"));
-        buffer.push_message(message_row_fixture(json!({"trace_id": "op-1"})));
-        buffer.push_message(message_row_fixture(
-            json!({"trace_id": "op-2", "user": "bob"}),
-        ));
+        buffer.push_message(json!({"trace_id": "op-1"}), Some("op-1".into()));
+        buffer.push_row(journal_row_fixture("UPDATE"));
 
         buffer.apply_transaction_context();
         let rows = buffer.take_rows();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 2, "MESSAGE строк журнала не создаёт (ADR-0004)");
+        // Обе строки изменения: контекст MESSAGE и trace_id в колонке,
+        // включая строку до MESSAGE.
+        for row in &rows {
+            assert_eq!(row.context, json!({"trace_id": "op-1"}));
+            assert_eq!(row.trace_id.as_deref(), Some("op-1"));
+        }
+    }
+
+    #[test]
+    fn last_message_wins_for_change_rows() {
+        let mut buffer = TransactionBuffer::new(7);
+        buffer.push_row(journal_row_fixture("CREATE"));
+        buffer.push_message(json!({"trace_id": "op-1"}), Some("op-1".into()));
+        buffer.push_message(
+            json!({"trace_id": "op-2", "user": "bob"}),
+            Some("op-2".into()),
+        );
+
+        buffer.apply_transaction_context();
+        let rows = buffer.take_rows();
+        assert_eq!(rows.len(), 1, "повторный MESSAGE строк не добавляет");
         // Строка изменения: контекст последнего MESSAGE, даже если она
         // была до него.
         assert_eq!(rows[0].context, json!({"trace_id": "op-2", "user": "bob"}));
         assert_eq!(rows[0].trace_id.as_deref(), Some("op-2"));
-        // MESSAGE-строки хранят свои payload без изменений.
-        assert_eq!(rows[1].context, json!({"trace_id": "op-1"}));
-        assert_eq!(rows[1].trace_id.as_deref(), Some("op-1"));
-        assert_eq!(rows[2].context, json!({"trace_id": "op-2", "user": "bob"}));
-        assert_eq!(rows[2].trace_id.as_deref(), Some("op-2"));
     }
 
     #[test]
     fn message_without_trace_id_leaves_column_empty() {
         let mut buffer = TransactionBuffer::new(1);
         buffer.push_row(journal_row_fixture("UPDATE"));
-        buffer.push_message(message_row_fixture(json!({"user": "bob"})));
+        buffer.push_message(json!({"user": "bob"}), None);
 
         buffer.apply_transaction_context();
         let rows = buffer.take_rows();
-        assert_eq!(rows[1].trace_id, None, "колонка пустая без ключа");
-        assert_eq!(rows[1].context, json!({"user": "bob"}));
-        // Строке изменения достаётся payload, но не trace_id.
+        assert_eq!(rows[0].trace_id, None, "колонка пустая без ключа");
         assert_eq!(rows[0].context, json!({"user": "bob"}));
+    }
+
+    #[test]
+    fn message_only_transaction_creates_no_rows() {
+        let mut buffer = TransactionBuffer::new(1);
+        // MESSAGE расходует индекс события, но строку журнала не создаёт:
+        // индекс остаётся детерминированной функцией содержимого транзакции.
+        buffer.next_index();
+        buffer.push_message(json!({"trace_id": "op-1"}), Some("op-1".into()));
+        buffer.apply_transaction_context();
+        assert!(
+            buffer.take_rows().is_empty(),
+            "транзакция только с MESSAGE не создаёт строк журнала (ADR-0004)"
+        );
+    }
+
+    #[test]
+    fn transaction_context_does_not_leak_into_next_buffer() {
+        let mut buffer = TransactionBuffer::new(1);
+        buffer.push_message(json!({"trace_id": "op-1"}), Some("op-1".into()));
+        buffer.apply_transaction_context();
+
+        // Новая транзакция без MESSAGE — строки с пустым контекстом.
+        let mut next = TransactionBuffer::new(2);
+        next.push_row(journal_row_fixture("DELETE"));
+        next.apply_transaction_context();
+        let rows = next.take_rows();
+        assert_eq!(rows[0].context, json!({}));
         assert_eq!(rows[0].trace_id, None);
     }
 

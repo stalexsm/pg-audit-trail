@@ -16,7 +16,7 @@ use crate::handlers as s;
 #[openapi(
     info(
         title = "Waltrail — документация API журнала аудита",
-        description = "Чтение журнала аудита: изменения данных и события приложения — единая сущность `changes` (ADR-0002)."
+        description = "Чтение журнала аудита: только изменения строк — единая сущность `changes` (ADR-0004)."
     ),
     paths(get_list_changes, get_change_by_id),
     components(schemas(ChangePageDTO, ChangeRowDTO, ChangeDetailDTO))
@@ -30,7 +30,7 @@ pub fn api_router() -> Router<Pool<Postgres>> {
         .route("/api/changes/{id}", get(get_change_by_id))
 }
 
-/// Метод для получения списка журнала: изменения и события приложения.
+/// Метод для получения списка журнала: изменения строк источника.
 #[utoipa::path(
     get,
     path = "/api/changes",

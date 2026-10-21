@@ -12,11 +12,9 @@ use crate::{AppError, AppResult};
 /// Диапазон времени фильтра: (нижняя граница, верхняя граница).
 pub(crate) type TimeRange = (Option<DateTime<chrono::Utc>>, Option<DateTime<chrono::Utc>>);
 
-/// Строка журнала в списке: изменение или событие приложения (ADR-0002).
+/// Строка журнала: изменение одной строки источника (ADR-0004).
 ///
-/// `changes` — краткая сводка образов «до/после» по первым четырём ключам;
-/// для MESSAGE-строк — пустой массив: у события образов нет, payload целиком
-/// в `context`.
+/// `changes` — краткая сводка образов «до/после» по первым четырём ключам.
 #[derive(Debug, Clone, Serialize, FromRow, ToSchema)]
 pub struct ChangeRowDTO {
     pub id: Uuid,
@@ -25,7 +23,7 @@ pub struct ChangeRowDTO {
     pub table: String,
     pub operation: String,
     pub primary_key: Option<String>,
-    /// Идентификатор сквозной операции: объединяет изменения и события одной операции.
+    /// Идентификатор сквозной операции: объединяет изменения строк одной операции.
     pub trace_id: Option<String>,
     #[schema(
         value_type = Vec<serde_json::Value>,
@@ -71,13 +69,13 @@ pub struct QChange {
     #[serde(default = "default_per_page")]
     pub per_page: i32,
 
-    /// Идентификатор сквозной операции: вся операция целиком — изменения и события.
+    /// Идентификатор сквозной операции: вся операция целиком — все изменения строк транзакции.
     pub trace_id: Option<String>,
 
     /// Имя таблицы, без учёта регистра.
     pub table: Option<String>,
 
-    /// Операция: CREATE, UPDATE, DELETE, TRUNCATE или MESSAGE, без учёта регистра.
+    /// Операция: CREATE, UPDATE, DELETE или TRUNCATE, без учёта регистра.
     pub operation: Option<String>,
 
     /// Диапазон времени сохранения в журнал: `2025-01-01..2025-12-31`;
