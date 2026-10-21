@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 
+use chrono::{DateTime, Utc};
 use serde_json::{Map, Value, json};
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use crate::{
-    AppResult,
-    dto::{ChangeDetailDTO, ChangeRowDTO, TimeRange},
+    AppError, AppResult,
+    dto::{ChangeDetailDTO, ChangeRowDTO, SourceDTO, TimeRange},
 };
 
 /// Число ключей в краткой сводке образов строки списка.
@@ -237,6 +238,144 @@ fn insert_nested(obj: &mut Map<String, Value>, path: &[&str], value: Value) {
         }
         [] => {}
     }
+}
+
+// === Реестр источников (ADR-0005, тикет #28) ===
+
+/// Колонки реестра источников для SELECT/RETURNING — точно в порядке полей
+/// `SourceDTO`.
+const SOURCE_COLUMNS: &str = "name, url, ignore_tables, message_prefix, batch_size, \
+    worker_state, last_event_at, last_error, deleted_at, created_at, updated_at";
+
+/// Вход репозитория: регистрация источника (POST /api/sources). Валидность
+/// полей проверена на уровне axum; здесь — чистые данные.
+pub(crate) struct SourceCreate {
+    pub name: String,
+    pub url: String,
+    pub ignore_tables: Vec<String>,
+    pub message_prefix: String,
+    pub batch_size: i32,
+}
+
+/// Вход репозитория: правка настроек источника (PATCH). `Some` — поле
+/// меняется, `None` — остаётся без изменений; URL неизменяем (ADR-0005)
+/// и здесь не представлен.
+pub(crate) struct SourcePatch {
+    pub ignore_tables: Option<Vec<String>>,
+    pub message_prefix: Option<String>,
+    pub batch_size: Option<i32>,
+}
+
+/// Репозиторий реестра источников: единственная сущность — `sources`
+/// (ADR-0005). Статус воркера только читается: пишет его воркер.
+#[derive(Debug)]
+pub(crate) struct SourceRepo;
+
+impl SourceRepo {
+    /// Регистрирует источник; статус воркера — дефолт схемы (`pending`).
+    /// Дубликат имени — ошибка валидации (400), прочая ошибка БД — 500.
+    pub(crate) async fn create(pool: &PgPool, source: &SourceCreate) -> AppResult<SourceDTO> {
+        let mut builder = QueryBuilder::new(
+            "INSERT INTO sources (name, url, ignore_tables, message_prefix, batch_size) \
+             VALUES ($1, $2, $3, $4, $5) RETURNING ",
+        );
+        builder.push(SOURCE_COLUMNS);
+
+        builder
+            .build_query_as()
+            .bind(&source.name)
+            .bind(&source.url)
+            .bind(&source.ignore_tables)
+            .bind(&source.message_prefix)
+            .bind(source.batch_size)
+            .fetch_one(pool)
+            .await
+            .map_err(map_create_error)
+    }
+
+    /// Все источники реестра со статусами воркеров, по имени.
+    pub(crate) async fn get_list(pool: &PgPool) -> AppResult<Vec<SourceDTO>> {
+        let mut builder = QueryBuilder::new("SELECT ");
+        builder
+            .push(SOURCE_COLUMNS)
+            .push(" FROM sources ORDER BY name");
+
+        let rows = builder.build_query_as().fetch_all(pool).await?;
+
+        Ok(rows)
+    }
+
+    /// Один источник по имени; `None` — источника нет (404).
+    pub(crate) async fn get_by_name(pool: &PgPool, name: &str) -> AppResult<Option<SourceDTO>> {
+        let mut builder = QueryBuilder::new("SELECT ");
+        builder
+            .push(SOURCE_COLUMNS)
+            .push(" FROM sources WHERE name = ")
+            .push_bind(name);
+
+        let found = builder.build_query_as().fetch_optional(pool).await?;
+
+        Ok(found)
+    }
+
+    /// Меняет только переданные настройки источника; помеченный к удалению
+    /// не меняется (`None` — 404/409 решает хендлер). Дата правки обновляется
+    /// всегда, даже при пустой правке.
+    pub(crate) async fn update(
+        pool: &PgPool,
+        name: &str,
+        patch: &SourcePatch,
+    ) -> AppResult<Option<SourceDTO>> {
+        let mut builder = QueryBuilder::new("UPDATE sources SET updated_at = NOW()");
+
+        if let Some(tables) = &patch.ignore_tables {
+            builder.push(", ignore_tables = ").push_bind(tables);
+        }
+        if let Some(prefix) = &patch.message_prefix {
+            builder.push(", message_prefix = ").push_bind(prefix);
+        }
+        if let Some(batch_size) = patch.batch_size {
+            builder.push(", batch_size = ").push_bind(batch_size);
+        }
+
+        builder
+            .push(" WHERE name = ")
+            .push_bind(name)
+            .push(" AND deleted_at IS NULL")
+            .push(format!(" RETURNING {SOURCE_COLUMNS}"));
+
+        let updated = builder.build_query_as().fetch_optional(pool).await?;
+
+        Ok(updated)
+    }
+
+    /// Помечает источник к удалению (ADR-0005: исполнение — за воркером);
+    /// повторная пометка не перетирает дату. Источника нет — `None` (404).
+    pub(crate) async fn mark_deleted(pool: &PgPool, name: &str) -> AppResult<Option<()>> {
+        let marked = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+            "UPDATE sources SET deleted_at = COALESCE(deleted_at, NOW()) \
+             WHERE name = $1 RETURNING deleted_at",
+        )
+        .bind(name)
+        .fetch_optional(pool)
+        .await?;
+
+        Ok(marked.map(|_| ()))
+    }
+}
+
+/// Нарушение уникальности имени источника (23505) — ошибка валидации (400),
+/// прочая ошибка БД — 500.
+fn map_create_error(err: sqlx::Error) -> AppError {
+    if err
+        .as_database_error()
+        .and_then(|db| db.code())
+        .is_some_and(|code| code.as_ref() == "23505")
+    {
+        return AppError::bad_request("Имя источника уже занято");
+    }
+
+    AppError::from(err)
 }
 
 #[cfg(test)]

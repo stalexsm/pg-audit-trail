@@ -171,6 +171,38 @@ pub async fn get_json(router: Router, uri: &str) -> (StatusCode, Value) {
     (status, json)
 }
 
+/// Запрос с методом и JSON-телом к роутеру API: статус и разобранный JSON.
+/// Пустое тело ответа (например, 202 на удаление) разбирается в `Null`.
+pub async fn send_json(
+    router: Router,
+    method: &str,
+    uri: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("запрос"),
+        )
+        .await
+        .expect("ответ роутера");
+
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("тело ответа");
+    let json = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(&String::from_utf8_lossy(&bytes)).expect("JSON-ответ")
+    };
+    (status, json)
+}
+
 /// GET-запрос к роутеру API без разбора тела: rejection-и axum (400)
 /// отвечают не во всех случаях JSON'ом.
 pub async fn get_raw(router: Router, uri: &str) -> (StatusCode, String) {
