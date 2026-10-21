@@ -30,6 +30,13 @@ from psycopg import sql
 # Префикс MESSAGE-событий приложения (ADR-0002) — тот же, что в воркере.
 AUDIT_MESSAGE_PREFIX = "_audit"
 
+# Детерминированный «бросок кубика» выбора операции транзакции: целочисленный
+# хеш (номер транзакции, номер сессии) вместо общего random — воспроизводимость
+# прогона и отсутствие блокировки генератора случайных чисел между потоками.
+ROLL_MULTIPLIER = 2_654_435_761  # нечётная константа (Кнут)
+ROLL_SESSION_SALT = 40_503
+ROLL_SCALE = 10_000  # единицы броска: 100 единиц = 1 процент
+
 TABLE_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)?$")
 
 
@@ -189,11 +196,15 @@ def session_loop(args, table, sequence, stop, stats, session_id):
                 emit_message = (
                     args.message_every > 0 and tx_number % args.message_every == 0
                 )
-                roll = (tx_number * 2654435761 + session_id * 40503) % 10_000
-                update = roll < args.update_percent * 100
+                roll = (
+                    tx_number * ROLL_MULTIPLIER + session_id * ROLL_SESSION_SALT
+                ) % ROLL_SCALE
+                percent_units = ROLL_SCALE // 100
+                update = roll < args.update_percent * percent_units
                 delete = (
                     not update
-                    and roll < (args.update_percent + args.delete_percent) * 100
+                    and roll
+                    < (args.update_percent + args.delete_percent) * percent_units
                 )
                 rows = 0
                 with conn.transaction():

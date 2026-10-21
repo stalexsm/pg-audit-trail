@@ -163,10 +163,8 @@ fn report_interval(previous: Snapshot) -> Snapshot {
     let rows_ps = current.inserted_rows.saturating_sub(previous.inserted_rows) as f64 / seconds;
 
     // Занятость ступени: её чистое время за интервал к времени стены.
-    let intake_pct =
-        current.intake_nanos.saturating_sub(previous.intake_nanos) as f64 / seconds / 10_000_000.0;
-    let insert_pct =
-        current.insert_nanos.saturating_sub(previous.insert_nanos) as f64 / seconds / 10_000_000.0;
+    let intake_pct = occupancy_percent(current.intake_nanos.saturating_sub(previous.intake_nanos));
+    let insert_pct = occupancy_percent(current.insert_nanos.saturating_sub(previous.insert_nanos));
 
     let p50 = percentile(&current.batch_ms, 50);
     let p99 = percentile(&current.batch_ms, 99);
@@ -195,6 +193,14 @@ fn percentile(values: &[u64], p: u64) -> u64 {
     sorted[(rank - 1).min(sorted.len() as u64 - 1) as usize]
 }
 
+/// Занятость ступени в процентах: её чистое время (наносекунды), отнесённое
+/// к длительности интервала отчёта.
+fn occupancy_percent(nanos: u64) -> f64 {
+    const NANOS_PER_SECOND: f64 = 1_000_000_000.0;
+    let interval_nanos = REPORT_INTERVAL_SECS as f64 * NANOS_PER_SECOND;
+    nanos as f64 / interval_nanos * 100.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,6 +227,19 @@ mod tests {
     fn percentile_sorts_unsorted_input() {
         assert_eq!(percentile(&[300, 100, 200], 50), 200);
         assert_eq!(percentile(&[300, 100, 200], 99), 300);
+    }
+
+    #[test]
+    fn occupancy_is_share_of_report_interval() {
+        let interval_nanos = REPORT_INTERVAL_SECS * 1_000_000_000;
+        assert_eq!(occupancy_percent(0), 0.0);
+        assert_eq!(occupancy_percent(interval_nanos), 100.0);
+        assert_eq!(occupancy_percent(interval_nanos / 4), 25.0);
+        assert_eq!(
+            occupancy_percent(interval_nanos * 2),
+            200.0,
+            "дренаж может превышать стену на границе интервалов"
+        );
     }
 
     #[test]
