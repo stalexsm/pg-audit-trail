@@ -8,7 +8,8 @@ use uuid::Uuid;
 use crate::dto::{AuditDTO, ChangeDTO, ChangeDetailDTO, QAudit, QChange};
 
 // Функция для добавления условий в запрос
-fn add_conditions<'a>(query_builder: &mut QueryBuilder<'a, Postgres>, q: &'a QAudit) {
+// sqlx 0.9: QueryBuilder больше не параметризуется временем жизни заимствований.
+fn add_conditions(query_builder: &mut QueryBuilder<Postgres>, q: &QAudit) {
     // Вспомогательная функция для форматирования поиска с подстроками
     let like_format = |val: &str| format!("%{val}%");
 

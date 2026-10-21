@@ -37,19 +37,26 @@ async fn cleanup_leftovers(admin: &PgPool, pattern: &str) {
     .await
     .unwrap_or_default();
     for name in names {
-        let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
-            .execute(admin)
-            .await;
+        // Идентификатор БД нельзя биндить: DDL с интерполяцией имени — вход
+        // из pg_database того же стенда, без пользовательского ввода (аудит).
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"
+        )))
+        .execute(admin)
+        .await;
     }
 }
 
 /// Создаёт уникальную БД на администраторском пуле, возвращает её URL.
 async fn spawn_db(admin: &PgPool, base_url: &str, prefix: &str) -> (String, String) {
     let db_name = format!("{prefix}_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
-        .execute(admin)
-        .await
-        .expect("создание тестовой БД");
+    // Имя БД генерируется из UUID здесь же — инъекции нет (аудит).
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE \"{db_name}\""
+    )))
+    .execute(admin)
+    .await
+    .expect("создание тестовой БД");
 
     let (prefix_url, _) = base_url
         .rsplit_once('/')
@@ -59,9 +66,10 @@ async fn spawn_db(admin: &PgPool, base_url: &str, prefix: &str) -> (String, Stri
 }
 
 async fn drop_db(admin: &PgPool, db_name: &str) {
-    sqlx::query(&format!(
+    // Имя БД — из фикстуры этого же теста, без пользовательского ввода (аудит).
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-    ))
+    )))
     .execute(admin)
     .await
     .expect("удаление тестовой БД");
