@@ -1,9 +1,10 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::Result;
 use crate::bootstrap::{self, Bootstrap};
 use crate::config::WorkerConfig;
 use crate::ingest::{self, ChangeRow, TransactionBuffer};
+use crate::metrics;
 use anyhow::Context;
 use chrono::{DateTime, TimeZone, Utc};
 use pgoutput::{ChangeKind, DecodedEvent, Relation, RelationCache, ReplicaIdentity, decode};
@@ -85,7 +86,11 @@ pub async fn run(config: WorkerConfig, token: CancellationToken) -> Result<()> {
     // удавшейся сессией, задаёт экспоненту backoff.
     let mut attempt: u32 = 0;
 
-    loop {
+    // Сводные метрики конвейера (walsender → intake → вставка) пишутся
+    // в лог до остановки воркера.
+    let reporter = tokio::spawn(metrics::report_loop(token.clone()));
+
+    let result: Result<()> = loop {
         if token.is_cancelled() {
             info!("остановка запрошена до подключения: воркер завершён");
             break Ok(());
@@ -168,7 +173,10 @@ pub async fn run(config: WorkerConfig, token: CancellationToken) -> Result<()> {
                 }
             }
         }
-    }
+    };
+
+    reporter.abort();
+    result
 }
 
 /// Одна сессия репликации: чтение потока до отмены, ошибки или закрытия
@@ -197,18 +205,23 @@ async fn stream_session(
                     buffer = Some(TransactionBuffer::new(xid));
                 }
                 Ok(Some(ReplicationEvent::XLogData { wal_start, data, .. })) => {
+                    metrics::add_wire(data.len());
                     let Some(buf) = buffer.as_mut() else {
                         warn!("изменение вне транзакции (Begin не приходил) — пропущено");
                         continue;
                     };
-                    if let Err(e) =
+                    // Чистое время ступени intake: декодирование и сборка строк.
+                    let intake_started = Instant::now();
+                    let outcome =
                         handle_xlog(source_pool, boot, config, &mut cache, buf, &data, wal_start)
-                            .await
-                    {
+                            .await;
+                    metrics::add_intake_time(intake_started.elapsed());
+                    if let Err(e) = outcome {
                         return SessionEnd::Reconnect(e);
                     }
                 }
                 Ok(Some(ReplicationEvent::Message { transactional, prefix, lsn, content, .. })) => {
+                    metrics::add_wire(content.len());
                     if !transactional {
                         debug!(%prefix, %lsn, bytes = content.len(), "внетранзакционный MESSAGE пропущен");
                         continue;
@@ -222,7 +235,9 @@ async fn stream_session(
                     // WAL — на этом держится replay-дедупликация.
                     let event_index = buf.next_index();
                     if prefix == AUDIT_MESSAGE_PREFIX {
+                        let intake_started = Instant::now();
                         handle_audit_message(boot, buf, &content, lsn, event_index);
+                        metrics::add_intake_time(intake_started.elapsed());
                     }
                 }
                 Ok(Some(ReplicationEvent::Commit { end_lsn, commit_time_micros, .. })) => {
@@ -234,6 +249,7 @@ async fn stream_session(
                     // строкам изменений строго перед вставкой батча.
                     buf.apply_transaction_context();
                     let rows = buf.take_rows();
+                    let flush_started = Instant::now();
                     match ingest::flush(
                         audit,
                         &rows,
@@ -244,6 +260,7 @@ async fn stream_session(
                     .await
                     {
                         Ok(()) => {
+                            metrics::add_flush(flush_started.elapsed(), rows.len());
                             info!(rows = rows.len(), end_lsn = %end_lsn, "транзакция источника сохранена в журнал");
                             // Ack слоту строго после коммита транзакции вставки.
                             client.update_applied_lsn(end_lsn);
@@ -418,6 +435,7 @@ async fn handle_xlog(
                 event_index,
                 buf.xid,
             ));
+            metrics::add_event();
         }
         DecodedEvent::Truncate(relation_oids) => {
             for oid in relation_oids {
@@ -439,6 +457,7 @@ async fn handle_xlog(
                     event_index,
                     buf.xid,
                 ));
+                metrics::add_event();
             }
         }
         DecodedEvent::Ignored => {}
@@ -485,6 +504,7 @@ fn handle_audit_message(
         event_index,
         buf.xid,
     ));
+    metrics::add_event();
     debug!(%lsn, "MESSAGE сохранён в журнал");
 }
 
