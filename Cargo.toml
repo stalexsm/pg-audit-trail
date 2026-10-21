@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/api", "crates/worker-debezium", "crates/worker-app", "crates/pgoutput", "crates/worker-cdc"]
+members = ["crates/api", "crates/pgoutput", "crates/worker-cdc"]
 
 resolver = "3"
 
@@ -32,18 +32,10 @@ sqlx = { version = "0.9.0", features = [
 ] }
 sqlx-cli = "0.9.0"
 tokio = { version = "1.54.0", features = ["full"] }
-futures = "0.3.34"
-rdkafka = { version = "0.39.0", features = ["cmake-build"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter"] }
 tracing-appender = "0.2.5"
-redis = { version = "1.7.1", features = ["tokio-comp"] }
-base64 = "0.23.1"
-rayon = "1.12.0"
-tokio-stream = "0.1.19"
 tokio-util = "0.7.20"
-fancy-regex = "0.19.2"
-lazy_static = "1.5.1"
 axum = "0.8.9"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7.1", features = ["cors", "compression-gzip", "trace"] }

@@ -7,19 +7,26 @@ cp env.example .env
 docker compose up -d
 ```
 
-Compose поднимает два PostgreSQL:
+Compose поднимает минимальный стек:
 
 | Сервис | Роль | Порт на хосте |
 | ------ | ---- | ------------- |
-| `db1` | БД аудита Waltrail (таблицы `changes`, `audits`) | `54399` |
+| `db1` | БД аудита Waltrail (таблица `changes` + чекпоинты) | `54399` |
 | `db-src` | Источник CDC — имитация БД клиента (`wal_level=logical`, публикация `audit` создаётся автоматически) | `54398` |
+| `api` | REST API журнала | `8000` |
+| `worker-cdc` | Консюмер логической репликации: слот источника → таблица `changes` | — |
 
-Остальные сервисы (Kafka, Redis, Debezium, kafka-ui) и легаси-крейты (`worker-app`, `worker-debezium`) работают как раньше — переход на CDC через pgoutput идёт поэтапно (см. issue #3). API читает журнал только из таблицы `changes`: `GET /api/changes` (список с пагинацией, сортировкой и фильтрами — `trace_id`, таблица, операция, время, вхождение в `context`) и `GET /api/changes/{id}` (детальная); Swagger — на `/swagger-ui`. Новый воркер CDC уже готов к использованию:
+Единственный тракт инжеста — слот логической репликации (ADR-0001): воркер `worker-cdc` читает pgoutput-поток источника и пишет журнал в таблицу `changes`. API читает журнал только из `changes`: `GET /api/changes` (список с пагинацией, сортировкой и фильтрами — `trace_id`, таблица, операция, время, вхождение в `context`) и `GET /api/changes/{id}` (детальная); Swagger — на `/swagger-ui`.
+
+Сквозной сценарий «эмит → журнал → REST-фильтр по trace_id»:
 
 ```bash
-export SOURCE_DATABASE_URL=postgresql://postgres:postgres@localhost:54398/postgres
-export DATABASE_URL=postgresql://postgres:postgres@localhost:54399/postgres
-cargo run -p worker-cdc
+# Эмит события приложения на источнике — pg_logical_emit_message в транзакции (ADR-0002)
+docker compose exec db-src psql -U postgres -c \
+  "SELECT pg_logical_emit_message(true, '_audit', '{\"trace_id\":\"demo-1\"}');"
+
+# Журнал: фильтр по trace_id
+curl 'http://localhost:8000/api/changes?trace_id=demo-1'
 ```
 
 Воркер сам создаёт слот репликации и применяет миграции, после остановки (Ctrl+C/SIGTERM) возобновляет с чекпоинта. Настройки — переменными окружения: `CDC_SLOT`, `CDC_PUBLICATION`, `CDC_IGNORE_TABLES`, `CDC_BATCH_SIZE` (значения по умолчанию — в [`env.example`](env.example)).
@@ -30,11 +37,7 @@ cargo run -p worker-cdc
 > SELECT pg_drop_replication_slot('waltrail');
 > ```
 
-Подготовка источника для dev: публикация создаётся init-скриптом [`docker/init-source/01_публикация_аудита.sql`](docker/init-source/01_публикация_аудита.sql) при первом создании volume. Слот репликации создаётся воркером CDC автоматически при старте. Удалить (например, после пересоздания стенда):
-
-```SQL
-SELECT pg_drop_replication_slot('waltrail');
-```
+Подготовка источника для dev: публикация создаётся init-скриптом [`docker/init-source/01_публикация_аудита.sql`](docker/init-source/01_публикация_аудита.sql) при первом создании volume. Слот репликации создаётся воркером CDC автоматически при старте.
 
 ### PoC-бенчмарк пропускной способности
 
@@ -48,94 +51,72 @@ python3 -m venv .venv && .venv/bin/pip install -r scripts/loadgen/requirements.t
 
 Методика, числа и вердикт гейта — в [`docs/benchmarks/0007-poc-пропускная-способность.md`](docs/benchmarks/0007-poc-пропускная-способность.md) (вердикт продублирован в [ADR-0003](docs/adr/0003-гейт-производительности-no-go-вставка-в-changes.md)).
 
-**Внимание:** история миграций переписана под целевую схему журнала (без накопленных ALTER-шагов), а данные сервисов живут в именованных volumes. Если у вас остался старый volume — пересоздайте его:
+**Внимание:** история миграций переписана под целевую схему журнала без мёртвых объектов (issue #11), а данные сервисов живут в именованных volumes. Если у вас остался старый volume — пересоздайте его:
 
 ```bash
 docker compose down -v && docker compose up -d
 ```
 
 > `down -v` удаляет локальные данные dev-стенда (в том числе volume БД аудита).
->
-> Сервис БД аудита переименован `db` → `db1` (как в `env.example`). Если Debezium-коннектор был зарегистрирован с `database.hostname: db` — перерегистрируйте его с `db1` после пересоздания стенда.
 
-### Postgres (Клиент)
-1. Запустите следующую команду SQL, чтобы изменить уровень WAL с реплики на логический и перезапустить вашу базу данных:
+## Подключение клиента (PostgreSQL)
+
+1. Включите логический WAL и перезапустите базу:
 ```SQL
     ALTER SYSTEM SET wal_level = logical;
 ```
 
 __Обязательно нужно перезагрузить postgres!!!__
 
-2. Создание публикации.
+2. Создайте публикацию и полную репликационную идентичность таблиц:
 ```SQL
--- Создайте ПУБЛИКАЦИЮ "audit", чтобы включить логическую репликацию для всех таблиц
+-- Публикация "audit" для всех таблиц
 CREATE PUBLICATION audit FOR ALL TABLES;
 
--- Создайте ПУБЛИКАЦИЮ "audit", чтобы включить логическую репликацию для выбранных таблиц
+-- Или только для выбранных таблиц
 CREATE PUBLICATION audit FOR TABLE [table1], [table2];
 
--- Установите ПОЛНУЮ ИДЕНТИФИКАЦИЮ РЕПЛИКИ для таблиц, чтобы отслеживать состояние "до" изменений строк базы данных
+-- Полная репликационная идентичность: в журнал попадают образы "до" (UPDATE/DELETE)
 ALTER TABLE [table1] REPLICA IDENTITY FULL;
 ALTER TABLE [table2] REPLICA IDENTITY FULL;
-
 
 -- Чтобы включить отслеживание изменений данных для новой таблицы:
 ALTER PUBLICATION audit ADD TABLE [table3];
 ALTER TABLE [table3] REPLICA IDENTITY FULL;
 
 -- Чтобы остановить отслеживание изменений данных для таблицы:
-
 ALTER PUBLICATION audit DROP TABLE [table3];
 ALTER TABLE [table3] REPLICA IDENTITY DEFAULT;
-
 ```
 
-3. Настройки для добавления в Debezium для отслеживания.
-```JSON
-{
-    "name": ${name},
-    "config": {
-        "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
-        "tasks.max": "1",
-        "database.hostname": ${hostname},
-        "database.port": ${port} or "5432",
-        "database.user": ${username},
-        "database.password": ${password},
-        "database.dbname": ${db_name},
-        "topic.prefix": "audit",
-        "plugin.name": "pgoutput",
-        "table.exclude.list": "public.alembic_version,",
-        "snapshot.mode": "never",
-        "transforms": "Reroute",
-        "transforms.Reroute.type": "org.apache.kafka.connect.transforms.RegexRouter",
-        "transforms.Reroute.regex": "audit\\..*",
-        "transforms.Reroute.replacement": "audit",
-        "heartbeat.interval.ms": "5000"
-    },
-}
+3. Контекст приложения и события передаются через `pg_logical_emit_message` в собственной транзакции клиента (ADR-0002): ключ `trace_id` верхнего уровня payload становится колонкой журнала и объединяет все строки одной операции:
+
+```SQL
+BEGIN;
+UPDATE orders SET status = 'paid' WHERE id = 42;
+SELECT pg_logical_emit_message(
+    true,
+    '_audit',
+    '{"trace_id":"op-123","user":"alice","app":"my-app"}'
+);
+COMMIT;
 ```
+
 ```mermaid
 flowchart LR
 
 Client[Client]
 
-subgraph Debezium
-  Api_D["Java API"]
-  D["Debezium Connect"]
-end
-
 subgraph M_Audit
-  W["Rust Worker"]
+  W["Rust Worker CDC"]
   A["Rust API"]
-  PG[(PostgreSQL)]
+  PG[(PostgreSQL<br>журнал)]
 end
 
 subgraph M_Any
-  PG_ANY[(PostgreSQL)]
+  PG_ANY[(PostgreSQL<br>клиента)]
   A_Any["API"]
 end
-
-K[(Kafka)]
 
 %% Client interaction
 Client --> A
@@ -148,10 +129,6 @@ W -->|Write| PG
 A_Any <--> |Write/Read| PG_ANY
 
 %% Cross-system flows
-M_Any -.->|Добавление данных о БД в коннектор| Api_D
-PG_ANY -->|CDC| D
-D -->|Debezium скидывает данные по топикам в Kafka| K
-
-K -->|Worker читает топики и обрабатывает| W
-A_Any -.->|Данные о выполнении запроса| K
+A_Any -.->|pg_logical_emit_message в транзакции| PG_ANY
+PG_ANY -->|CDC: слот логической репликации pgoutput| W
 ```

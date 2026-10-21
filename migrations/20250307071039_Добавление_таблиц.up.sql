@@ -11,7 +11,6 @@ CREATE TABLE IF NOT EXISTS public.changes (
     "before" JSONB NULL DEFAULT '{}',
     "after" JSONB NULL DEFAULT '{}',
     "context" JSONB DEFAULT '{}',
-    "request_id" VARCHAR(255) NULL,
     "committed_at" TIMESTAMPTZ (0),
     "queued_at" TIMESTAMPTZ (0),
     "created_at" TIMESTAMPTZ (0) DEFAULT NOW (),
@@ -29,8 +28,6 @@ CREATE INDEX changes_after_index ON public.changes USING GIN ("after" jsonb_path
 CREATE INDEX changes_before_index ON public.changes USING GIN ("before" jsonb_path_ops);
 
 CREATE INDEX changes_context_index ON public.changes USING GIN ("context" jsonb_path_ops);
-
-CREATE INDEX changes_request_id_index ON public.changes (request_id);
 
 CREATE INDEX changes_operation_index ON public.changes (operation);
 
@@ -56,9 +53,7 @@ COMMENT ON COLUMN public.changes.before IS 'Значения записи до �
 
 COMMENT ON COLUMN public.changes.after IS 'Значения записи после изменения';
 
-COMMENT ON COLUMN public.changes.context IS 'Контекст приложения, переданный через рекомендуемые ORM-пакеты';
-
-COMMENT ON COLUMN public.changes.request_id IS 'Уникальный идентификатор запроса в прикладе';
+COMMENT ON COLUMN public.changes.context IS 'Контекст приложения, переданный через pg_logical_emit_message (ADR-0002)';
 
 COMMENT ON COLUMN public.changes.committed_at IS 'Когда запись была изменена';
 
@@ -70,38 +65,10 @@ COMMENT ON COLUMN public.changes.transaction_id IS 'ID транзакции Post
 
 COMMENT ON COLUMN public.changes.position IS 'Позиция в WAL PostgreSQL (LSN события)';
 
-COMMENT ON COLUMN public.changes.commit_lsn IS 'LSN коммита транзакции источника (заполняет воркер CDC; NULL — записи старого пайплайна)';
+COMMENT ON COLUMN public.changes.commit_lsn IS 'LSN коммита транзакции источника (заполняет воркер CDC)';
 
 COMMENT ON COLUMN public.changes.event_index IS 'Порядковый номер события внутри транзакции источника (для дедупликации вместе с commit_lsn)';
 
 COMMENT ON COLUMN public.changes.trace_id IS 'Идентификатор сквозной операции приложения (из MESSAGE); объединяет все строки одной операции';
 
 CREATE INDEX changes_trace_id_index ON public.changes (trace_id);
-
--- Table Audits
-CREATE TABLE IF NOT EXISTS public.audits (
-    "id" uuid PRIMARY KEY DEFAULT uuid_generate_v4 (),
-    "event" TEXT NOT NULL,
-    "status_code" SMALLINT NOT NULL,
-    "response_body" TEXT NOT NULL,
-    "context" JSONB DEFAULT '{}',
-    "created_at" TIMESTAMPTZ (0)
-);
-
-CREATE INDEX audits_context_index ON public.audits USING GIN ("context" jsonb_path_ops);
-
-CREATE INDEX audits_event_index ON public.audits (event);
-
-CREATE INDEX audits_status_code_index ON public.audits (status_code);
-
-COMMENT ON COLUMN public.audits.id IS 'Уникальный идентификатор записи';
-
-COMMENT ON COLUMN public.audits.event IS 'Тип события';
-
-COMMENT ON COLUMN public.audits.status_code IS 'Код статуса HTTP';
-
-COMMENT ON COLUMN public.audits.response_body IS 'Тело ответа события';
-
-COMMENT ON COLUMN public.audits.context IS 'Контекст приложения';
-
-COMMENT ON COLUMN public.audits.created_at IS 'Когда запись была сохранена в базе данных';

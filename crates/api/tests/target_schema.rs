@@ -1,4 +1,5 @@
-//! Интеграционные тесты целевой схемы журнала (issue #5, Waltrail 02).
+//! Интеграционные тесты целевой схемы журнала (issue #5, Waltrail 02;
+//! contract-снос мёртвых объектов — issue #11, Waltrail 08).
 //!
 //! Требуют поднятой инфраструктуры: `docker compose up -d`.
 //! Подключение: `TEST_DATABASE_URL` (по умолчанию — `db1` с проброшенным портом).
@@ -94,24 +95,51 @@ async fn target_changes_schema_is_applied() {
         );
     }
 
-    // Expand перед contract: старые таблица и колонка пока сохраняются.
-    let audits_exists: bool = sqlx::query_scalar("SELECT to_regclass('public.audits') IS NOT NULL")
-        .fetch_one(&pool)
-        .await
-        .expect("запрос существования audits");
-    assert!(audits_exists, "таблица audits должна существовать");
-
-    let request_id_exists: bool = sqlx::query_scalar(
-        "SELECT COUNT(*) > 0 \
-         FROM information_schema.columns \
-         WHERE table_schema = 'public' AND table_name = 'changes' AND column_name = 'request_id'",
+    // Полный состав схемы — white-list: объекты создаются только миграциями,
+    // мёртвых таблиц и колонок в целевой схеме нет (issue #11, Waltrail 08).
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT tablename FROM pg_tables WHERE schemaname = 'public' \
+         AND tablename != '_sqlx_migrations' ORDER BY tablename",
     )
-    .fetch_one(&pool)
+    .fetch_all(&pool)
     .await
-    .expect("запрос существования request_id");
-    assert!(
-        request_id_exists,
-        "колонка changes.request_id должна существовать"
+    .expect("список таблиц схемы public");
+    assert_eq!(
+        tables,
+        vec!["changes".to_string(), "checkpoints".to_string()],
+        "в public должны быть только таблицы журнала и чекпоинтов (кроме служебной _sqlx_migrations)"
+    );
+
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'changes' \
+         ORDER BY ordinal_position",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("список колонок changes");
+    assert_eq!(
+        columns,
+        vec![
+            "id",
+            "database",
+            "schema",
+            "table",
+            "primary_key",
+            "operation",
+            "before",
+            "after",
+            "context",
+            "committed_at",
+            "queued_at",
+            "created_at",
+            "transaction_id",
+            "position",
+            "commit_lsn",
+            "event_index",
+            "trace_id",
+        ],
+        "неожиданный состав колонок changes"
     );
 
     // Btree-индекс по trace_id.
