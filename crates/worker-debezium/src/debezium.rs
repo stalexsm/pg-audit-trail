@@ -338,7 +338,7 @@ pub async fn run_loop(
 fn process_batch_data(batch: Vec<ChangeDTO>) -> Vec<ChangeDTO> {
     // Сортируем по position
     let mut changes = batch;
-    changes.sort_by(|a, b| a.position.cmp(&b.position));
+    changes.sort_by_key(|a| a.position);
 
     // Агрегируем контекст для операций MESSAGE
     let context_map: HashMap<(i64, Option<String>), serde_json::Value> = changes
