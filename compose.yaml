@@ -6,6 +6,16 @@ networks:
   shared-network:
     external: true
 
+volumes:
+  kafka-data:
+  debezium-config:
+  debezium-data:
+  debezium-connect:
+  debezium-logs:
+  redis-data:
+  db1-data:
+  db-src-data:
+
 services:
   kafka-ui:
     image: provectuslabs/kafka-ui
@@ -49,7 +59,7 @@ services:
       - "9094:9094"
 
     volumes:
-      - ./docker-volumes/kafka/:/bitnami/kafka:cached
+      - kafka-data:/bitnami/kafka
 
     networks:
       - shared-network
@@ -80,10 +90,10 @@ services:
       - CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE=false
 
     volumes:
-      - ./docker-volumes/debezium/config:/config:cached
-      - ./docker-volumes/debezium/data:/data:cached
-      - ./docker-volumes/debezium/connect:/connect:cached
-      - ./docker-volumes/debezium/logs:/logs:cached
+      - debezium-config:/config
+      - debezium-data:/data
+      - debezium-connect:/connect
+      - debezium-logs:/logs
 
     depends_on:
       kafka:
@@ -104,7 +114,7 @@ services:
     restart: always
     image: redis:8.0.1-bookworm
     volumes:
-      - ./docker-volumes/redis/:/data
+      - redis-data:/data
 
     networks:
       - default
@@ -119,7 +129,8 @@ services:
       start_period: 60s
       timeout: 10s
 
-  db:
+  # БД аудита Waltrail
+  db1:
     image: postgres:17.4
     restart: always
     environment:
@@ -128,9 +139,36 @@ services:
       PGDATA: /var/lib/postgresql/data
       POSTGRES_DB: postgres
     volumes:
-      - ./docker-volumes/postgres/:/var/lib/postgresql/data
+      - db1-data:/var/lib/postgresql/data
     ports:
       - "54399:5432"
+
+    networks:
+      - default
+
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"]
+      interval: 30s
+      retries: 3
+      start_period: 60s
+      timeout: 10s
+
+  # Источник CDC — имитация БД клиента (wal_level=logical, публикация создаётся из ./docker/init-source)
+  db-src:
+    image: postgres:17.4
+    restart: always
+    command:
+      ["postgres", "-c", "wal_level=logical"]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      PGDATA: /var/lib/postgresql/data
+      POSTGRES_DB: postgres
+    volumes:
+      - db-src-data:/var/lib/postgresql/data
+      - ./docker/init-source:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "54398:5432"
 
     networks:
       - default
@@ -153,7 +191,7 @@ services:
     volumes:
       - ./logs:/app/logs
     depends_on:
-      db:
+      db1:
         condition: service_healthy
       kafka:
         condition: service_healthy
