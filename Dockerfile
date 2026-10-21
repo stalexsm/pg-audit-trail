@@ -36,8 +36,6 @@ RUN apk add --no-cache clang lld musl-dev git openssl-dev pkgconfig cmake make g
 RUN --mount=type=bind,source=crates,target=crates \
     --mount=type=bind,source=Cargo.toml,target=Cargo.toml \
     --mount=type=bind,source=Cargo.lock,target=Cargo.lock,rw \
-    --mount=type=bind,source=casbin.conf,target=casbin.conf \
-    --mount=type=bind,source=policy.csv,target=policy.csv \
     --mount=type=bind,source=start.sh,target=start.sh \
     --mount=type=bind,source=migrations,target=migrations \
     --mount=type=cache,target=/app/target/ \
@@ -47,8 +45,6 @@ RUN --mount=type=bind,source=crates,target=crates \
     cp ./target/release/$APP_NAME /bin/ && \
     cp ./target/release/$WORKER_APP_NAME /bin/ && \
     cp ./target/release/$WORKER_DEBEZIUM_NAME /bin/ && \
-    cp ./casbin.conf /bin/casbin.conf && \
-    cp ./policy.csv /bin/policy.csv && \
     cp ./start.sh /bin/start.sh
 
 ################################################################################
@@ -75,8 +71,6 @@ RUN mkdir -p /app/logs
 COPY --from=build /bin/api /app/
 COPY --from=build /bin/worker-app /app/
 COPY --from=build /bin/worker-debezium /app/
-COPY --from=build /bin/casbin.conf /app/
-COPY --from=build /bin/policy.csv /app/
 COPY --from=build /bin/start.sh /app/
 
 # Expose the port that the application listens on.

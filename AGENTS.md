@@ -8,7 +8,7 @@
 
 - `crates/pgoutput` — парсер протокола pgoutput: Relation (кэш отношений, переживает ALTER TABLE), Insert/Update/Delete/Truncate → события с JSON-образами и ключом; без инфраструктурных зависимостей, проверяется живым PostgreSQL.
 - `crates/worker-cdc` — консюмер логической репликации (ADR-0001): слот источника → таблица `changes`; бутстрап (создание слота, чекпоинт), батчевая вставка в транзакции с чекпоинтом, ack слота только после коммита, реконнект с backoff; конфиг — крейт `config` из окружения (`CDC_*`), остановка по `CancellationToken`.
-- `crates/api` — REST API (axum, sqlx, casbin, JWT, Swagger через utoipa): чтение журнала, авторизация.
+- `crates/api` — REST API (axum, sqlx, Swagger через utoipa): чтение журнала из таблицы `changes`; аутентификации и авторизации нет.
 - `crates/worker-app`, `crates/worker-debezium` — легаси-консюмеры Kafka/Redis/Debezium: работают до удаления (issue #11), новых фич в них не заводить.
 
 Инфраструктура: PostgreSQL, Kafka, Redis, Debezium, kafka-ui. Схема потоков — в `README.md`, переменные окружения — в `env.example`.

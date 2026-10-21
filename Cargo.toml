@@ -11,6 +11,8 @@ description = "Waltrail — журнал аудита изменений Postgre
 rust-version = "1.99.1"
 
 [workspace.dependencies]
+pgoutput = { path = "crates/pgoutput" }
+
 anyhow = "1.0.104"
 chrono = { version = "0.4.45", features = ["serde"] }
 uuid = { version = "1.28.0", features = ["serde", "v4"] }
@@ -30,7 +32,6 @@ sqlx = { version = "0.9.0", features = [
 ] }
 sqlx-cli = "0.9.0"
 tokio = { version = "1.54.0", features = ["full"] }
-validator = { version = "0.21.0", features = ["derive"] }
 futures = "0.3.34"
 rdkafka = { version = "0.39.0", features = ["cmake-build"] }
 tracing = "0.1.44"
@@ -44,16 +45,10 @@ tokio-util = "0.7.20"
 fancy-regex = "0.19.2"
 lazy_static = "1.5.1"
 axum = "0.8.9"
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7.1", features = ["cors", "compression-gzip", "trace"] }
-axum-valid = { version = "0.25.0", features = ["into_json", "json"] }
-jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
 utoipa = { version = "6.0.0", features = ["uuid", "chrono", "axum_extras"] }
 utoipa-swagger-ui = { version = "10.0.2", features = ["axum"] }
-infer = "0.22.0"
-hyper = "1.12.0"
-casbin = { version = "2.20.0", features = ["tokio"] }
-parking_lot = "0.13.0"
-pgoutput = { path = "crates/pgoutput" }
 pgwire-replication = "0.5"
 bytes = "1.12.1"
 config = { version = "0.15", default-features = false }

@@ -5,85 +5,109 @@ use serde::{Deserialize, Serialize};
 use sqlx::prelude::*;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
-use validator::Validate;
 
+// --- Границы пагинации: без магических чисел ---
+
+/// Минимальный номер страницы.
+pub const MIN_PAGE: i32 = 1;
+/// Минимальный размер страницы.
+pub const MIN_PER_PAGE: i32 = 1;
+/// Максимальный размер страницы.
+pub const MAX_PER_PAGE: i32 = 200;
+
+/// Строка журнала в списке: изменение или событие приложения (ADR-0002).
+///
+/// `changes` — краткая сводка образов «до/после» по первым четырём ключам;
+/// для MESSAGE-строк — пустой массив: у события образов нет, payload целиком
+/// в `context`.
 #[derive(Debug, Clone, Serialize, FromRow, ToSchema)]
-pub struct AuditDTO {
-    pub id: Uuid,
-    pub status_code: i16,
-    pub event: String,
-    pub primary_key: Option<String>,
-    pub is_change: bool,
-    #[serde(flatten)]
-    pub context: serde_json::Value,
-    pub created_at: DateTime<chrono::Utc>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct AuditPaginateDTO {
-    pub page: i32,
-    pub pages: i64,
-    pub rows: Vec<AuditDTO>,
-}
-
-#[derive(Deserialize, Debug, Validate, IntoParams)]
-#[into_params(parameter_in = Query)]
-pub struct QAudit {
-    #[validate(range(min = 1))]
-    #[serde(default = "default_page")]
-    pub page: i32,
-
-    #[validate(range(min = 1))]
-    #[serde(default = "default_per_page")]
-    pub per_page: i32,
-    // fields
-    pub event: Option<String>,
-    pub primary_key: Option<String>,
-    pub status_code: Option<i16>,
-    #[param(example = "2025-01-01 || ..2025-12-31 || 2025-01-01..2025-12-31")]
-    pub created_at: Option<String>,
-    // Context в JSONB
-    pub app: Option<String>,
-    pub ip: Option<String>,
-    pub method: Option<String>,
-    pub user_login: Option<String>,
-    pub user_fio: Option<String>,
-    pub user_role_name: Option<String>,
-    #[param(example = "created_at:desc")]
-    #[serde(default = "default_sortable")]
-    pub sortable: String,
-}
-
-/// Функция значения по умолчанию
-fn default_sortable() -> String {
-    "created_at:desc".to_string()
-}
-
-/// Функция значения по умолчанию
-fn default_per_page() -> i32 {
-    25
-}
-
-/// Функция значения по умолчанию
-fn default_page() -> i32 {
-    1
-}
-
-// Changes
-
-#[derive(Debug, Clone, Serialize, FromRow, ToSchema)]
-pub struct ChangeDTO {
+pub struct ChangeRowDTO {
     pub id: Uuid,
     pub database: String,
-    pub operation: String,
+    pub schema: String,
     pub table: String,
+    pub operation: String,
+    pub primary_key: Option<String>,
+    /// Идентификатор сквозной операции: объединяет изменения и события одной операции.
+    pub trace_id: Option<String>,
     #[schema(
         value_type = Vec<serde_json::Value>,
         example = "[{\"key\": \"name\", \"before\": \"John\", \"after\": \"Jane\"}]",
     )]
     pub changes: serde_json::Value,
+    #[schema(value_type = serde_json::Value)]
+    pub context: serde_json::Value,
+    /// Когда запись была изменена в источнике; NULL — строки старого пайплайна.
+    pub committed_at: Option<DateTime<chrono::Utc>>,
+    /// Когда запись сохранена в журнал.
+    pub created_at: DateTime<chrono::Utc>,
 }
 
+/// Страница журнала.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChangePageDTO {
+    pub page: i32,
+    pub pages: i64,
+    pub rows: Vec<ChangeRowDTO>,
+}
+
+/// Параметры списка журнала.
+///
+/// Незнакомые параметры запроса трактуются как фильтры вхождения в
+/// `context` (GIN `@>`): точка в имени параметра задаёт вложенность,
+/// например `?user.login=alice` → `context @> {"user": {"login": "alice"}}`.
+#[derive(Deserialize, Debug, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct QChange {
+    /// Номер страницы, с единицы.
+    #[param(minimum = 1)]
+    #[serde(default = "default_page")]
+    pub page: i32,
+
+    /// Размер страницы.
+    #[param(minimum = 1, maximum = 200)]
+    #[serde(default = "default_per_page")]
+    pub per_page: i32,
+
+    /// Идентификатор сквозной операции: вся операция целиком — изменения и события.
+    pub trace_id: Option<String>,
+
+    /// Имя таблицы, без учёта регистра.
+    pub table: Option<String>,
+
+    /// Операция: CREATE, UPDATE, DELETE, TRUNCATE или MESSAGE, без учёта регистра.
+    pub operation: Option<String>,
+
+    /// Диапазон времени сохранения в журнал: `2025-01-01..2025-12-31`;
+    /// одна граница — нижняя: `2025-01-01`.
+    #[param(example = "2025-01-01..2025-12-31")]
+    pub created_at: Option<String>,
+
+    /// Направление сортировки по времени сохранения: `created_at:asc|desc`.
+    #[param(example = "created_at:desc")]
+    #[serde(default = "default_sortable")]
+    pub sortable: String,
+
+    /// Остальные параметры — фильтры вхождения в `context`.
+    #[serde(flatten)]
+    pub context_filters: HashMap<String, String>,
+}
+
+impl QChange {
+    /// Номер страницы, нормализованный к нижней границе.
+    pub fn normalized_page(&self) -> i32 {
+        self.page.max(MIN_PAGE)
+    }
+
+    /// Размер страницы, нормализованный к допустимому диапазону.
+    pub fn normalized_per_page(&self) -> i32 {
+        self.per_page.clamp(MIN_PER_PAGE, MAX_PER_PAGE)
+    }
+}
+
+/// Детальная строка журнала: полные образы «до/после» и контекст.
+///
+/// Значения ключа `password` в образах маскируются.
 #[derive(Debug, Clone, Serialize, FromRow, ToSchema)]
 pub struct ChangeDetailDTO {
     pub id: Uuid,
@@ -92,16 +116,20 @@ pub struct ChangeDetailDTO {
     pub table: String,
     pub operation: String,
     pub primary_key: Option<String>,
+    pub trace_id: Option<String>,
     #[schema(value_type = serde_json::Value)]
     #[serde(serialize_with = "mask_sensitive_data")]
     pub before: serde_json::Value,
     #[schema(value_type = serde_json::Value)]
     #[serde(serialize_with = "mask_sensitive_data")]
     pub after: serde_json::Value,
+    #[schema(value_type = serde_json::Value)]
     pub context: serde_json::Value,
+    pub committed_at: Option<DateTime<chrono::Utc>>,
+    pub created_at: DateTime<chrono::Utc>,
 }
 
-/// Функция для обратотки ключей и скрытие маской
+/// Маскирует чувствительные ключи верхнего уровня образа.
 fn mask_sensitive_data<S>(value: &serde_json::Value, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
@@ -122,37 +150,17 @@ where
     masked_value.serialize(serializer)
 }
 
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ChangePaginateDTO {
-    pub offset: i32,
-    pub cnt: i64,
-    pub rows: Vec<ChangeDTO>,
+/// Значение номера страницы по умолчанию.
+fn default_page() -> i32 {
+    1
 }
 
-#[derive(Deserialize, Debug, Validate, IntoParams)]
-#[into_params(parameter_in = Query)]
-pub struct QChange {
-    #[validate(range(min = 0))]
-    #[serde(default = "default_offset")]
-    pub offset: i32,
-
-    #[validate(range(min = 1))]
-    #[serde(default = "default_limit")]
-    pub limit: i32,
-
-    pub table: Option<String>,
-    pub operation: Option<String>,
-
-    #[serde(flatten, skip_serializing)]
-    pub filters: HashMap<String, String>,
+/// Значение размера страницы по умолчанию.
+fn default_per_page() -> i32 {
+    25
 }
 
-/// Функция значения по умолчанию
-pub fn default_limit() -> i32 {
-    15
-}
-
-/// Функция значения по умолчанию
-pub fn default_offset() -> i32 {
-    0
+/// Значение сортировки по умолчанию: свежие сверху.
+fn default_sortable() -> String {
+    "created_at:desc".to_string()
 }
