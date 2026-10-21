@@ -26,6 +26,15 @@ const PG_EPOCH_SECONDS: i64 = 946_684_800;
 /// в статистике будут с «хвостом на срез».
 const APPLICATION_NAME_PREFIX: &str = "waltrail-cdc";
 
+/// Размер пула к БД аудита: вставки батчами + чтение чекпоинта.
+const AUDIT_POOL_MAX_CONNECTIONS: u32 = 5;
+
+/// Размер пула к источнику: только чтение каталога (первичные ключи).
+const SOURCE_POOL_MAX_CONNECTIONS: u32 = 2;
+
+/// Таймаут взятия соединения из пулов, секунды.
+const DB_ACQUIRE_TIMEOUT_SECS: u64 = 30;
+
 /// Чем закончилась сессия репликации — одно подключение к walsender.
 enum SessionEnd {
     /// Остановка по `CancellationToken`: штатный выход из `run` без реконнекта.
@@ -49,8 +58,8 @@ enum SessionEnd {
 /// (неверные креды, TLS) завершают воркер с ошибкой.
 pub async fn run(config: WorkerConfig, token: CancellationToken) -> Result<()> {
     let audit = PgPoolOptions::new()
-        .max_connections(5)
-        .acquire_timeout(Duration::from_secs(30))
+        .max_connections(AUDIT_POOL_MAX_CONNECTIONS)
+        .acquire_timeout(Duration::from_secs(DB_ACQUIRE_TIMEOUT_SECS))
         .connect(&config.database_url)
         .await
         .context("подключение к БД аудита")?;
@@ -62,8 +71,8 @@ pub async fn run(config: WorkerConfig, token: CancellationToken) -> Result<()> {
     // Пул источника живёт весь цикл: по нему читается каталог для
     // первичных ключей таблиц с REPLICA IDENTITY FULL.
     let source_pool = PgPoolOptions::new()
-        .max_connections(2)
-        .acquire_timeout(Duration::from_secs(30))
+        .max_connections(SOURCE_POOL_MAX_CONNECTIONS)
+        .acquire_timeout(Duration::from_secs(DB_ACQUIRE_TIMEOUT_SECS))
         .connect(&config.source_database_url)
         .await
         .context("подключение к источнику CDC")?;
@@ -84,8 +93,8 @@ pub async fn run(config: WorkerConfig, token: CancellationToken) -> Result<()> {
             Ok(boot) => boot,
             Err(e) => {
                 attempt += 1;
-                warn!(attempt, error = %e, "бутстрап не удался — повтор с backoff");
-                if !wait_reconnect(&token, reconnect_delay(&config, attempt)).await {
+                if !backoff_after_failure(&token, &config, attempt, "бутстрап не удался", &e).await
+                {
                     break Ok(());
                 }
                 continue;
@@ -104,8 +113,9 @@ pub async fn run(config: WorkerConfig, token: CancellationToken) -> Result<()> {
             Err(e) if has_fatal_config_error(&e) => break Err(e),
             Err(e) => {
                 attempt += 1;
-                warn!(attempt, error = %e, "подключение к walsender не удалось — повтор с backoff");
-                if !wait_reconnect(&token, reconnect_delay(&config, attempt)).await {
+                if !backoff_after_failure(&token, &config, attempt, "подключение не удалось", &e)
+                    .await
+                {
                     break Ok(());
                 }
                 continue;
@@ -118,8 +128,8 @@ pub async fn run(config: WorkerConfig, token: CancellationToken) -> Result<()> {
             }
             // Например, слот занят другим консюмером: ждём освобождения.
             attempt += 1;
-            warn!(attempt, error = %err, "старт репликации не подтверждён — повтор с backoff");
-            if !wait_reconnect(&token, reconnect_delay(&config, attempt)).await {
+            if !backoff_after_failure(&token, &config, attempt, "старт не подтверждён", &err).await
+            {
                 break Ok(());
             }
             continue;
@@ -141,12 +151,15 @@ pub async fn run(config: WorkerConfig, token: CancellationToken) -> Result<()> {
             }
             SessionEnd::Reconnect(e) => {
                 attempt += 1;
-                warn!(
+                if !backoff_after_failure(
+                    &token,
+                    &config,
                     attempt,
-                    error = %e,
-                    "сессия репликации прервана — реконнект с backoff, продолжение с чекпоинта"
-                );
-                if !wait_reconnect(&token, reconnect_delay(&config, attempt)).await {
+                    "сессия репликации прервана — продолжение с чекпоинта",
+                    &e,
+                )
+                .await
+                {
                     break Ok(());
                 }
             }
@@ -249,6 +262,19 @@ fn reconnect_delay(config: &WorkerConfig, attempt: u32) -> Duration {
     )
 }
 
+/// Единая реакция на неудачную попытку: warn-лог с причиной и пауза backoff,
+/// прерываемая остановкой воркера. `false` — сигнал остановки пришёл в паузе.
+async fn backoff_after_failure(
+    token: &CancellationToken,
+    config: &WorkerConfig,
+    attempt: u32,
+    reason: &str,
+    error: &anyhow::Error,
+) -> bool {
+    warn!(attempt, reason, error = %error, "повтор с backoff");
+    wait_reconnect(token, reconnect_delay(config, attempt)).await
+}
+
 /// Экспоненциальный backoff `initial * 2^attempt`, ограниченный сверху `max`;
 /// ниже `initial` не опускается даже при `max < initial`.
 fn backoff_delay(initial: Duration, max: Duration, attempt: u32) -> Duration {
@@ -275,6 +301,12 @@ fn has_fatal_config_error(err: &anyhow::Error) -> bool {
 }
 
 /// Подключение к walsender источника: `START_REPLICATION … messages 'true'`.
+///
+/// Обязательство спеки «отвечать на все keepalive с reply_requested и слать
+/// периодический standby status update» лежит на транспорте pgwire-replication:
+/// он отвечает на каждый серверный keepalive и отправляет статус-апдейт в
+/// пределах `status_interval` (в том числе на молчащем потоке); позиция для
+/// апдейтов — `update_applied_lsn` после коммита вставки.
 ///
 /// Подтверждаемая слоту позиция (`ack_lsn`) — точка старта сессии: слот
 /// не продвигается дальше durable-чекпоинта, пока вставки не закоммичены

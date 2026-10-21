@@ -223,12 +223,19 @@ async fn hard_kill_and_restart_delivers_exactly_once() {
     }
     wait_journal_count(&audit, 3).await;
 
+    // Глушим с событием «в полёте»: оно уже в WAL источника, но воркер не
+    // обязан был его сохранить — abort попадает в случайную точку обработки
+    // (буфер транзакции, вставка или ack слота). Короткая пауза даёт воркеру
+    // шанс забрать событие из потока до глушения.
+    emit_order(&source, 4, "в полёте").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
     // Глушим мгновенно, без graceful-процедуры: как SIGKILL.
     handle.abort();
     let _ = handle.await;
 
-    // Вторая половина пишется в отсутствие воркера.
-    for id in 4..=6 {
+    // Остальное пишется в отсутствие воркера.
+    for id in 5..=6 {
         emit_order(&source, id, "после-убийства").await;
     }
 
@@ -383,11 +390,14 @@ async fn sigterm_restart_keeps_journal_complete() {
     }
     wait_journal_count(&audit, 3).await;
 
-    // Чистая остановка по сигналу.
+    // Чистая остановка по сигналу с событием «в полёте»: незакоммиченная
+    // транзакция буфера должна быть переиграна слотом после рестарта.
+    emit_order(&source, 4, "в полёте").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     shutdown_cleanly(token, handle).await;
 
     // События, пришедшие, пока воркер остановлен.
-    for id in 4..=6 {
+    for id in 5..=6 {
         emit_order(&source, id, "после-sigterm").await;
     }
 
