@@ -17,7 +17,11 @@ CREATE TABLE IF NOT EXISTS public.changes (
     "created_at" TIMESTAMPTZ (0) DEFAULT NOW (),
     "transaction_id" BIGINT NOT NULL,
     "position" BIGINT NOT NULL,
-    CONSTRAINT changes_position_table_schema_database_operation_unique UNIQUE (position, "table", schema, database, operation)
+    "commit_lsn" BIGINT NULL,
+    "event_index" INT NULL,
+    "trace_id" VARCHAR(255) NULL,
+    CONSTRAINT changes_position_table_schema_database_operation_unique UNIQUE (position, "table", schema, database, operation),
+    CONSTRAINT changes_commit_lsn_event_index_unique UNIQUE (commit_lsn, event_index)
 );
 
 CREATE INDEX changes_after_index ON public.changes USING GIN ("after" jsonb_path_ops);
@@ -64,7 +68,15 @@ COMMENT ON COLUMN public.changes.created_at IS 'Когда запись об и�
 
 COMMENT ON COLUMN public.changes.transaction_id IS 'ID транзакции PostgreSQL';
 
-COMMENT ON COLUMN public.changes.position IS 'Позиция в WAL PostgreSQL';
+COMMENT ON COLUMN public.changes.position IS 'Позиция в WAL PostgreSQL (LSN события)';
+
+COMMENT ON COLUMN public.changes.commit_lsn IS 'LSN коммита транзакции источника (заполняет воркер CDC; NULL — записи старого пайплайна)';
+
+COMMENT ON COLUMN public.changes.event_index IS 'Порядковый номер события внутри транзакции источника (для дедупликации вместе с commit_lsn)';
+
+COMMENT ON COLUMN public.changes.trace_id IS 'Идентификатор сквозной операции приложения (из MESSAGE); объединяет все строки одной операции';
+
+CREATE INDEX changes_trace_id_index ON public.changes (trace_id);
 
 -- Table Audits
 CREATE TABLE IF NOT EXISTS public.audits (
