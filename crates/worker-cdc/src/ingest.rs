@@ -14,8 +14,12 @@ pub const MESSAGE_OPERATION: &str = "MESSAGE";
 /// Ключ payload MESSAGE с идентификатором сквозной операции (ADR-0002).
 pub const TRACE_ID_KEY: &str = "trace_id";
 
-/// Ширина колонки `trace_id` (VARCHAR(255)): более длинные значения
-/// обрезаются, иначе вставка транзакции падала бы целиком.
+/// Предел длины `trace_id` под колонку `trace_id` VARCHAR(255).
+///
+/// VARCHAR считает символы, а режем по байтам — это сознательно
+/// консервативно: строка из ≤255 байт всегда влезает в VARCHAR(255),
+/// даже если состоит из многобайтных символов. Без обрезки вставка
+/// слишком длинного значения уронила бы всю транзакцию вставки.
 pub const MAX_TRACE_ID_LEN: usize = 255;
 
 /// Строка журнала, подготовленная к вставке в `changes`.
@@ -151,13 +155,15 @@ pub fn is_ignored(ignore_tables: &[String], schema: &str, table: &str) -> bool {
 ///
 /// В колонку попадает только строковое значение ключа `trace_id`; сам
 /// payload сохраняется в `context` дословно, без вырезания ключа.
-/// Значение длиннее `MAX_TRACE_ID_LEN` (VARCHAR(255)) обрезается:
+/// Значение длиннее `MAX_TRACE_ID_LEN` обрезается по границе символов:
 /// вставка исходной длины уронила бы всю транзакцию вставки.
 pub fn trace_id_from_payload(payload: &Value) -> Option<String> {
     let trace_id = payload.get(TRACE_ID_KEY)?.as_str()?;
     if trace_id.len() <= MAX_TRACE_ID_LEN {
         return Some(trace_id.to_owned());
     }
+    // Срез по границе символов: отступаем от байтового предела назад,
+    // чтобы не рвать многобайтные символы.
     let mut cutoff = MAX_TRACE_ID_LEN;
     while !trace_id.is_char_boundary(cutoff) {
         cutoff -= 1;
@@ -341,6 +347,15 @@ mod tests {
         let long = "x".repeat(MAX_TRACE_ID_LEN + 10);
         let extracted = trace_id_from_payload(&json!({ "trace_id": long }));
         assert_eq!(extracted.expect("строка").len(), MAX_TRACE_ID_LEN);
+    }
+
+    #[test]
+    fn multibyte_trace_id_is_truncated_on_char_boundary() {
+        // «ж» — 2 байта: байтовый предел 255 попадает в середину символа.
+        let long = "ж".repeat(130);
+        let extracted = trace_id_from_payload(&json!({ "trace_id": long })).expect("строка");
+        assert!(extracted.len() <= MAX_TRACE_ID_LEN);
+        assert!(extracted.chars().all(|c| c == 'ж'));
     }
 
     #[test]
