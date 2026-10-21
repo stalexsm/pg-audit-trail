@@ -135,15 +135,11 @@ jobs:
       # Правила подавлены с обоснованием:
       # - sqlalchemy-execute-raw-query: ложные срабатывания в scripts/loadgen —
       #   там psycopg-композиция sql.SQL(...).format(sql.Identifier(...)),
-      #   параметризованная и безопасная;
-      # - missing-user: непривилегированный пользователь в Dockerfile —
-      #   техдолг (#23), смена USER сейчас сломает запись
-      #   в volume ./logs на Linux.
+      #   параметризованная и безопасная.
       - name: SAST-скан semgrep (гейт)
         run: >
           semgrep scan --config p/default --error --metrics=off
           --exclude-rule python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
-          --exclude-rule dockerfile.security.missing-user.missing-user
 
   gates:
     # Сводный гейт для branch protection: required status check «gates»

@@ -46,10 +46,21 @@ FROM alpine:3.18 AS final
 # curl — healthcheck сервиса api
 RUN apk add --no-cache curl
 
+# Непривилегированный пользователь сервисов с фиксированными UID/GID:
+# стабильные идентификаторы нужны, чтобы владелец каталога логов совпадал
+# между образом и томом, а на хосте файлы тома имели предсказуемого
+# владельца (10001:10001).
+ARG APP_UID=10001
+ARG APP_GID=10001
+RUN addgroup -g "$APP_GID" app && adduser -D -H -u "$APP_UID" -G app app
+
 WORKDIR /app
 
-# Создать директорию для логов
-RUN mkdir -p /app/logs
+# Каталог логов принадлежит пользователю сервиса: named volume из compose.yaml
+# при первом подключении инициализируется содержимым и владельцем из образа,
+# поэтому запись в логи не зависит от владельца на хосте (bind mount перекрыл
+# бы chown правами своего каталога).
+RUN mkdir -p /app/logs && chown app:app /app/logs
 
 # Copy the executable from the "build" stage.
 COPY --from=build /bin/api /app/
@@ -60,6 +71,10 @@ EXPOSE 8000
 
 # Make executables executable
 RUN chmod +x /app/api /app/worker-cdc
+
+# Сервисам не нужен root: из привилегий — только порт 8000 (> 1024) и запись в
+# /app/logs; бинарники остаются во владении root (только чтение и исполнение).
+USER app:app
 
 # Контейнер запускает процесс как PID 1 без init: ядро не доставляет сигналы
 # с дефолтной диспетчеризацией PID 1, поэтому оба сервиса сами обрабатывают
