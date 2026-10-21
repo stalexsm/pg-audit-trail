@@ -13,12 +13,14 @@ use crate::{
 /// Число ключей в краткой сводке образов строки списка.
 const CHANGES_SUMMARY_KEYS: i64 = 4;
 
-/// Типизированный запрос списка журнала: вход репозитория. Всё, что
+/// Типизированный запрос списка изменений: вход репозитория. Всё, что
 /// приходит извне, проверено и разобрано на уровне axum (axum-valid +
 /// обработчик): здесь только чистые данные, без парсинга строк.
-pub(crate) struct JournalQuery {
+pub(crate) struct ChangeQuery {
     pub page: i32,
     pub per_page: i32,
+    /// Имя источника журнала; `None` — без фильтра (все источники).
+    pub source: Option<String>,
     pub trace_id: Option<String>,
     pub table: Option<String>,
     pub operation: Option<String>,
@@ -45,7 +47,7 @@ impl ChangeRepo {
     /// Ошибка БД — ошибкой запроса (500), а не пустой страницей.
     pub(crate) async fn get_list_paginate(
         pool: &PgPool,
-        q: &JournalQuery,
+        q: &ChangeQuery,
     ) -> AppResult<(Vec<ChangeRowDTO>, i64)> {
         let offset = (q.page - 1) * q.per_page;
 
@@ -53,6 +55,7 @@ impl ChangeRepo {
             "
             SELECT
                 c.id,
+                c.source,
                 c.database,
                 c.schema,
                 c.\"table\",
@@ -120,6 +123,7 @@ impl ChangeRepo {
             "
             SELECT
                 c.id,
+                c.source,
                 c.database,
                 c.schema,
                 c.\"table\",
@@ -144,7 +148,14 @@ impl ChangeRepo {
 }
 
 /// Добавляет условия фильтров к запросу со сквозным псевдонимом `c`.
-fn push_filters(builder: &mut QueryBuilder<Postgres>, q: &JournalQuery) {
+fn push_filters(builder: &mut QueryBuilder<Postgres>, q: &ChangeQuery) {
+    // Фильтр по источнику — равенство: имена источников нормированы
+    // правилом слотов `[a-z0-9_]` (ADR-0005). Пустая строка (источник
+    // неизвестен, строки до переезда) под конкретное имя не попадает.
+    if let Some(val) = &q.source {
+        builder.push(" AND c.source = ").push_bind(val);
+    }
+
     // Фильтр «вся операция» — равенство по колонке trace_id (ADR-0004):
     if let Some(val) = &q.trace_id {
         builder.push(" AND c.trace_id = ").push_bind(val);
