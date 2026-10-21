@@ -8,15 +8,9 @@ description = "Ядро приложения журнала событий"
 anyhow.workspace = true
 axum.workspace = true
 axum-valid.workspace = true
-base64.workspace = true
-casbin.workspace = true
 chrono.workspace = true
 dotenv.workspace = true
 env_logger.workspace = true
-hyper.workspace = true
-infer.workspace = true
-jsonwebtoken.workspace = true
-parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
@@ -30,3 +24,6 @@ utoipa.workspace = true
 utoipa-swagger-ui.workspace = true
 uuid.workspace = true
 validator.workspace = true
+
+[dev-dependencies]
+tower.workspace = true

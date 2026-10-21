@@ -1,8 +1,7 @@
-use std::{env, path::PathBuf, sync::Arc, time::Duration};
+use std::{env, path::PathBuf, time::Duration};
 
 use api::routes::{ApiDoc, api_router};
 use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::get};
-use parking_lot::RwLock;
 use serde::Serialize;
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
@@ -13,7 +12,6 @@ use tower_http::{
 };
 
 use ::api::AppResult;
-use casbin::{self, CoreApi, Enforcer};
 use tracing::info;
 use tracing_appender::rolling;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -67,10 +65,6 @@ async fn main() -> anyhow::Result<()> {
         panic!("An error occurred while getting `DATABASE_URL` from ENV. Add a variable to the environment!")
     });
 
-    let jwt_seckey = std::env::var("JWT_SECKEY").unwrap_or_else(|_| {
-        panic!("An error occurred while getting `JWT_SECKEY` from ENV. Add a variable to the environment!")
-    });
-
     let pool = PgPoolOptions::new()
         .max_connections(20)
         .acquire_timeout(Duration::from_secs(3))
@@ -81,27 +75,6 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind("0.0.0.0:8000").await?;
     info!("listening on {}", listener.local_addr()?);
 
-    // Путь для конфига casbin
-    let casbin_path: &'static str = Box::leak(
-        base_dir
-            .join("casbin.conf")
-            .to_string_lossy()
-            .into_owned()
-            .into_boxed_str(),
-    );
-
-    // Путь для настроек разрешений политик casbin
-    let policy_path: &'static str = Box::leak(
-        base_dir
-            .join("policy.csv")
-            .to_string_lossy()
-            .into_owned()
-            .into_boxed_str(),
-    );
-
-    // Casbin для обработки политики достуров...
-    let enforcer = Arc::new(RwLock::new(Enforcer::new(casbin_path, policy_path).await?));
-
     // Запуск миграций
     sqlx::migrate!("../../migrations").run(&pool).await?;
 
@@ -110,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
         Router::new()
             .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
             .route("/health", get(health))
-            .nest("/api", api_router(jwt_seckey, enforcer))
+            .merge(api_router())
             .fallback(handler_404)
             .layer(TraceLayer::new_for_http())
             .layer(

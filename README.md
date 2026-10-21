@@ -14,7 +14,7 @@ Compose поднимает два PostgreSQL:
 | `db1` | БД аудита Waltrail (таблицы `changes`, `audits`) | `54399` |
 | `db-src` | Источник CDC — имитация БД клиента (`wal_level=logical`, публикация `audit` создаётся автоматически) | `54398` |
 
-Остальные сервисы (Kafka, Redis, Debezium, kafka-ui) и крейты (`api`, `worker-app`, `worker-debezium`) работают как раньше — переход на CDC через pgoutput идёт поэтапно (см. issue #3). Новый воркер CDC уже готов к использованию:
+Остальные сервисы (Kafka, Redis, Debezium, kafka-ui) и легаси-крейты (`worker-app`, `worker-debezium`) работают как раньше — переход на CDC через pgoutput идёт поэтапно (см. issue #3). API читает журнал только из таблицы `changes`: `GET /api/changes` (список с пагинацией, сортировкой и фильтрами — `trace_id`, таблица, операция, время, вхождение в `context`) и `GET /api/changes/{id}` (детальная); Swagger — на `/swagger-ui`. Новый воркер CDC уже готов к использованию:
 
 ```bash
 export SOURCE_DATABASE_URL=postgresql://postgres:postgres@localhost:54398/postgres
