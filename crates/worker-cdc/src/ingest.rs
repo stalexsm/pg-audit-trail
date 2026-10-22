@@ -19,6 +19,25 @@ pub const TRACE_ID_KEY: &str = "trace_id";
 /// слишком длинного значения уронила бы всю транзакцию вставки.
 pub const MAX_TRACE_ID_LEN: usize = 255;
 
+/// Лимит протокола PostgreSQL на параметры одного extended-запроса: 65535
+/// на statement (UInt16 в wire-протоколе); превышение — ошибка протокола,
+/// соединение рвётся.
+const MAX_STATEMENT_PARAMS: usize = 65_535;
+
+/// Число bind-параметров на одну строку журнала в INSERT `changes`
+/// (`flush_once`: по колонке на каждое поле `ChangeRow`, включая LSN
+/// коммита, общий для всех строк чанка).
+const CHANGE_ROW_PARAMS: usize = 16;
+
+/// Максимум строк журнала в одном statement — бюджет параметров протокола
+/// в пересчёте на строку (65535 / 16 = 4095). Верхняя граница `batch_size`
+/// в API совпадает с этим пределом; чанки вставки не превышают его, даже
+/// если в реестре значение больше (правка в обход API, исторические записи).
+const MAX_ROWS_PER_STATEMENT: usize = MAX_STATEMENT_PARAMS / CHANGE_ROW_PARAMS;
+
+// Инвариант бюджета: полный чанк обязан влезать в лимит statement.
+const _: () = assert!(CHANGE_ROW_PARAMS * MAX_ROWS_PER_STATEMENT <= MAX_STATEMENT_PARAMS);
+
 /// Строка журнала, подготовленная к вставке в `changes`.
 #[derive(Debug, Clone)]
 pub struct ChangeRow {
@@ -186,6 +205,15 @@ fn trace_id_from_payload(payload: &Value) -> Option<String> {
     }
 }
 
+/// Размер чанка вставки: настройка источника, зажатая бюджетом параметров
+/// протокола. `batch_size` из реестра может превышать бюджет (правка реестра
+/// в обход API, исторические значения) — тогда чанк сжимается до лимита
+/// statement, иначе сервер отвергнет вставку и инжест зациклится на
+/// реконнекте, копя WAL без ack.
+fn chunk_size(batch_size: usize) -> usize {
+    batch_size.clamp(1, MAX_ROWS_PER_STATEMENT)
+}
+
 /// Вставляет строки батчами (`push_values`) в одной транзакции с чекпоинтом.
 ///
 /// Дедупликация replay-дублей — `ON CONFLICT DO NOTHING` по уникальному
@@ -222,7 +250,7 @@ async fn flush_once(
 ) -> Result<()> {
     let mut tx = audit.begin().await?;
 
-    for chunk in rows.chunks(batch_size.max(1)) {
+    for chunk in rows.chunks(chunk_size(batch_size)) {
         let mut builder = QueryBuilder::new(
             "INSERT INTO changes \
              (source, database, schema, \"table\", primary_key, operation, before, after, context, \
@@ -350,6 +378,68 @@ mod tests {
         let long = "x".repeat(MAX_TRACE_ID_LEN + 10);
         let extracted = trace_id_from_payload(&json!({ "trace_id": long }));
         assert_eq!(extracted.expect("строка").len(), MAX_TRACE_ID_LEN);
+    }
+
+    #[test]
+    fn rows_per_statement_fits_protocol_parameter_budget() {
+        // Бюджет параметров протокола: 65535 на statement, 16 на строку
+        // журнала → максимум 4095 строк; инвариант полного чанка —
+        // compile-тайм проверка рядом с константами.
+        assert_eq!(MAX_STATEMENT_PARAMS, 65_535);
+        assert_eq!(CHANGE_ROW_PARAMS, 16);
+        assert_eq!(CHANGE_ROW_PARAMS * MAX_ROWS_PER_STATEMENT, 65_520);
+        assert_eq!(MAX_ROWS_PER_STATEMENT, 4_095);
+    }
+
+    #[test]
+    fn chunk_size_clamps_batch_to_statement_budget() {
+        assert_eq!(chunk_size(0), 1, "нулевой batch_size не ломает вставку");
+        assert_eq!(chunk_size(1), 1);
+        assert_eq!(chunk_size(500), 500, "обычная настройка не сжимается");
+        assert_eq!(
+            chunk_size(MAX_ROWS_PER_STATEMENT),
+            MAX_ROWS_PER_STATEMENT,
+            "верхняя граница бюджета исполняется одним statement"
+        );
+        assert_eq!(
+            chunk_size(10_000),
+            MAX_ROWS_PER_STATEMENT,
+            "batch_size выше бюджета (историческая граница API) сжимается"
+        );
+    }
+
+    #[test]
+    fn budget_chunking_covers_every_row_without_oversize_chunks() {
+        // Тест чанкования: 10 000 строк (историческая верхняя граница API)
+        // нарезаются на чанки в пределах бюджета, без потерь и дублей.
+        let rows = vec![journal_row_fixture("CREATE"); 10_000];
+        let lengths: Vec<usize> = rows
+            .chunks(chunk_size(10_000))
+            .map(<[ChangeRow]>::len)
+            .collect();
+
+        assert!(lengths.iter().all(|len| *len <= MAX_ROWS_PER_STATEMENT));
+        assert_eq!(
+            lengths.iter().sum::<usize>(),
+            rows.len(),
+            "строки не теряются"
+        );
+        assert_eq!(
+            lengths,
+            vec![
+                MAX_ROWS_PER_STATEMENT,
+                MAX_ROWS_PER_STATEMENT,
+                10_000 - 2 * MAX_ROWS_PER_STATEMENT,
+            ],
+            "нарезка: полные чанки по бюджету + хвост"
+        );
+
+        // Настройка источника меньше бюджета тоже соблюдается.
+        let lengths: Vec<usize> = rows
+            .chunks(chunk_size(500))
+            .map(<[ChangeRow]>::len)
+            .collect();
+        assert_eq!(lengths, vec![500; 20]);
     }
 
     #[test]
