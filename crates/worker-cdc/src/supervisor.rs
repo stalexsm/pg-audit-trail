@@ -358,7 +358,7 @@ mod tests {
     /// Ленивый пул в никуда: тест проверяет снятие задачи с учёта, запись
     /// статуса в реестр (StatusWriter) при недоступной БД лишь логирует warn.
     fn audit_lazy() -> PgPool {
-        sqlx::postgres::PgPoolOptions::new()
+        PgPoolOptions::new()
             .connect_lazy("postgresql://invalid:invalid@127.0.0.1:1/none")
             .expect("ленивый пул создаётся без подключения")
     }
