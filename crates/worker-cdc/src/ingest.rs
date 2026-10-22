@@ -657,7 +657,7 @@ mod tests {
     /// ни попыток, ни пауз повторов (тикет #46).
     #[tokio::test]
     async fn flush_with_cancelled_token_aborts_before_any_attempt() {
-        let token = tokio_util::sync::CancellationToken::new();
+        let token = CancellationToken::new();
         token.cancel();
         let audit = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgresql://invalid:invalid@127.0.0.1:1/none")

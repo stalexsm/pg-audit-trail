@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 description = "REST API журнала аудита изменений PostgreSQL"
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
