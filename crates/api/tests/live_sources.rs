@@ -323,14 +323,35 @@ async fn patch_updates_only_provided_fields_and_keeps_url() {
     assert_eq!(body["message_prefix"], "_audit");
     assert_eq!(body["url"], "postgresql://*****@client_a-host");
 
-    // URL неизменяем (ADR-0005): поле в теле игнорируется, прочие поля
-    // применяются; пустой список служебных таблиц — валидная очистка.
+    // URL неизменяем (ADR-0005): попытка передать поле url — явный 400,
+    // правка целиком не применяется (тикет #54): раньше поле молча
+    // игнорировалось, и клиент верил, что сменил сервер.
     let (status, body) = send_json(
         router.clone(),
         "PATCH",
         "/api/sources/client_a",
         json!({
             "url": "postgresql://user:pass@evil:5432/db",
+            "ignore_tables": ["public.kv_migrations"],
+            "message_prefix": "_ctx"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "правка с url: {body}");
+    assert!(
+        body["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("неизменяемо")),
+        "диагностика называет неизменяемость url: {body}"
+    );
+
+    // Правка без url применяется как обычно; пустой список служебных
+    // таблиц — валидная очистка.
+    let (status, body) = send_json(
+        router.clone(),
+        "PATCH",
+        "/api/sources/client_a",
+        json!({
             "ignore_tables": ["public.kv_migrations"],
             "message_prefix": "_ctx"
         }),

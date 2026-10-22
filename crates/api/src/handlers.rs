@@ -107,13 +107,22 @@ pub async fn get_source_by_name(
 }
 
 /// Правит настройки источника (только `ignore_tables`, `batch_size`,
-/// `message_prefix`; URL неизменяем — ADR-0005). Отсутствующий — 404,
-/// помеченный к удалению — 409.
+/// `message_prefix`; URL неизменяем — ADR-0005). Попытка передать `url` —
+/// явный 400 (тикет #54): правка целиком не применяется. Отсутствующий —
+/// 404, помеченный к удалению — 409.
 pub async fn patch_source(
     State(pool): State<PgPool>,
     Path(name): Path<String>,
     Valid(Json(q)): Valid<Json<QSourcePatch>>,
 ) -> AppResult<SourceDTO> {
+    // Проверка до обращения к БД: правка с url невалидна независимо
+    // от существования источника.
+    if q.url.is_some() {
+        return Err(AppError::bad_request(
+            "Поле url неизменяемо: URL источника задаётся при регистрации (ADR-0005) — удалите источник и создайте заново",
+        ));
+    }
+
     let patch = SourcePatch {
         ignore_tables: q.ignore_tables,
         message_prefix: q.message_prefix,

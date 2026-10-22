@@ -161,7 +161,8 @@ pub async fn get_source_by_name(
 }
 
 /// Правит настройки источника: только `ignore_tables`, `message_prefix`,
-/// `batch_size`; URL неизменяем (ADR-0005). Опущенное поле остаётся без изменений.
+/// `batch_size`; URL неизменяем (ADR-0005): попытка передать `url` — явный
+/// 400. Опущенное поле остаётся без изменений.
 #[utoipa::path(
     patch,
     path = "/api/sources/{name}",
@@ -170,7 +171,7 @@ pub async fn get_source_by_name(
     request_body = QSourcePatch,
     responses(
         (status = 200, description = "Источник после правки", body = SourceDTO),
-        (status = 400, description = "Ошибка валидации тела"),
+        (status = 400, description = "Ошибка валидации тела, включая попытку сменить неизменяемый url"),
         (status = 404, description = "Источника не существует"),
         (status = 409, description = "Источник помечен к удалению"),
         (status = 500, description = "Ошибка сервера: нейтральное сообщение и correlation id (детали — только в логе, тикет #45)")
