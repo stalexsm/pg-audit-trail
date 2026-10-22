@@ -189,4 +189,28 @@ mod tests {
         // Контекст ошибки понятен без DSN.
         assert!(rendered.contains("БД аудита"), "без контекста: {rendered}");
     }
+
+    /// Кривой DSN (некорректный порт) падает на парсинге url — без сети:
+    /// sqlx и в этом случае не включает саму строку подключения в текст
+    /// ошибки, пароль не уходит в логи при таком сбое.
+    #[tokio::test]
+    async fn connect_error_on_malformed_dsn_does_not_leak_it() {
+        const SECRET: &str = "S3cret-Pa55word-#51";
+        const MALFORMED: &str = "postgresql://postgres:S3cret-Pa55word-#51@[::1]:not-a-port/db";
+
+        let error = connect_pool(MALFORMED)
+            .await
+            .expect_err("кривой DSN обязан провалиться на парсинге");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            !rendered.contains(SECRET),
+            "ошибка раскрывает пароль: {rendered}"
+        );
+        assert!(
+            !rendered.contains(MALFORMED),
+            "ошибка раскрывает DSN: {rendered}"
+        );
+        assert!(rendered.contains("БД аудита"), "без контекста: {rendered}");
+    }
 }
