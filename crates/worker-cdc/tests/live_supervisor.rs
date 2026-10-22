@@ -578,18 +578,19 @@ async fn deletion_retries_while_client_unreachable_and_completes_when_back() {
         .expect("пометка источника к удалению");
 
     // Удаление застряло и видно в реестре: состояние `deleting` с текстом
-    // ошибки, строка реестра с меткой ждёт возврата клиента.
-    wait_source_state(&worker.audit, &name, "deleting").await;
-    let last_error: Option<String> =
-        sqlx::query_scalar("SELECT last_error FROM sources WHERE name = $1")
-            .bind(&name)
-            .fetch_one(&worker.audit)
-            .await
-            .expect("статус застрявшего удаления");
-    assert!(
-        last_error.is_some_and(|text| !text.is_empty()),
-        "текст ошибки застрявшего удаления виден в реестре"
-    );
+    // ошибки. Пара пишется двумя апдейтами — сначала `deleting` без текста,
+    // затем текст первой неудачи у клиента — поэтому ждём оба признака
+    // одним запросом, а не состоянием с отдельным чтением last_error.
+    wait_until(|| async {
+        let (state, last_error): (String, Option<String>) =
+            sqlx::query_as("SELECT worker_state, last_error FROM sources WHERE name = $1")
+                .bind(&name)
+                .fetch_one(&worker.audit)
+                .await
+                .expect("статус застрявшего удаления");
+        state == "deleting" && last_error.is_some_and(|text| !text.is_empty())
+    })
+    .await;
     let marked: bool =
         sqlx::query_scalar("SELECT deleted_at IS NOT NULL FROM sources WHERE name = $1")
             .bind(&name)
@@ -674,6 +675,81 @@ async fn vanished_source_stops_task() {
         "задача исчезнувшего источника остановлена"
     );
 
+    shutdown_worker(worker).await;
+    drop_db(&source_admin, &source_db).await;
+}
+
+/// AC (тикет #47): задача источника, завершившаяся паникой, снимается
+/// супервизором с учёта и перезапускается на том же такте без рестарта
+/// процесса. Реестр проходит через `error` с диагнозом паники в `last_error`
+/// и восстанавливается до `connected`; перезапущенная задача продолжает
+/// писать журнал.
+///
+/// Паника взводится тестовым швом (`test_hooks::arm_task_panic`) на первые
+/// ДВА запуска задачи: после первого такта супервизор снимает упавшую задачу
+/// и перезапускает её на том же такте, а второй запуск паникует снова до
+/// подключения — состояние `error` с текстом паники живёт в реестре целый
+/// интервал опроса и гарантированно наблюдаемо; третий запуск уже healthy.
+#[tokio::test]
+async fn panicked_task_is_reaped_restarted_and_recovers() {
+    let worker = spawn_worker("panic").await;
+    let (source, source_admin, source_url, source_db) = spawn_client("panic").await;
+
+    let name = source_name("panic");
+    // Шов взводится ДО регистрации: задача паникует на первых двух запусках.
+    worker_cdc::test_hooks::arm_task_panic(&name, 2);
+    register_source(&worker.audit, &name, &source_url).await;
+
+    // Реестр проходит через `error`: worker_state=error, last_error — диагноз
+    // с текстом паники (пара читается одним запросом, атомарно).
+    wait_until(|| async {
+        let (state, last_error): (String, Option<String>) =
+            sqlx::query_as("SELECT worker_state, last_error FROM sources WHERE name = $1")
+                .bind(&name)
+                .fetch_one(&worker.audit)
+                .await
+                .expect("строка источника в реестре");
+        state == "error" && last_error.is_some_and(|text| text.contains("паникой"))
+    })
+    .await;
+
+    // Восстановление: третий запуск задачи подключается, реестр согласован
+    // с перезапуском — connected без текста ошибки.
+    wait_source_state(&worker.audit, &name, "connected").await;
+    let (state, last_error): (String, Option<String>) =
+        sqlx::query_as("SELECT worker_state, last_error FROM sources WHERE name = $1")
+            .bind(&name)
+            .fetch_one(&worker.audit)
+            .await
+            .expect("строка источника в реестре");
+    assert_eq!(state, "connected");
+    assert!(
+        last_error.is_none(),
+        "после восстановления last_error закрыт"
+    );
+
+    // Перезапущенная задача работает: изменения попадают в журнал.
+    sqlx::query("INSERT INTO orders VALUES (1, 1.00, 'после паники', now())")
+        .execute(&source)
+        .await
+        .expect("insert orders после восстановления");
+    wait_until(|| async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM changes WHERE source = $1 AND \"table\" = 'orders'",
+        )
+        .bind(&name)
+        .fetch_one(&worker.audit)
+        .await
+        .unwrap_or(0)
+            == 1
+    })
+    .await;
+
+    // Процесс не рестартовал: воркер жив и завершается штатно по токену.
+    assert!(
+        !worker.handle.is_finished(),
+        "воркер жив после паники задачи источника"
+    );
     shutdown_worker(worker).await;
     drop_db(&source_admin, &source_db).await;
 }

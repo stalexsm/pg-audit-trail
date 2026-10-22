@@ -261,7 +261,7 @@ async fn reap_finished_tasks(audit: &PgPool, tasks: &mut HashMap<String, SourceH
         let diagnosis = abnormal_exit_diagnosis(handle.handle.await);
         warn!(
             source = %name,
-            "{diagnosis} — задача снята с учёта и будет перезапущена на следующем такте"
+            "{diagnosis} — задача снята с учёта и перезапускается на том же такте (шаг запуска ниже)"
         );
         StatusWriter::new(audit, name.clone())
             .error(&anyhow::anyhow!("{diagnosis}"))
