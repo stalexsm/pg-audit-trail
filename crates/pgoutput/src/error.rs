@@ -23,3 +23,35 @@ impl From<String> for PgOutputError {
         Self(s)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_prefixes_message() {
+        let err = PgOutputError("ветка не декодирована".to_owned());
+        assert_eq!(
+            err.to_string(),
+            "ошибка парсера pgoutput: ветка не декодирована"
+        );
+    }
+
+    #[test]
+    fn builds_from_str_and_string() {
+        assert_eq!(
+            PgOutputError::from("из среза"),
+            PgOutputError("из среза".to_owned())
+        );
+        assert_eq!(
+            PgOutputError::from(String::from("из строки")),
+            PgOutputError("из строки".to_owned())
+        );
+    }
+
+    #[test]
+    fn usable_as_std_error() {
+        fn takes_error(_: &dyn std::error::Error) {}
+        takes_error(&PgOutputError("динамический объект ошибки".to_owned()));
+    }
+}

@@ -125,3 +125,71 @@ impl RelationCache {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Отношение-фикстура с заданным identity и расстановкой key-флагов.
+    fn relation(identity: ReplicaIdentity, key_flags: &[bool]) -> Relation {
+        Relation {
+            oid: 50,
+            schema: "pub".into(),
+            name: "users".into(),
+            replica_identity: identity,
+            columns: key_flags
+                .iter()
+                .enumerate()
+                .map(|(i, key)| RelationColumn {
+                    name: format!("c{i}"),
+                    type_oid: 25,
+                    is_key: *key,
+                })
+                .collect(),
+            primary_key: None,
+        }
+    }
+
+    #[test]
+    fn identity_byte_maps_to_mode() {
+        assert_eq!(ReplicaIdentity::from_byte(b'd'), ReplicaIdentity::Default);
+        assert_eq!(ReplicaIdentity::from_byte(b'n'), ReplicaIdentity::Nothing);
+        assert_eq!(ReplicaIdentity::from_byte(b'f'), ReplicaIdentity::Full);
+        assert_eq!(ReplicaIdentity::from_byte(b'i'), ReplicaIdentity::Index);
+        // Неизвестный байт трактуется как выбранный уникальный индекс.
+        assert_eq!(ReplicaIdentity::from_byte(b'x'), ReplicaIdentity::Index);
+    }
+
+    #[test]
+    fn key_columns_come_from_flags() {
+        let mut cache = RelationCache::new(17);
+        cache.register(relation(ReplicaIdentity::Default, &[true, false]));
+        assert_eq!(cache.key_columns(50), Some(vec!["c0".to_owned()]));
+    }
+
+    #[test]
+    fn catalog_primary_key_overrides_flags() {
+        let mut cache = RelationCache::new(17);
+        cache.register(relation(ReplicaIdentity::Default, &[true, false]));
+        cache.set_primary_key(50, vec!["c1".to_owned()]);
+        assert_eq!(cache.key_columns(50), Some(vec!["c1".to_owned()]));
+        // Пустой ключ из каталога (таблица без PK) — откат к флагам.
+        let mut cache = RelationCache::new(17);
+        cache.register(relation(ReplicaIdentity::Default, &[true, false]));
+        cache.set_primary_key(50, Vec::new());
+        assert_eq!(cache.key_columns(50), Some(vec!["c0".to_owned()]));
+    }
+
+    #[test]
+    fn key_is_unknown_without_identity() {
+        let mut cache = RelationCache::new(17);
+        cache.register(relation(ReplicaIdentity::Nothing, &[true, false]));
+        assert_eq!(cache.key_columns(50), None);
+        // FULL без каталога ключ тоже не даёт.
+        let mut cache = RelationCache::new(17);
+        cache.register(relation(ReplicaIdentity::Full, &[true, false]));
+        assert_eq!(cache.key_columns(50), None);
+        // Неизвестный oid — ключа нет.
+        assert_eq!(cache.key_columns(99), None);
+    }
+}

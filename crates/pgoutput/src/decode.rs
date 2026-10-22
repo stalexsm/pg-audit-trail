@@ -403,12 +403,12 @@ mod tests {
     /// Таблица users(pub), oid 50: id int8 — ключевая, name text.
     /// Формат PG 17+: после имени таблицы идёт байт replica identity.
     const RELATION_USERS_PG17: &[u8] = &[
-        b'R',                            // тег сообщения
-        0, 0, 0, 50,                     // oid отношения = 50
-        b'p', b'u', b'b', 0,             // схема "pub"
-        b'u', b's', b'e', b'r', b's', 0, // таблица "users"
-        b'd',                            // replica identity: default
-        0, 2,                            // колонок: 2
+        b'R', // тег сообщения
+        0, 0, 0, 50, // oid отношения = 50
+        b'p', b'u', b'b', 0, // схема "pub"
+        b'u', b's', b'e', b'r', b's', 0,    // таблица "users"
+        b'd', // replica identity: default
+        0, 2, // колонок: 2
         // id: флаг 1 (входит в identity), тип int8 (20), typmod -1
         1, b'i', b'd', 0, 0, 0, 0, 20, 0xFF, 0xFF, 0xFF, 0xFF,
         // name: неключевая, тип text (25), typmod -1
@@ -435,19 +435,27 @@ mod tests {
     /// Новый кортеж users: id = 7, name = "Anna".
     const TUPLE_NEW_ANNA: &[u8] = &[
         0, 2, // колонок: 2
-        b't', 0, 0, 0, 1, b'7',
-        b't', 0, 0, 0, 4, b'A', b'n', b'n', b'a',
+        b't', 0, 0, 0, 1, b'7', b't', 0, 0, 0, 4, b'A', b'n', b'n', b'a',
     ];
 
     /// Старый кортеж users: id = 7, name = "Old".
     const TUPLE_OLD: &[u8] = &[
-        0, 2,
-        b't', 0, 0, 0, 1, b'7',
-        b't', 0, 0, 0, 3, b'O', b'l', b'd',
+        0, 2, b't', 0, 0, 0, 1, b'7', b't', 0, 0, 0, 3, b'O', b'l', b'd',
     ];
 
     /// Ключевой кортеж K: только identity-колонка id = 7.
     const TUPLE_KEY_ID: &[u8] = &[0, 1, b't', 0, 0, 0, 1, b'7'];
+
+    /// Позиция байта replica identity в RELATION_USERS_PG17:
+    /// тег (1) + oid (4) + "pub\0" (4) + "users\0" (6).
+    const IDENTITY_BYTE_INDEX: usize = 15;
+
+    /// Фикстура Relation users с подставленным байтом replica identity.
+    fn users_relation_with_identity(byte: u8) -> Vec<u8> {
+        let mut relation = RELATION_USERS_PG17.to_vec();
+        relation[IDENTITY_BYTE_INDEX] = byte;
+        relation
+    }
 
     /// Клеит сообщение из тега и кусков тела — читаемость составных фикстур.
     fn message(tag: u8, parts: &[&[u8]]) -> Vec<u8> {
@@ -470,7 +478,8 @@ mod tests {
 
     /// Достаёт изменение из результата декодирования.
     fn expect_change(data: &[u8], cache: &mut RelationCache) -> ChangeEvent {
-        match decode(data, cache).expect("сообщение обязано декодироваться") {
+        match decode(data, cache).expect("сообщение обязано декодироваться")
+        {
             DecodedEvent::Change(change) => change,
             other => panic!("ожидалось Change, получено: {other:?}"),
         }
@@ -490,7 +499,9 @@ mod tests {
         let mut cache = RelationCache::new(17);
         let event = decode(RELATION_USERS_PG17, &mut cache).expect("должно декодироваться");
         assert!(matches!(event, DecodedEvent::Relation(50)));
-        let relation = cache.relation(50).expect("отношение обязано появиться в кэше");
+        let relation = cache
+            .relation(50)
+            .expect("отношение обязано появиться в кэше");
         assert_eq!(relation.schema, "pub");
         assert_eq!(relation.name, "users");
         assert_eq!(relation.replica_identity, ReplicaIdentity::Default);
@@ -515,8 +526,7 @@ mod tests {
     fn relation_reads_identity_byte_from_wire() {
         let mut cache = RelationCache::new(17);
         // Та же фикстура с байтом 'f' (FULL) на месте replica identity.
-        let mut full = RELATION_USERS_PG17.to_vec();
-        full[15] = b'f';
+        let full = users_relation_with_identity(b'f');
         decode(&full, &mut cache).expect("должно декодироваться");
         let relation = cache.relation(50).expect("отношение в кэше");
         assert_eq!(relation.replica_identity, ReplicaIdentity::Full);
@@ -525,7 +535,7 @@ mod tests {
     #[test]
     fn insert_decodes_tuple_and_key() {
         let mut cache = cache_with_users();
-        let msg = message(b'I', &[&USERS_OID, &[b'N'], TUPLE_NEW_ANNA]);
+        let msg = message(b'I', &[&USERS_OID, b"N", TUPLE_NEW_ANNA]);
         let change = expect_change(&msg, &mut cache);
         assert_eq!(change.kind, ChangeKind::Insert);
         assert_eq!(change.relation_oid, 50);
@@ -537,7 +547,7 @@ mod tests {
     #[test]
     fn update_with_full_old_tuple() {
         let mut cache = cache_with_users();
-        let msg = message(b'U', &[&USERS_OID, &[b'O'], TUPLE_OLD, &[b'N'], TUPLE_NEW_ANNA]);
+        let msg = message(b'U', &[&USERS_OID, b"O", TUPLE_OLD, b"N", TUPLE_NEW_ANNA]);
         let change = expect_change(&msg, &mut cache);
         assert_eq!(change.kind, ChangeKind::Update);
         assert_eq!(change.old, Some(json!({"id": 7, "name": "Old"})));
@@ -548,7 +558,10 @@ mod tests {
     #[test]
     fn update_with_key_tuple_k() {
         let mut cache = cache_with_users();
-        let msg = message(b'U', &[&USERS_OID, &[b'K'], TUPLE_KEY_ID, &[b'N'], TUPLE_NEW_ANNA]);
+        let msg = message(
+            b'U',
+            &[&USERS_OID, b"K", TUPLE_KEY_ID, b"N", TUPLE_NEW_ANNA],
+        );
         let change = expect_change(&msg, &mut cache);
         // K-кортеж образует образ только из identity-колонок.
         assert_eq!(change.old, Some(json!({"id": 7})));
@@ -558,7 +571,7 @@ mod tests {
     #[test]
     fn update_without_old_tuple() {
         let mut cache = cache_with_users();
-        let msg = message(b'U', &[&USERS_OID, &[b'N'], TUPLE_NEW_ANNA]);
+        let msg = message(b'U', &[&USERS_OID, b"N", TUPLE_NEW_ANNA]);
         let change = expect_change(&msg, &mut cache);
         assert!(change.old.is_none());
         // Ключ берётся из нового кортежа.
@@ -593,7 +606,7 @@ mod tests {
 
     #[test]
     fn unknown_tags_are_ignored() {
-        for tag in [b'Y', b'O', b'w', b'z'] {
+        for tag in *b"YOwz" {
             let mut cache = RelationCache::new(17);
             let event = decode(&[tag], &mut cache).expect("незнакомый тег не должен ронять парсер");
             assert!(matches!(event, DecodedEvent::Ignored));
@@ -607,7 +620,7 @@ mod tests {
         let mut cache = cache_with_users();
         // name пришёл как 'u': колонки нет в образе (не null).
         let tuple = [0, 2, b't', 0, 0, 0, 1, b'7', b'u'];
-        let msg = message(b'I', &[&USERS_OID, &[b'N'], &tuple]);
+        let msg = message(b'I', &[&USERS_OID, b"N", &tuple]);
         let change = expect_change(&msg, &mut cache);
         assert_eq!(change.new, json!({"id": 7}));
     }
@@ -616,7 +629,7 @@ mod tests {
     fn null_cell_becomes_json_null() {
         let mut cache = cache_with_users();
         let tuple = [0, 2, b't', 0, 0, 0, 1, b'7', b'n'];
-        let msg = message(b'I', &[&USERS_OID, &[b'N'], &tuple]);
+        let msg = message(b'I', &[&USERS_OID, b"N", &tuple]);
         let change = expect_change(&msg, &mut cache);
         assert_eq!(change.new, json!({"id": 7, "name": null}));
     }
@@ -625,7 +638,7 @@ mod tests {
     fn empty_text_value_is_kept() {
         let mut cache = cache_with_users();
         let tuple = [0, 2, b't', 0, 0, 0, 1, b'7', b't', 0, 0, 0, 0];
-        let msg = message(b'I', &[&USERS_OID, &[b'N'], &tuple]);
+        let msg = message(b'I', &[&USERS_OID, b"N", &tuple]);
         let change = expect_change(&msg, &mut cache);
         assert_eq!(change.new, json!({"id": 7, "name": ""}));
     }
@@ -637,7 +650,7 @@ mod tests {
         let mut cache = RelationCache::new(17);
         decode(RELATION_EVTS_PG17, &mut cache).expect("Relation обязан декодироваться");
         let tuple = [0, 2, b't', 0, 0, 0, 1, b'7', b't', 0, 0, 0, 2, b'r', b'u'];
-        let msg = message(b'I', &[&[0, 0, 0, 60], &[b'N'], &tuple]);
+        let msg = message(b'I', &[&[0, 0, 0, 60], b"N", &tuple]);
         let change = expect_change(&msg, &mut cache);
         assert_eq!(change.key.as_deref(), Some("[\"7\",\"ru\"]"));
     }
@@ -646,10 +659,9 @@ mod tests {
     fn key_is_absent_without_replica_identity() {
         // Таблица с identity 'n': ключа у изменений нет.
         let mut cache = RelationCache::new(17);
-        let mut nothing = RELATION_USERS_PG17.to_vec();
-        nothing[15] = b'n';
+        let nothing = users_relation_with_identity(b'n');
         decode(&nothing, &mut cache).expect("должно декодироваться");
-        let msg = message(b'I', &[&USERS_OID, &[b'N'], TUPLE_NEW_ANNA]);
+        let msg = message(b'I', &[&USERS_OID, b"N", TUPLE_NEW_ANNA]);
         let change = expect_change(&msg, &mut cache);
         assert!(change.key.is_none());
     }
@@ -657,10 +669,9 @@ mod tests {
     #[test]
     fn full_identity_takes_key_from_catalog() {
         let mut cache = RelationCache::new(17);
-        let mut full = RELATION_USERS_PG17.to_vec();
-        full[15] = b'f';
+        let full = users_relation_with_identity(b'f');
         decode(&full, &mut cache).expect("должно декодироваться");
-        let msg = message(b'I', &[&USERS_OID, &[b'N'], TUPLE_NEW_ANNA]);
+        let msg = message(b'I', &[&USERS_OID, b"N", TUPLE_NEW_ANNA]);
         // Без каталога ключ при FULL не определить.
         assert!(expect_change(&msg, &mut cache).key.is_none());
         // Ключевые колонки пришли из каталога источника.
@@ -674,7 +685,7 @@ mod tests {
         // K-кортеж с двумя ячейками против одной identity-колонки:
         // образ пуст, ключ считается по новому кортежу.
         let k_tuple = [0, 2, b't', 0, 0, 0, 1, b'7', b't', 0, 0, 0, 2, b'r', b'u'];
-        let msg = message(b'U', &[&USERS_OID, &[b'K'], &k_tuple, &[b'N'], TUPLE_NEW_ANNA]);
+        let msg = message(b'U', &[&USERS_OID, b"K", &k_tuple, b"N", TUPLE_NEW_ANNA]);
         let change = expect_change(&msg, &mut cache);
         assert_eq!(change.old, Some(json!({})));
         assert_eq!(change.key.as_deref(), Some("7"));
@@ -690,7 +701,7 @@ mod tests {
 
     #[test]
     fn boundary_tags_belong_to_transport() {
-        for tag in [b'B', b'C', b'M'] {
+        for tag in *b"BCM" {
             let mut cache = RelationCache::new(17);
             assert_decode_error(&[tag], &mut cache, "обрабатывает транспорт");
         }
@@ -704,7 +715,7 @@ mod tests {
         assert_decode_error(&msg, &mut cache, "обрезанное i16");
         // Кортеж: число колонок обрезано.
         let mut cache = cache_with_users();
-        let msg = message(b'I', &[&USERS_OID, &[b'N'], &[0]]);
+        let msg = message(b'I', &[&USERS_OID, b"N", &[0]]);
         assert_decode_error(&msg, &mut cache, "обрезанное i16");
     }
 
@@ -721,7 +732,7 @@ mod tests {
     #[test]
     fn string_without_terminator_is_reported() {
         let mut cache = RelationCache::new(16);
-        let msg = message(b'R', &[&[0, 0, 0, 50], &[b'a', b'b']]);
+        let msg = message(b'R', &[&[0, 0, 0, 50], b"ab"]);
         assert_decode_error(&msg, &mut cache, "строка без терминатора");
     }
 
@@ -747,9 +758,13 @@ mod tests {
         // Заявлено 2 колонки, пришла только первая.
         let msg = message(
             b'R',
-            &[&[0, 0, 0, 50], b"pub\0", b"users\0", &[b'd', 0, 2], &[
-                1, b'i', b'd', 0, 0, 0, 0, 20, 0xFF, 0xFF, 0xFF, 0xFF,
-            ]],
+            &[
+                &[0, 0, 0, 50],
+                b"pub\0",
+                b"users\0",
+                &[b'd', 0, 2],
+                &[1, b'i', b'd', 0, 0, 0, 0, 20, 0xFF, 0xFF, 0xFF, 0xFF],
+            ],
         );
         assert_decode_error(&msg, &mut cache, "обрезанная колонка");
     }
@@ -765,14 +780,17 @@ mod tests {
     #[test]
     fn tuple_without_tag_byte_is_reported() {
         let mut cache = cache_with_users();
-        let msg = message(b'I', &[&USERS_OID, &[b'N'], &[0, 1]]);
+        let msg = message(b'I', &[&USERS_OID, b"N", &[0, 1]]);
         assert_decode_error(&msg, &mut cache, "кортеж: обрезанное значение");
     }
 
     #[test]
     fn tuple_with_negative_length_is_reported() {
         let mut cache = cache_with_users();
-        let msg = message(b'I', &[&USERS_OID, &[b'N'], &[0, 1, b't', 0xFF, 0xFF, 0xFF, 0xFF]]);
+        let msg = message(
+            b'I',
+            &[&USERS_OID, b"N", &[0, 1, b't', 0xFF, 0xFF, 0xFF, 0xFF]],
+        );
         assert_decode_error(&msg, &mut cache, "отрицательная длина");
     }
 
@@ -782,7 +800,11 @@ mod tests {
         // Заявлено 9 байт значения, пришло 3.
         let msg = message(
             b'I',
-            &[&USERS_OID, &[b'N'], &[0, 1, b't', 0, 0, 0, 9, b'o', b'n', b'e']],
+            &[
+                &USERS_OID,
+                b"N",
+                &[0, 1, b't', 0, 0, 0, 9, b'o', b'n', b'e'],
+            ],
         );
         assert_decode_error(&msg, &mut cache, "значение короче заголовка");
     }
@@ -790,7 +812,7 @@ mod tests {
     #[test]
     fn tuple_with_unknown_cell_tag_is_reported() {
         let mut cache = cache_with_users();
-        let msg = message(b'I', &[&USERS_OID, &[b'N'], &[0, 1, 0x7F]]);
+        let msg = message(b'I', &[&USERS_OID, b"N", &[0, 1, 0x7F]]);
         assert_decode_error(&msg, &mut cache, "неизвестный тег значения");
     }
 
@@ -798,21 +820,21 @@ mod tests {
     fn tuple_wider_than_relation_is_reported() {
         let mut cache = cache_with_users();
         // Ячейка одна, а в Relation две колонки.
-        let msg = message(b'I', &[&USERS_OID, &[b'N'], &[0, 1, b't', 0, 0, 0, 1, b'7']]);
+        let msg = message(b'I', &[&USERS_OID, b"N", &[0, 1, b't', 0, 0, 0, 1, b'7']]);
         assert_decode_error(&msg, &mut cache, "колонок 1, а в Relation 2");
     }
 
     #[test]
     fn insert_without_relation_is_reported() {
         let mut cache = RelationCache::new(17);
-        let msg = message(b'I', &[&USERS_OID, &[b'N'], TUPLE_NEW_ANNA]);
+        let msg = message(b'I', &[&USERS_OID, b"N", TUPLE_NEW_ANNA]);
         assert_decode_error(&msg, &mut cache, "Insert: Relation ещё не приходил");
     }
 
     #[test]
     fn insert_with_wrong_tuple_tag_is_reported() {
         let mut cache = cache_with_users();
-        let msg = message(b'I', &[&USERS_OID, &[b'O'], TUPLE_NEW_ANNA]);
+        let msg = message(b'I', &[&USERS_OID, b"O", TUPLE_NEW_ANNA]);
         assert_decode_error(&msg, &mut cache, "Insert: ожидается новый кортеж 'N'");
         // Тег-байта нет вовсе — та же ветка.
         let msg = message(b'I', &[&USERS_OID]);
@@ -822,7 +844,7 @@ mod tests {
     #[test]
     fn update_without_relation_is_reported() {
         let mut cache = RelationCache::new(17);
-        let msg = message(b'U', &[&USERS_OID, &[b'N'], TUPLE_NEW_ANNA]);
+        let msg = message(b'U', &[&USERS_OID, b"N", TUPLE_NEW_ANNA]);
         assert_decode_error(&msg, &mut cache, "Update: Relation ещё не приходил");
     }
 
@@ -830,7 +852,7 @@ mod tests {
     fn update_without_new_tuple_is_reported() {
         let mut cache = cache_with_users();
         // После старого кортежа 'O' новый кортеж 'N' не пришёл.
-        let msg = message(b'U', &[&USERS_OID, &[b'O'], TUPLE_OLD]);
+        let msg = message(b'U', &[&USERS_OID, b"O", TUPLE_OLD]);
         assert_decode_error(&msg, &mut cache, "Update: ожидается новый кортеж 'N'");
         // Нет и старого кортежа.
         let msg = message(b'U', &[&USERS_OID]);
@@ -840,7 +862,7 @@ mod tests {
     #[test]
     fn delete_without_relation_is_reported() {
         let mut cache = RelationCache::new(17);
-        let msg = message(b'D', &[&USERS_OID, &[b'O'], TUPLE_OLD]);
+        let msg = message(b'D', &[&USERS_OID, b"O", TUPLE_OLD]);
         assert_decode_error(&msg, &mut cache, "Delete: Relation ещё не приходил");
     }
 
@@ -854,8 +876,12 @@ mod tests {
     #[test]
     fn delete_with_wrong_tuple_tag_is_reported() {
         let mut cache = cache_with_users();
-        let msg = message(b'D', &[&USERS_OID, &[b'N']]);
-        assert_decode_error(&msg, &mut cache, "Delete: ожидается старый кортеж 'O' или 'K'");
+        let msg = message(b'D', &[&USERS_OID, b"N"]);
+        assert_decode_error(
+            &msg,
+            &mut cache,
+            "Delete: ожидается старый кортеж 'O' или 'K'",
+        );
     }
 
     #[test]
