@@ -49,7 +49,10 @@ impl ChangeRepo {
         pool: &PgPool,
         q: &ChangeQuery,
     ) -> AppResult<(Vec<ChangeRowDTO>, i64)> {
-        let offset = (q.page - 1) * q.per_page;
+        // Смещение страницы считается в i64: произведение двух i32
+        // (номер страницы × размер страницы) переполнило бы i32 на
+        // глубокой странице — паника/500 вместо пустой страницы.
+        let offset = (i64::from(q.page) - 1) * i64::from(q.per_page);
 
         let mut builder = QueryBuilder::new(
             "
@@ -161,16 +164,24 @@ fn push_filters(builder: &mut QueryBuilder<Postgres>, q: &ChangeQuery) {
         builder.push(" AND c.trace_id = ").push_bind(val);
     }
 
+    // Фильтр по таблице — sargable: колонка сравнивается напрямую,
+    // нормализуется параметр, а не колонка — обёртка вида
+    // `LOWER(c."table") = ...` сделала бы индекс `changes_table_index`
+    // неприменимым (полный скан на каждый запрос). Параметр приводится
+    // к нижнему регистру — так PostgreSQL хранит идентификаторы без кавычек.
     if let Some(val) = &q.table {
         builder
-            .push(" AND LOWER(c.\"table\") = ")
+            .push(" AND c.\"table\" = ")
             .push_bind(val.to_lowercase());
     }
 
+    // Фильтр по операции — sargable по той же причине: словарь операций
+    // хранится в верхнем регистре (CREATE/UPDATE/DELETE/TRUNCATE),
+    // нормализуется параметр, индекс `changes_operation_index` применим.
     if let Some(val) = &q.operation {
         builder
-            .push(" AND LOWER(c.operation) = ")
-            .push_bind(val.to_lowercase());
+            .push(" AND c.operation = ")
+            .push_bind(val.to_uppercase());
     }
 
     // Диапазон времени сохранения: границы уже разобраны на входе.

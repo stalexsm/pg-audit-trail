@@ -12,6 +12,13 @@ use crate::{AppError, AppResult};
 /// Диапазон времени фильтра: (нижняя граница, верхняя граница).
 pub(crate) type TimeRange = (Option<DateTime<chrono::Utc>>, Option<DateTime<chrono::Utc>>);
 
+/// Верхняя граница номера страницы: глубже журнал не листается.
+/// Экстремальный, но синтаксически валидный номер больше не уходит в БД
+/// миллионными смещениями (смещение всё равно считается в i64, тикет #41);
+/// значение обязано совпадать с литералом `maximum` в `#[param(...)]`
+/// ниже: в Swagger-схему utoipa принимает только литерал.
+const MAX_PAGE: i32 = 1_000_000;
+
 /// Строка журнала: изменение одной строки источника (ADR-0004).
 ///
 /// `changes` — краткая сводка образов «до/после» по первым четырём ключам.
@@ -63,9 +70,9 @@ pub struct ChangePageDTO {
 #[derive(Deserialize, Debug, Validate, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct QChange {
-    /// Номер страницы, с единицы.
-    #[param(minimum = 1)]
-    #[validate(range(min = 1))]
+    /// Номер страницы, с единицы; выше верхней границы (`MAX_PAGE`) — 400.
+    #[param(minimum = 1, maximum = 1000000)]
+    #[validate(range(min = 1, max = MAX_PAGE))]
     #[serde(default = "default_page")]
     pub page: i32,
 
@@ -83,10 +90,14 @@ pub struct QChange {
     /// пустое значение параметра — без фильтра.
     pub source: Option<String>,
 
-    /// Имя таблицы, без учёта регистра.
+    /// Имя таблицы; параметр приводится к нижнему регистру (как
+    /// PostgreSQL хранит идентификаторы без кавычек) и сравнивается с
+    /// колонкой напрямую — фильтр остаётся sargable.
     pub table: Option<String>,
 
-    /// Операция: CREATE, UPDATE, DELETE или TRUNCATE, без учёта регистра.
+    /// Операция: CREATE, UPDATE, DELETE или TRUNCATE; параметр приводится
+    /// к верхнему регистру (словарь операций журнала) и сравнивается с
+    /// колонкой напрямую — фильтр остаётся sargable.
     pub operation: Option<String>,
 
     /// Диапазон времени сохранения в журнал: `2025-01-01..2025-12-31`;

@@ -141,6 +141,41 @@ async fn invalid_query_params_give_400() {
     drop_db(&connect_admin(&audit_admin_url()).await, &db_name).await;
 }
 
+/// Верхняя граница номера страницы из валидации api/dto.rs (`MAX_PAGE`);
+/// в тесте повторяется литералом — шов проверяется снаружи, через HTTP.
+const MAX_PAGE_PARAM: i32 = 1_000_000;
+
+#[tokio::test]
+async fn huge_page_gives_empty_page_not_500() {
+    let (pool, db_name, router) = spawn_env("hugepage").await;
+
+    let mut early = row("CREATE", "orders", json!({}), at(16, 9));
+    early.after = json!({"id": 1});
+    insert_row(&pool, &early).await;
+
+    // Экстремальный, но валидный номер страницы: смещение считается в i64
+    // без переполнения, ответ — корректная пустая страница (200), а не 500.
+    let (status, body) = get_json(
+        router.clone(),
+        &format!("/api/changes?page={MAX_PAGE_PARAM}&per_page=200"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["page"], MAX_PAGE_PARAM);
+    assert_eq!(body["pages"], 1);
+    assert_eq!(body["rows"], json!([]));
+
+    // За верхней границей номера страницы — 400 валидации, без похода в БД.
+    let (status, body) = get_json(
+        router,
+        &format!("/api/changes?page={}&per_page=200", MAX_PAGE_PARAM + 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "тело: {body}");
+
+    drop_db(&connect_admin(&audit_admin_url()).await, &db_name).await;
+}
+
 #[tokio::test]
 async fn trace_id_returns_whole_operation() {
     let (pool, db_name, router) = spawn_env("trace").await;
