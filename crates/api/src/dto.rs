@@ -770,7 +770,7 @@ mod tests {
     // === Единое маскирование образов и контекста (ADR-0006, тикет #39) ===
 
     /// Сериализует DTO в JSON — так маскирование видит клиент API.
-    fn serialized<T: serde::Serialize>(value: &T) -> serde_json::Value {
+    fn serialized<T: Serialize>(value: &T) -> serde_json::Value {
         serde_json::to_value(value).expect("сериализация DTO")
     }
 

@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // Получение env.DATABASE_URL
-    let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+    let url = env::var("DATABASE_URL").unwrap_or_else(|_| {
         panic!("An error occurred while getting `DATABASE_URL` from ENV. Add a variable to the environment!")
     });
 

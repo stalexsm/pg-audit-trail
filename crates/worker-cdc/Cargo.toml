@@ -2,7 +2,11 @@
 name = "worker-cdc"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
 anyhow.workspace = true
