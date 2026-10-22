@@ -151,12 +151,7 @@ async fn reconcile(
     };
 
     // Завершившиеся исполнения удаления снимаются с учёта.
-    let finished: Vec<String> = deletions
-        .iter()
-        .filter(|(_, handle)| handle.is_finished())
-        .map(|(name, _)| name.clone())
-        .collect();
-    for name in finished {
+    for name in finished_keys(deletions, JoinHandle::is_finished) {
         if let Some(handle) = deletions.remove(&name)
             && let Err(e) = handle.await
         {
@@ -242,6 +237,15 @@ async fn stop_task(tasks: &mut HashMap<String, SourceHandle>, name: &str) {
     }
 }
 
+/// Ключи записей карты, чьё значение сообщает о завершении: общая форма
+/// очистки исполнений удаления и задач источников (reap-шаг такта).
+fn finished_keys<T>(map: &HashMap<String, T>, is_finished: impl Fn(&T) -> bool) -> Vec<String> {
+    map.iter()
+        .filter(|(_, value)| is_finished(value))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 /// Снимает с учёта задачи источников, завершившиеся сами по себе (по образцу
 /// очистки исполнений удаления): паника или преждевременный выход без сигнала
 /// остановки диагностируются, диагноз идёт в лог и в статус источника в
@@ -249,12 +253,7 @@ async fn stop_task(tasks: &mut HashMap<String, SourceHandle>, name: &str) {
 /// `connected`), задача снимается с учёта — шаг запуска того же такта
 /// перезапускает её без рестарта процесса (тикет #47).
 async fn reap_finished_tasks(audit: &PgPool, tasks: &mut HashMap<String, SourceHandle>) {
-    let finished: Vec<String> = tasks
-        .iter()
-        .filter(|(_, handle)| handle.handle.is_finished())
-        .map(|(name, _)| name.clone())
-        .collect();
-    for name in finished {
+    for name in finished_keys(tasks, |handle| handle.handle.is_finished()) {
         let Some(handle) = tasks.remove(&name) else {
             continue;
         };
