@@ -319,10 +319,17 @@ const MAX_SOURCE_NAME_LEN: usize = 63 - SLOT_PREFIX.len();
 /// `pg_logical_emit_message` (ADR-0004); u64 — под сигнатуру валидатора длины.
 const MAX_MESSAGE_PREFIX_LEN: u64 = 63;
 
-/// Границы размера батча: не меньше одной строки, верх — защита от
-/// необдуманного батча на гигабайт (дефолт исторический — 500).
+/// Границы размера батча: не меньше одной строки, верх — бюджет параметров
+/// протокола на statement (65535 / 16 bind-параметров на строку журнала =
+/// 4095): чанк вставки воркера исполняется одним statement, значения выше
+/// валидны при регистрации, но роняют инжест (тикет #42). Дефолт исторический
+/// — 500. Граница повторяет `MAX_ROWS_PER_STATEMENT` крейта worker-cdc.
 const MIN_BATCH_SIZE: i32 = 1;
-const MAX_BATCH_SIZE: i32 = 10_000;
+const MAX_BATCH_SIZE: i32 = 4_095;
+
+// utoipa принимает в `#[schema(maximum = ...)]` только литерал: проверка
+// держит литералы в схемах ниже согласованными с константой.
+const _: () = assert!(MAX_BATCH_SIZE == 4_095);
 
 /// Источник журнала: строка реестра (ADR-0005). Поля статуса воркера
 /// пишет воркер (тикет подхвата), API только читает.
@@ -383,7 +390,8 @@ pub struct QSourceCreate {
     pub message_prefix: String,
 
     /// Размер чанка батчевой вставки строк в журнал; по умолчанию 500.
-    #[schema(minimum = 1, maximum = 10_000)]
+    /// Верх — бюджет параметров протокола на statement (тикет #42).
+    #[schema(minimum = 1, maximum = 4_095)]
     #[serde(default = "default_batch_size")]
     #[validate(range(min = MIN_BATCH_SIZE, max = MAX_BATCH_SIZE))]
     pub batch_size: i32,
@@ -402,7 +410,7 @@ pub struct QSourcePatch {
     #[validate(length(min = 1, max = MAX_MESSAGE_PREFIX_LEN))]
     pub message_prefix: Option<String>,
 
-    #[schema(minimum = 1, maximum = 10_000)]
+    #[schema(minimum = 1, maximum = 4_095)]
     #[validate(range(min = MIN_BATCH_SIZE, max = MAX_BATCH_SIZE))]
     pub batch_size: Option<i32>,
 }
@@ -682,6 +690,15 @@ mod tests {
         assert!(body.validate().is_err());
         body.batch_size = MAX_BATCH_SIZE;
         assert!(body.validate().is_ok());
+        // Контракт верхней границы закреплён числом: это бюджет параметров
+        // протокола на statement (65535 / 16 на строку журнала). Дрейф
+        // константы от бюджета ловится здесь, а в инжесте — падающей вставкой.
+        assert_eq!(MAX_BATCH_SIZE, 4_095);
+        body.batch_size = 4_095;
+        assert!(body.validate().is_ok(), "граница бюджета валидна");
+        body.batch_size = 4_096;
+        assert!(body.validate().is_err(), "выше бюджета — невалидно");
+        body.batch_size = MAX_BATCH_SIZE; // валидно для последующих ассертов
         body.message_prefix = "x".repeat(MAX_MESSAGE_PREFIX_LEN as usize + 1);
         assert!(body.validate().is_err());
         body.message_prefix = "x".repeat(MAX_MESSAGE_PREFIX_LEN as usize);
