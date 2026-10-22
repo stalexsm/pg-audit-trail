@@ -94,8 +94,7 @@ pub(crate) async fn list_sources(audit: &PgPool) -> Result<Vec<SourceRecord>> {
 }
 
 /// Состояния задачи воркера в реестре (`sources.worker_state`).
-/// `pending` (дефолт схемы) ставится при регистрации — источник ждёт подхвата;
-/// исполнение удаления (состояние застрявшего дропа) — тикет #31.
+/// `pending` (дефолт схемы) ставится при регистрации — источник ждёт подхвата.
 pub(crate) mod worker_state {
     /// Задача подхвачена: бутстрап (публикация и слот у клиента) и подключение.
     pub(crate) const STARTING: &str = "starting";
@@ -105,6 +104,11 @@ pub(crate) mod worker_state {
 
     /// Последняя попытка не удалась, текст — в `last_error`; задача повторяет с backoff.
     pub(crate) const ERROR: &str = "error";
+
+    /// Исполняется удаление: дроп слота и публикации у клиента пока не удался;
+    /// текст последней неудачи — в `last_error`. Состояние застрявшего удаления
+    /// видно в реестре, пока дроп не удался (тикет #31).
+    pub(crate) const DELETING: &str = "deleting";
 }
 
 /// Пишет статус источника в реестр (`worker_state`, `last_error`,
@@ -170,6 +174,14 @@ impl<'a> StatusWriter<'a> {
             .await;
     }
 
+    /// Удаление исполняется и пока не удалось: состояние застрявшего
+    /// удаления в реестре, текст последней неудачи — в `last_error`.
+    /// `None` — удаление начато, прошлый текст ошибки закрывается.
+    pub(crate) async fn deleting(&self, error: Option<&anyhow::Error>) {
+        let text = error.map(|e| format!("{e:#}"));
+        self.write(worker_state::DELETING, text.as_deref()).await;
+    }
+
     /// Изменения источника сохранены в журнал: обновляет `last_event_at` —
     /// не чаще `LAST_EVENT_WRITE_INTERVAL`, чтобы не удваивать нагрузку
     /// на БД аудита на горячем пути.
@@ -203,6 +215,30 @@ impl<'a> StatusWriter<'a> {
 /// Пора ли обновлять `last_event_at`: не чаще интервала троттлинга.
 fn event_write_due(last: Instant, now: Instant) -> bool {
     now.duration_since(last) >= LAST_EVENT_WRITE_INTERVAL
+}
+
+/// Снимает чекпоинт дропнутого слота: после удаления источника строка
+/// осиротела, а повторная регистрация того же имени не должна наследовать
+/// чужую координату старта. Отсутствие строки — не ошибка (дроп уже был).
+pub(crate) async fn delete_checkpoint(audit: &PgPool, slot: &str) -> Result<()> {
+    sqlx::query("DELETE FROM checkpoints WHERE name = $1")
+        .bind(slot)
+        .execute(audit)
+        .await?;
+    Ok(())
+}
+
+/// Снимает строку источника с реестра — исполнение удаления завершено:
+/// слот и публикация у клиента дропнуты. Строки журнала `changes` не
+/// трогаются: журнал переживает источник. `false` — строки уже нет
+/// (снята в обход DELETE или удаление исполняется повторно) — результат
+/// тот же: источника в реестре больше нет.
+pub(crate) async fn delete_row(audit: &PgPool, name: &str) -> Result<bool> {
+    let removed = sqlx::query("DELETE FROM sources WHERE name = $1")
+        .bind(name)
+        .execute(audit)
+        .await?;
+    Ok(removed.rows_affected() > 0)
 }
 
 #[cfg(test)]

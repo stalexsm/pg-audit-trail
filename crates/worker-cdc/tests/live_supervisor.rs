@@ -417,17 +417,17 @@ async fn settings_edit_applies_to_live_source() {
     drop_db(&source_admin, &source_db).await;
 }
 
-/// Пометка к удалению (DELETE /api/sources → 202) останавливает задачу:
-/// walsender-соединение исчезает, новые изменения не собираются. Строка
-/// реестра с меткой ждёт исполнения удаления (тикет #31).
+/// AC (тикет #31): после пометки к удалению (DELETE /api/sources → 202)
+/// воркер исполняет удаление — у клиента исчезают слот и публикация,
+/// строка реестра удаляется. Строки журнала удалённого источника
+/// сохраняются; новые изменения клиента больше не собираются.
 #[tokio::test]
-async fn delete_mark_stops_task_and_keeps_row_for_execution() {
+async fn delete_drops_slot_publication_and_registry_row() {
     let worker = spawn_worker("delete").await;
     let (source, source_admin, source_url, source_db) = spawn_client("delete").await;
 
     let name = source_name("delete");
     register_source(&worker.audit, &name, &source_url).await;
-    let app_name = application_name(&source_slot(&name));
     wait_source_state(&worker.audit, &name, "connected").await;
 
     sqlx::query("INSERT INTO orders VALUES (1, 1.00, 'до-удаления', now())")
@@ -451,31 +451,194 @@ async fn delete_mark_stops_task_and_keeps_row_for_execution() {
         .await
         .expect("пометка источника к удалению");
 
-    // Задача остановлена: walsender-соединение исчезло.
-    wait_until(|| async { walsender_pid(&source_admin, &app_name).await.is_none() }).await;
-
-    // Сбор прекращён: новые изменения не попадают в журнал.
-    sqlx::query("INSERT INTO orders VALUES (2, 2.00, 'после-удаления', now())")
-        .execute(&source)
+    // Воркер исполняет удаление: слот и публикация дропнуты у клиента.
+    wait_until(|| async {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1) \
+             AND NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $2)",
+        )
+        .bind(source_slot(&name))
+        .bind(source_publication(&name))
+        .fetch_one(&source)
         .await
-        .expect("insert orders после удаления");
-    tokio::time::sleep(Duration::from_secs(2)).await;
+        .unwrap_or(false)
+    })
+    .await;
+    // Строка реестра снята; чекпоинт дропнутого слота — тоже (повторная
+    // регистрация того же имени не должна наследовать чужую координату).
+    wait_until(|| async {
+        sqlx::query_scalar::<_, bool>("SELECT NOT EXISTS (SELECT 1 FROM sources WHERE name = $1)")
+            .bind(&name)
+            .fetch_one(&worker.audit)
+            .await
+            .unwrap_or(false)
+    })
+    .await;
+    let checkpoint_gone: bool =
+        sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM checkpoints WHERE name = $1)")
+            .bind(source_slot(&name))
+            .fetch_one(&worker.audit)
+            .await
+            .expect("проверка чекпоинта после удаления");
+    assert!(checkpoint_gone, "чекпоинт удалённого источника снят");
+
+    // Строки журнала удалённого источника сохраняются.
     let total: i64 = sqlx::query_scalar("SELECT count(*) FROM changes WHERE source = $1")
         .bind(&name)
         .fetch_one(&worker.audit)
         .await
         .expect("подсчёт журнала после удаления");
-    assert_eq!(total, 1, "после пометки к удалению сбор прекращён");
+    assert_eq!(total, 1, "строки журнала удалённого источника сохраняются");
 
-    // Строка реестра с меткой ждёт исполнения удаления (тикет #31):
-    // дроп слота и публикации у клиента и снятие строки — за воркером.
-    let deleted_at: Option<chrono::DateTime<chrono::Utc>> =
-        sqlx::query_scalar("SELECT deleted_at FROM sources WHERE name = $1")
+    // Сбор прекращён: новые изменения клиента не попадают в журнал
+    // (слота и публикации нет — потоку не с чего идти).
+    sqlx::query("INSERT INTO orders VALUES (2, 2.00, 'после-удаления', now())")
+        .execute(&source)
+        .await
+        .expect("insert orders после удаления");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM changes WHERE source = $1")
+        .bind(&name)
+        .fetch_one(&worker.audit)
+        .await
+        .expect("подсчёт журнала после новых вставок");
+    assert_eq!(total, 1, "после удаления сбор с клиента прекращён");
+
+    shutdown_worker(worker).await;
+    drop_db(&source_admin, &source_db).await;
+}
+
+/// AC (тикет #31): клиент недоступен — удаление остаётся в видимом
+/// состоянии (`deleting` с текстом ошибки, строка реестра на месте)
+/// и завершается после возврата клиента — у клиента дропаются реальные
+/// слот и публикация. Строки журнала сохраняются.
+#[tokio::test]
+async fn deletion_retries_while_client_unreachable_and_completes_when_back() {
+    let worker = spawn_worker("stuckdel").await;
+    let (source, source_admin, source_url, source_db) = spawn_client("stuckdel").await;
+
+    // Клиентская роль: суперюзер ради бутстрапа (публикация+слот), но
+    // её можно закрыть на вход, не трогая админский доступ стенда —
+    // недоступность клиента имитируется без сноса БД и его объектов.
+    let role = format!(
+        "cdc_del_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE ROLE \"{role}\" LOGIN SUPERUSER PASSWORD 'del-pass'"
+    )))
+    .execute(&source_admin)
+    .await
+    .expect("создание клиентской роли");
+    let client_url = source_url.replacen("postgres:postgres", &format!("{role}:del-pass"), 1);
+
+    let name = source_name("stuckdel");
+    register_source(&worker.audit, &name, &client_url).await;
+    wait_source_state(&worker.audit, &name, "connected").await;
+
+    sqlx::query("INSERT INTO orders VALUES (1, 1.00, 'до-удаления', now())")
+        .execute(&source)
+        .await
+        .expect("insert orders до удаления");
+    wait_until(|| async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM changes WHERE source = $1")
             .bind(&name)
             .fetch_one(&worker.audit)
             .await
-            .expect("строка удалённого источника");
-    assert!(deleted_at.is_some(), "метка удаления на месте");
+            .unwrap_or(0)
+            == 1
+    })
+    .await;
+
+    // Клиент становится недоступным: роль закрыта на вход, живые сессии
+    // оборваны (walsender и пул задачи). Слот и публикация остаются.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER ROLE \"{role}\" NOLOGIN"
+    )))
+    .execute(&source_admin)
+    .await
+    .expect("закрытие клиентской роли на вход");
+    sqlx::query(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE usename = $1 AND pid <> pg_backend_pid()",
+    )
+    .bind(&role)
+    .execute(&source_admin)
+    .await
+    .expect("обрыв сессий клиентской роли");
+    source.close().await;
+    wait_source_state(&worker.audit, &name, "error").await;
+
+    // Пометка к удалению при недоступном клиенте.
+    sqlx::query("UPDATE sources SET deleted_at = now() WHERE name = $1")
+        .bind(&name)
+        .execute(&worker.audit)
+        .await
+        .expect("пометка источника к удалению");
+
+    // Удаление застряло и видно в реестре: состояние `deleting` с текстом
+    // ошибки, строка реестра с меткой ждёт возврата клиента.
+    wait_source_state(&worker.audit, &name, "deleting").await;
+    let last_error: Option<String> =
+        sqlx::query_scalar("SELECT last_error FROM sources WHERE name = $1")
+            .bind(&name)
+            .fetch_one(&worker.audit)
+            .await
+            .expect("статус застрявшего удаления");
+    assert!(
+        last_error.is_some_and(|text| !text.is_empty()),
+        "текст ошибки застрявшего удаления виден в реестре"
+    );
+    let marked: bool =
+        sqlx::query_scalar("SELECT deleted_at IS NOT NULL FROM sources WHERE name = $1")
+            .bind(&name)
+            .fetch_one(&worker.audit)
+            .await
+            .expect("строка реестра застрявшего удаления");
+    assert!(marked, "строка реестра ждёт возврата клиента");
+
+    // Клиент возвращается: роль снова пускает на вход.
+    sqlx::query(sqlx::AssertSqlSafe(format!("ALTER ROLE \"{role}\" LOGIN")))
+        .execute(&source_admin)
+        .await
+        .expect("открытие клиентской роли на вход");
+
+    // Удаление завершается: строка реестра снята; чекпоинт — тоже.
+    wait_until(|| async {
+        sqlx::query_scalar::<_, bool>("SELECT NOT EXISTS (SELECT 1 FROM sources WHERE name = $1)")
+            .bind(&name)
+            .fetch_one(&worker.audit)
+            .await
+            .unwrap_or(false)
+    })
+    .await;
+    let checkpoint_gone: bool =
+        sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM checkpoints WHERE name = $1)")
+            .bind(source_slot(&name))
+            .fetch_one(&worker.audit)
+            .await
+            .expect("проверка чекпоинта после завершения удаления");
+    assert!(checkpoint_gone, "чекпоинт удалённого источника снят");
+
+    // Дроп реально исполнен у клиента: слота и публикации больше нет.
+    let dropped: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1) \
+         AND NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $2)",
+    )
+    .bind(source_slot(&name))
+    .bind(source_publication(&name))
+    .fetch_one(&source_admin)
+    .await
+    .expect("проверка слота и публикации у клиента");
+    assert!(dropped, "слот и публикация дропнуты после возврата клиента");
+
+    // Строки журнала удалённого источника сохраняются.
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM changes WHERE source = $1")
+        .bind(&name)
+        .fetch_one(&worker.audit)
+        .await
+        .expect("подсчёт журнала после завершения удаления");
+    assert_eq!(total, 1, "строки журнала удалённого источника сохраняются");
 
     shutdown_worker(worker).await;
     drop_db(&source_admin, &source_db).await;

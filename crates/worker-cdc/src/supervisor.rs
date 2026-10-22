@@ -1,11 +1,12 @@
 //! Супервизор воркера (ADR-0005): периодически опрашивает реестр источников
 //! в БД аудита и держит по задаче на каждый источник. Зарегистрированные
 //! источники подхватываются без перезапуска воркера; задачи источников,
-//! помеченных к удалению или исчезнувших из реестра, останавливаются
-//! (исполнение удаления — дроп слота и публикации у клиента — за воркером,
-//! тикет #31). Правки настроек живого источника применяются перезапуском
-//! задачи. Остановка воркера — по общему `CancellationToken`: супервизор
-//! отменяет дочерние токены задач и ждёт их завершения.
+//! помеченных к удалению или исчезнувших из реестра, останавливаются, а для
+//! помеченных запускается исполнение удаления: дроп слота и публикации у
+//! клиента, затем снятие строки реестра (тикет #31). Правки настроек живого
+//! источника применяются перезапуском задачи. Остановка воркера — по общему
+//! `CancellationToken`: супервизор отменяет дочерние токены задач и ждёт
+//! завершения задач и исполнений удаления.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -20,6 +21,7 @@ use tracing::{info, warn};
 
 use crate::Result;
 use crate::config::{DB_ACQUIRE_TIMEOUT_SECS, WorkerConfig};
+use crate::deletion;
 use crate::metrics;
 use crate::registry::{self, SourceRecord};
 use crate::source_task;
@@ -76,6 +78,9 @@ pub async fn run(config: WorkerConfig, token: CancellationToken) -> Result<()> {
     let reporter = tokio::spawn(metrics::report_loop(token.clone()));
 
     let mut tasks: HashMap<String, SourceHandle> = HashMap::new();
+    // Исполнения удаления помеченных к удалению источников (тикет #31);
+    // остановка — вместе с супервизором (общий токен воркера).
+    let mut deletions: HashMap<String, JoinHandle<()>> = HashMap::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(REGISTRY_POLL_INTERVAL_SECS));
     // Пропущенные (пока шёл предыдущий опрос) тики не догоняются.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -88,7 +93,17 @@ pub async fn run(config: WorkerConfig, token: CancellationToken) -> Result<()> {
                 info!("получен сигнал остановки: останавливаем задачи источников");
                 break;
             }
-            _ = ticker.tick() => reconcile(&audit, &config, &token, &supervisor_gone_rx, &mut tasks).await,
+            _ = ticker.tick() => {
+                reconcile(
+                    &audit,
+                    &config,
+                    &token,
+                    &supervisor_gone_rx,
+                    &mut tasks,
+                    &mut deletions,
+                )
+                .await
+            }
         }
     }
 
@@ -103,20 +118,29 @@ pub async fn run(config: WorkerConfig, token: CancellationToken) -> Result<()> {
         }
     }
 
+    // Исполнения удаления останавливаются общим токеном воркера; незавершённое
+    // удаление остаётся помеченным в реестре — исполнение продолжит новый воркер.
+    for (_, handle) in deletions.drain() {
+        if let Err(e) = handle.await {
+            warn!(error = %e, "исполнение удаления завершилось паникой");
+        }
+    }
+
     reporter.abort();
     info!("супервизор остановлен: все задачи источников завершены");
     Ok(())
 }
 
 /// Один такт согласования запущенных задач с реестром: запуск задач новым
-/// источникам, остановка задач удалённых и исчезнувших, перезапуск задач
-/// с изменившимися настройками.
+/// источникам, остановка задач удалённых и исчезнувших, исполнение удаления
+/// помеченных, перезапуск задач с изменившимися настройками.
 async fn reconcile(
     audit: &PgPool,
     config: &WorkerConfig,
     token: &CancellationToken,
     supervisor_gone_rx: &watch::Receiver<()>,
     tasks: &mut HashMap<String, SourceHandle>,
+    deletions: &mut HashMap<String, JoinHandle<()>>,
 ) {
     let sources = match registry::list_sources(audit).await {
         Ok(sources) => sources,
@@ -126,6 +150,20 @@ async fn reconcile(
         }
     };
 
+    // Завершившиеся исполнения удаления снимаются с учёта.
+    let finished: Vec<String> = deletions
+        .iter()
+        .filter(|(_, handle)| handle.is_finished())
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in finished {
+        if let Some(handle) = deletions.remove(&name)
+            && let Err(e) = handle.await
+        {
+            warn!(source = %name, error = %e, "исполнение удаления завершилось паникой");
+        }
+    }
+
     // Активные источники: не помеченные к удалению.
     let active: HashMap<&str, &SourceRecord> = sources
         .iter()
@@ -134,11 +172,21 @@ async fn reconcile(
         .collect();
 
     // Помеченные к удалению: задача останавливается сразу, чтобы слот
-    // отпустил WAL; исполнение удаления — отдельный шаг (тикет #31).
+    // отпустил WAL; затем исполняется удаление — дроп слота и публикации
+    // у клиента, снятие чекпоинта и строки реестра (тикет #31). Клиент
+    // недоступен — исполнение повторяет с backoff, состояние застрявшего
+    // удаления видно в реестре, пока дроп не удался.
     for record in sources.iter().filter(|record| record.deleted_at.is_some()) {
         if tasks.contains_key(&record.name) {
             info!(source = %record.name, "источник помечен к удалению — задача остановлена");
             stop_task(tasks, &record.name).await;
+        }
+        if !deletions.contains_key(&record.name) {
+            info!(
+                source = %record.name,
+                "источник помечен к удалению — исполняем дроп слота и публикации"
+            );
+            spawn_deletion(record, config, token, supervisor_gone_rx.clone(), deletions);
         }
     }
 
@@ -214,4 +262,24 @@ fn spawn_task(
             handle,
         },
     );
+}
+
+/// Запускает исполнение удаления источника (тикет #31): дроп слота и
+/// публикации у клиента, затем снятие строки реестра. Исполнение
+/// останавливается вместе с супервизором: общий токен воркера и канал
+/// `supervisor_gone` (не переживает аварийной остановки супервизора).
+fn spawn_deletion(
+    record: &SourceRecord,
+    config: &WorkerConfig,
+    token: &CancellationToken,
+    supervisor_gone: watch::Receiver<()>,
+    deletions: &mut HashMap<String, JoinHandle<()>>,
+) {
+    let handle = tokio::spawn(deletion::run(
+        config.clone(),
+        record.clone(),
+        token.clone(),
+        supervisor_gone,
+    ));
+    deletions.insert(record.name.clone(), handle);
 }

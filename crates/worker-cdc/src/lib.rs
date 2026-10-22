@@ -7,10 +7,13 @@
 //! на каждый источник (свой слот, публикация, чекпоинт и статус в реестре)
 //! до отмены `CancellationToken`.
 
+mod backoff;
 mod bootstrap;
 mod config;
+mod deletion;
 mod ingest;
 mod metrics;
+mod pool;
 mod registry;
 mod replicate;
 mod source_task;

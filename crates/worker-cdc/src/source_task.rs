@@ -14,8 +14,10 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::backoff;
 use crate::bootstrap;
 use crate::config::{DB_ACQUIRE_TIMEOUT_SECS, WorkerConfig};
+use crate::pool;
 use crate::registry::{SourceRecord, StatusWriter};
 use crate::replicate;
 
@@ -24,10 +26,6 @@ const TASK_AUDIT_POOL_MAX_CONNECTIONS: u32 = 3;
 
 /// Размер пула к источнику: только чтение каталога (первичные ключи).
 const SOURCE_POOL_MAX_CONNECTIONS: u32 = 2;
-
-/// Потолок степени экспоненты backoff: 2^30 миллисекунд — далеко за любым
-/// разумным верхом, защита от переполнения умножения.
-const MAX_BACKOFF_SHIFT: u32 = 30;
 
 /// Чем закончилась попытка источника (подключение + сессия репликации).
 enum AttemptEnd {
@@ -60,22 +58,17 @@ pub(crate) async fn run(
     // соединения, медленный клиент не занимает чужие подключения.
     // Статусы пишутся в тот же пул (заимствование): пул — ресурс задачи,
     // статус — лишь один его потребитель.
-    let audit = loop {
-        match PgPoolOptions::new()
-            .max_connections(TASK_AUDIT_POOL_MAX_CONNECTIONS)
-            .acquire_timeout(Duration::from_secs(DB_ACQUIRE_TIMEOUT_SECS))
-            .connect(&config.database_url)
-            .await
-        {
-            Ok(pool) => break pool,
-            Err(e) => {
-                warn!(source = %record.name, error = %e, "пул задачи к БД аудита не создан — повтор");
-                if !wait_reconnect(&token, &mut supervisor_gone, reconnect_delay(&config, 0)).await
-                {
-                    return;
-                }
-            }
-        }
+    let Some(audit) = pool::audit_pool_with_retry(
+        &config,
+        TASK_AUDIT_POOL_MAX_CONNECTIONS,
+        &record.name,
+        "задача",
+        &token,
+        &mut supervisor_gone,
+    )
+    .await
+    else {
+        return;
     };
     let status = StatusWriter::new(&audit, record.name.clone());
 
@@ -124,6 +117,31 @@ pub(crate) async fn run(
     }
 
     info!(source = %record.name, "задача источника остановлена");
+}
+
+/// Единая реакция на неудачную попытку: warn-лог с причиной и пауза backoff,
+/// прерываемая остановкой (токен или исчезновение супервизора). `false` —
+/// остановка пришла в паузе.
+async fn backoff_after_failure(
+    token: &CancellationToken,
+    supervisor_gone: &mut watch::Receiver<()>,
+    config: &WorkerConfig,
+    attempt: u32,
+    source: &str,
+    error: &anyhow::Error,
+) -> bool {
+    warn!(
+        source,
+        attempt,
+        reason = "попытка источника не удалась — повтор с backoff",
+        error = %error,
+    );
+    backoff::pause(
+        token,
+        supervisor_gone,
+        backoff::reconnect_delay(config, attempt),
+    )
+    .await
 }
 
 /// Одна попытка источника: подключение, бутстрап, сессия репликации.
@@ -187,93 +205,5 @@ async fn run_attempt(
     match end {
         replicate::SessionEnd::Cancelled => AttemptEnd::Cancelled,
         replicate::SessionEnd::Reconnect(e) => AttemptEnd::Failed(e),
-    }
-}
-
-/// Задержка перед (пере)подключением по номеру подряд идущей попытки.
-fn reconnect_delay(config: &WorkerConfig, attempt: u32) -> Duration {
-    backoff_delay(
-        Duration::from_millis(config.reconnect_initial_backoff_ms),
-        Duration::from_millis(config.reconnect_max_backoff_ms),
-        attempt,
-    )
-}
-
-/// Единая реакция на неудачную попытку: warn-лог с причиной и пауза backoff,
-/// прерываемая остановкой (токен или исчезновение супервизора). `false` —
-/// остановка пришла в паузе.
-async fn backoff_after_failure(
-    token: &CancellationToken,
-    supervisor_gone: &mut watch::Receiver<()>,
-    config: &WorkerConfig,
-    attempt: u32,
-    source: &str,
-    error: &anyhow::Error,
-) -> bool {
-    warn!(
-        source,
-        attempt,
-        reason = "попытка источника не удалась — повтор с backoff",
-        error = %error,
-    );
-    wait_reconnect(token, supervisor_gone, reconnect_delay(config, attempt)).await
-}
-
-/// Экспоненциальный backoff `initial * 2^attempt`, ограниченный сверху `max`;
-/// ниже `initial` не опускается даже при `max < initial`.
-fn backoff_delay(initial: Duration, max: Duration, attempt: u32) -> Duration {
-    // Потолок степени защищает от переполнения при больших номерах попыток.
-    let doubling = initial.saturating_mul(2u32.saturating_pow(attempt.min(MAX_BACKOFF_SHIFT)));
-    doubling.min(max).max(initial)
-}
-
-/// Пауза перед реконнектом, прерываемая остановкой (токен воркера или
-/// исчезновение супервизора): `false` — остановка пришла в паузе.
-async fn wait_reconnect(
-    token: &CancellationToken,
-    supervisor_gone: &mut watch::Receiver<()>,
-    delay: Duration,
-) -> bool {
-    tokio::select! {
-        _ = token.cancelled() => false,
-        _ = supervisor_gone.changed() => false,
-        _ = tokio::time::sleep(delay) => true,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn backoff_starts_at_initial_and_doubles() {
-        let initial = Duration::from_millis(200);
-        let max = Duration::from_secs(30);
-        assert_eq!(backoff_delay(initial, max, 0), initial);
-        assert_eq!(backoff_delay(initial, max, 1), Duration::from_millis(400));
-        assert_eq!(backoff_delay(initial, max, 2), Duration::from_millis(800));
-        assert_eq!(backoff_delay(initial, max, 3), Duration::from_millis(1600));
-    }
-
-    #[test]
-    fn backoff_is_capped_at_max() {
-        let initial = Duration::from_secs(1);
-        let max = Duration::from_secs(30);
-        assert_eq!(backoff_delay(initial, max, 5), max);
-        assert_eq!(
-            backoff_delay(initial, max, 100),
-            max,
-            "переполнение степени не должно пробить верхнюю границу"
-        );
-    }
-
-    #[test]
-    fn backoff_floor_is_initial_even_when_max_is_smaller() {
-        let initial = Duration::from_secs(5);
-        assert_eq!(
-            backoff_delay(initial, Duration::from_secs(1), 3),
-            initial,
-            "нулевая пауза реконнекта недопустима"
-        );
     }
 }
