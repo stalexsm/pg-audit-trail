@@ -33,6 +33,7 @@ const MIB: f64 = 1024.0 * 1024.0;
 struct Snapshot {
     wire_bytes: u64,
     events: u64,
+    messages: u64,
     inserted_rows: u64,
     batches: u64,
     intake_nanos: u64,
@@ -51,6 +52,7 @@ impl Snapshot {
 struct Metrics {
     wire_bytes: AtomicU64,
     events: AtomicU64,
+    messages: AtomicU64,
     inserted_rows: AtomicU64,
     batches: AtomicU64,
     intake_nanos: AtomicU64,
@@ -65,6 +67,10 @@ impl Metrics {
 
     fn add_event(&self) {
         self.events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_message(&self) {
+        self.messages.fetch_add(1, Ordering::Relaxed);
     }
 
     fn add_intake_time(&self, spent: Duration) {
@@ -92,6 +98,7 @@ impl Metrics {
         Snapshot {
             wire_bytes: self.wire_bytes.load(Ordering::Relaxed),
             events: self.events.load(Ordering::Relaxed),
+            messages: self.messages.load(Ordering::Relaxed),
             inserted_rows: self.inserted_rows.load(Ordering::Relaxed),
             batches: self.batches.load(Ordering::Relaxed),
             intake_nanos: self.intake_nanos.load(Ordering::Relaxed),
@@ -109,6 +116,7 @@ impl Metrics {
 static METRICS: Metrics = Metrics {
     wire_bytes: AtomicU64::new(0),
     events: AtomicU64::new(0),
+    messages: AtomicU64::new(0),
     inserted_rows: AtomicU64::new(0),
     batches: AtomicU64::new(0),
     intake_nanos: AtomicU64::new(0),
@@ -124,6 +132,14 @@ pub(crate) fn add_wire(bytes: usize) {
 /// Событие подготовлено к вставке в журнал (ступень intake).
 pub(crate) fn add_event() {
     METRICS.add_event();
+}
+
+/// MESSAGE принят как контекст транзакции (ADR-0004): считается отдельным
+/// счётчиком — строк журнала MESSAGE не создаёт, и в остаток буферов
+/// (события минус вставленные строки) он входить не вправе, иначе остаток
+/// навсегда завышается на каждый MESSAGE (тикет #54).
+pub(crate) fn add_message() {
+    METRICS.add_message();
 }
 
 /// Чистое время ступени intake (декодирование, сборка строк, payload MESSAGE).
@@ -169,15 +185,19 @@ fn report_interval(previous: Snapshot) -> Snapshot {
 
     let p50 = percentile(&current.batch_ms, 50);
     let p99 = percentile(&current.batch_ms, 99);
+    // Остаток журнала в буферах транзакций: события готовились к вставке,
+    // но ещё не вставлены. MESSAGE в счётчик событий не входит (свой
+    // счётчик) — остаток не завышается на потоках с MESSAGE.
     let backlog = current.events as i64 - current.inserted_rows as i64;
 
     info!(
         "метрики CDC [за {REPORT_INTERVAL_SECS} с]: walsender {wire_mib_s:.1} МиБ/с | \
          intake {events_ps:.0} соб/с (занятость {intake_pct:.0}%) | \
          вставка {rows_ps:.0} строк/с, батчей {}, p50 {p50} мс, p99 {p99} мс \
-         (занятость {insert_pct:.0}%) | всего {} строк, в буферах {backlog}",
+         (занятость {insert_pct:.0}%) | всего {} строк, сообщений {}, в буферах {backlog}",
         current.batches.saturating_sub(previous.batches),
         current.inserted_rows,
+        current.messages,
     );
     current
 }
@@ -269,6 +289,26 @@ mod tests {
         assert_eq!(snapshot.wire_bytes, 1024);
         assert_eq!(snapshot.events, 1);
         assert_eq!(snapshot.intake_nanos, 5_000_000);
+    }
+
+    #[test]
+    fn messages_are_counted_separately_and_do_not_inflate_backlog() {
+        // MESSAGE (ADR-0004) строк журнала не создаёт: в остатке буферов
+        // (события минус вставленные строки) ему делать нечего — иначе
+        // остаток навсегда завышен на каждый MESSAGE.
+        let metrics = Metrics::default();
+        metrics.add_event();
+        metrics.add_event();
+        metrics.add_message();
+        metrics.add_message();
+        metrics.add_message();
+        metrics.add_flush(Duration::from_millis(1), 2);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.events, 2, "MESSAGE не входит в события");
+        assert_eq!(snapshot.messages, 3, "MESSAGE — отдельный счётчик");
+        let backlog = snapshot.events as i64 - snapshot.inserted_rows as i64;
+        assert_eq!(backlog, 0, "остаток сходится на потоке с MESSAGE");
     }
 
     #[test]

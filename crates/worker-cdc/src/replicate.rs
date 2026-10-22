@@ -374,7 +374,9 @@ fn handle_audit_message(buf: &mut TransactionBuffer, content: &[u8], lsn: Lsn) {
         }
     };
     buf.push_message(payload);
-    metrics::add_event();
+    // Отдельный счётчик: MESSAGE строк журнала не создаёт, в остаток
+    // буферов (события минус вставленные строки) входить не должен.
+    metrics::add_message();
     debug!(%lsn, "MESSAGE принят как контекст транзакции");
 }
 
