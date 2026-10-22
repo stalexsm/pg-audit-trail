@@ -16,7 +16,10 @@ use tracing::{info, warn};
 
 use crate::backoff;
 use crate::bootstrap;
-use crate::config::{DB_ACQUIRE_TIMEOUT_SECS, WorkerConfig};
+use crate::config::{
+    BOOTSTRAP_TIMEOUT_SECS, DB_ACQUIRE_TIMEOUT_SECS, REPLICATION_SHUTDOWN_TIMEOUT_SECS,
+    REPLICATION_START_TIMEOUT_SECS, SOURCE_CONNECT_TIMEOUT_SECS, WorkerConfig,
+};
 use crate::pool;
 use crate::registry::{SourceRecord, StatusWriter};
 use crate::replicate;
@@ -145,6 +148,9 @@ async fn backoff_after_failure(
 }
 
 /// Одна попытка источника: подключение, бутстрап, сессия репликации.
+/// Подключение к БД источника, бутстрап и подтверждение старта репликации
+/// ограничены таймаутами (config.rs): зависание сети переводит попытку
+/// в видимый `error` с backoff вместо вечного `starting` (тикет #46).
 async fn run_attempt(
     record: &SourceRecord,
     audit: &sqlx::PgPool,
@@ -153,21 +159,41 @@ async fn run_attempt(
     attempt: &mut u32,
 ) -> AttemptEnd {
     // Пул источника живёт одну попытку: пересоздаётся после обрыва.
-    let source = match PgPoolOptions::new()
-        .max_connections(SOURCE_POOL_MAX_CONNECTIONS)
-        .acquire_timeout(Duration::from_secs(DB_ACQUIRE_TIMEOUT_SECS))
-        .connect(&record.url)
-        .await
+    // Внешний таймаут страхует и фазу DNS/TCP, которую acquire_timeout
+    // пула оборвать не может.
+    let source = match tokio::time::timeout(
+        Duration::from_secs(SOURCE_CONNECT_TIMEOUT_SECS),
+        PgPoolOptions::new()
+            .max_connections(SOURCE_POOL_MAX_CONNECTIONS)
+            .acquire_timeout(Duration::from_secs(DB_ACQUIRE_TIMEOUT_SECS))
+            .connect(&record.url),
+    )
+    .await
     {
-        Ok(pool) => pool,
-        Err(e) => {
+        Ok(Ok(pool)) => pool,
+        Ok(Err(e)) => {
             return AttemptEnd::Failed(anyhow::Error::new(e).context("подключение к БД источника"));
+        }
+        Err(_) => {
+            return AttemptEnd::Failed(anyhow::anyhow!(
+                "подключение к БД источника не уложилось в {SOURCE_CONNECT_TIMEOUT_SECS} с"
+            ));
         }
     };
 
-    let boot = match bootstrap::bootstrap(audit, &source, record).await {
-        Ok(boot) => boot,
-        Err(e) => return AttemptEnd::Failed(e.context("бутстрап источника не удался")),
+    let boot = match tokio::time::timeout(
+        Duration::from_secs(BOOTSTRAP_TIMEOUT_SECS),
+        bootstrap::bootstrap(audit, &source, record),
+    )
+    .await
+    {
+        Ok(Ok(boot)) => boot,
+        Ok(Err(e)) => return AttemptEnd::Failed(e.context("бутстрап источника не удался")),
+        Err(_) => {
+            return AttemptEnd::Failed(anyhow::anyhow!(
+                "бутстрап источника не уложился в {BOOTSTRAP_TIMEOUT_SECS} с"
+            ));
+        }
     };
     info!(
         source = %record.name,
@@ -180,11 +206,27 @@ async fn run_attempt(
         Ok(client) => client,
         Err(e) => return AttemptEnd::Failed(e),
     };
-    if let Err(e) = client.wait_started().await {
-        // Например, слот занят другим консюмером: повтор с backoff.
-        return AttemptEnd::Failed(
-            anyhow::Error::new(e).context("старт репликации не подтверждён сервером"),
-        );
+    // Подключение walsender фоновое: TCP, аутентификация и
+    // START_REPLICATION завершаются не позже подтверждения старта —
+    // таймаут на нём ограничивает весь тракт подключения.
+    let started = tokio::time::timeout(
+        Duration::from_secs(REPLICATION_START_TIMEOUT_SECS),
+        client.wait_started(),
+    )
+    .await;
+    match started {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            // Например, слот занят другим консюмером: повтор с backoff.
+            return AttemptEnd::Failed(
+                anyhow::Error::new(e).context("старт репликации не подтверждён сервером"),
+            );
+        }
+        Err(_) => {
+            return AttemptEnd::Failed(anyhow::anyhow!(
+                "старт репликации не подтвердился за {REPLICATION_START_TIMEOUT_SECS} с"
+            ));
+        }
     }
     // Подключение и старт удались: счётчик неудач сбрасывается.
     *attempt = 0;
@@ -193,14 +235,27 @@ async fn run_attempt(
 
     let end =
         replicate::stream_session(&mut client, audit, &source, &boot, record, status, token).await;
-    if matches!(end, replicate::SessionEnd::Cancelled)
-        && let Err(e) = client.shutdown().await
-    {
-        warn!(
-            source = %record.name,
-            error = %e,
-            "штатное закрытие репликации завершилось с ошибкой"
-        );
+    if matches!(end, replicate::SessionEnd::Cancelled) {
+        // Остановка обязана уложиться в grace-окно оркестратора: на
+        // зависшей сети закрытие обрывается по таймауту, соединение
+        // добивает дроп клиента.
+        let shutdown = tokio::time::timeout(
+            Duration::from_secs(REPLICATION_SHUTDOWN_TIMEOUT_SECS),
+            client.shutdown(),
+        )
+        .await;
+        match shutdown {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!(
+                source = %record.name,
+                error = %e,
+                "штатное закрытие репликации завершилось с ошибкой"
+            ),
+            Err(_) => warn!(
+                source = %record.name,
+                "закрытие репликации не уложилось в таймаут остановки — соединение оставлено на дроп"
+            ),
+        }
     }
     match end {
         replicate::SessionEnd::Cancelled => AttemptEnd::Cancelled,
