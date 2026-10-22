@@ -66,6 +66,7 @@ async fn live_long_primary_key_is_truncated_and_ingest_continues() {
         database_url: audit_url.clone(),
         reconnect_initial_backoff_ms: 1_000,
         reconnect_max_backoff_ms: 30_000,
+        tx_buffer_max_rows: 100_000,
     };
 
     let token = tokio_util::sync::CancellationToken::new();

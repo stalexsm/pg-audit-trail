@@ -57,6 +57,7 @@ async fn spawn_worker(prefix: &str) -> Worker {
         database_url: audit_url.clone(),
         reconnect_initial_backoff_ms: 1_000,
         reconnect_max_backoff_ms: 30_000,
+        tx_buffer_max_rows: 100_000,
     };
     let token = tokio_util::sync::CancellationToken::new();
     let handle = tokio::spawn(worker_cdc::run(config, token.clone()));

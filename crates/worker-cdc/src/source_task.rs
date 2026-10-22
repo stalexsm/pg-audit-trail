@@ -95,7 +95,7 @@ pub(crate) async fn run(
             // Супервизор исчез (аварийная остановка): сессия обрывается
             // вместе с будущим попытки, сохранённый прогресс — в чекпоинтах.
             _ = supervisor_gone.changed() => break,
-            outcome = run_attempt(&record, &audit, &status, &token, &mut attempt) => {
+            outcome = run_attempt(&record, &audit, &status, &token, &config, &mut attempt) => {
                 match outcome {
                     AttemptEnd::Cancelled => break,
                     AttemptEnd::Failed(e) => {
@@ -151,11 +151,14 @@ async fn backoff_after_failure(
 /// Подключение к БД источника, бутстрап и подтверждение старта репликации
 /// ограничены таймаутами (config.rs): зависание сети переводит попытку
 /// в видимый `error` с backoff вместо вечного `starting` (тикет #46).
+/// Потолок буфера транзакции — настройка воркера, передаётся в сессию
+/// (тикет #48).
 async fn run_attempt(
     record: &SourceRecord,
     audit: &sqlx::PgPool,
     status: &StatusWriter<'_>,
     token: &CancellationToken,
+    config: &WorkerConfig,
     attempt: &mut u32,
 ) -> AttemptEnd {
     // Пул источника живёт одну попытку: пересоздаётся после обрыва.
@@ -233,8 +236,17 @@ async fn run_attempt(
     status.connected().await;
     info!(source = %record.name, "репликация источника запущена");
 
-    let end =
-        replicate::stream_session(&mut client, audit, &source, &boot, record, status, token).await;
+    let end = replicate::stream_session(
+        &mut client,
+        audit,
+        &source,
+        &boot,
+        record,
+        status,
+        token,
+        config.tx_buffer_max_rows,
+    )
+    .await;
     if matches!(end, replicate::SessionEnd::Cancelled) {
         // Остановка обязана уложиться в grace-окно оркестратора: на
         // зависшей сети закрытие обрывается по таймауту, соединение

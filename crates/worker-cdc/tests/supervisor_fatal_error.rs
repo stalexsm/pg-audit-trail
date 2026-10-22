@@ -31,6 +31,7 @@ fn config(database_url: String) -> WorkerConfig {
         database_url,
         reconnect_initial_backoff_ms: 1_000,
         reconnect_max_backoff_ms: 30_000,
+        tx_buffer_max_rows: 100_000,
     }
 }
 

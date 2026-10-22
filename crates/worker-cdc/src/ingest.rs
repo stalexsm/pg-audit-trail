@@ -3,6 +3,7 @@ use pgoutput::ChangeKind;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::QueryBuilder;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -43,6 +44,15 @@ const _: () = assert!(CHANGE_ROW_PARAMS * MAX_ROWS_PER_STATEMENT <= MAX_STATEMEN
 /// линейно с номером попытки (200, 400, …).
 const RETRY_BASE_DELAY_MS: u64 = 200;
 
+/// Разделяемый пустой контекст: дефолт строк до первого MESSAGE — без
+/// аллокации на каждую строку (один Arc на все строки без MESSAGE).
+static EMPTY_CONTEXT: LazyLock<Arc<Value>> = LazyLock::new(|| Arc::new(json!({})));
+
+/// Пустой контекст транзакции: общий Arc для строк без MESSAGE.
+pub(crate) fn empty_context() -> Arc<Value> {
+    Arc::clone(&EMPTY_CONTEXT)
+}
+
 /// Предел длины `primary_key` под колонку `primary_key` VARCHAR(255).
 ///
 /// Тот же подход, что и для `trace_id`: VARCHAR считает символы, а режем
@@ -67,8 +77,11 @@ pub struct ChangeRow {
     pub operation: &'static str,
     pub before: Value,
     pub after: Value,
-    /// Контекст приложения: payload MESSAGE (ADR-0004).
-    pub context: Value,
+    /// Контекст приложения: payload MESSAGE (ADR-0004). Владение разделяется
+    /// между строками одной транзакции (Arc): payload проставляется всем
+    /// строкам при коммите, полный клон на каждую строку множил бы память
+    /// и CPU на больших транзакциях (тикет #48).
+    pub context: Arc<Value>,
     pub committed_at: DateTime<Utc>,
     pub queued_at: DateTime<Utc>,
     pub transaction_id: i64,
@@ -79,13 +92,19 @@ pub struct ChangeRow {
 }
 
 /// Буфер одной транзакции источника: события копятся между Begin и Commit
-/// и вставляются одним батчем в транзакции с чекпоинтом.
+/// и вставляются одним батчем в транзакции с чекпоинтом. Буфер ограничен
+/// потолком строк (тикет #48): гигантская транзакция клиента не роняет
+/// воркер по памяти — строка сверх потолка завершает попытку с ошибкой,
+/// транзакция переиграется слотом после реконнекта.
 pub struct TransactionBuffer {
     pub xid: i64,
     rows: Vec<ChangeRow>,
+    /// Потолок буфера: максимум строк журнала транзакции (включительно).
+    max_rows: usize,
     event_index: i32,
-    /// Контекст последнего MESSAGE транзакции — его payload (ADR-0004).
-    context: Value,
+    /// Контекст последнего MESSAGE транзакции — его payload (ADR-0004);
+    /// разделяется между строками без клонирования.
+    context: Arc<Value>,
     /// trace_id последнего MESSAGE с этим ключом: проставляется всем
     /// строкам транзакции при коммите.
     trace_id: Option<String>,
@@ -94,12 +113,17 @@ pub struct TransactionBuffer {
 }
 
 impl TransactionBuffer {
-    pub fn new(xid: u32) -> Self {
+    /// Буфер с явным потолком строк; значение ниже 1 поднимается до 1 —
+    /// нулевой потолок отвергал бы любую строку. Потолок приходит из
+    /// конфигурации воркера (`WorkerConfig::tx_buffer_max_rows`, дефолт —
+    /// `DEFAULT_TX_BUFFER_MAX_ROWS`).
+    pub fn with_row_limit(xid: u32, max_rows: usize) -> Self {
         Self {
             xid: i64::from(xid),
             rows: Vec::new(),
+            max_rows: max_rows.max(1),
             event_index: 0,
-            context: json!({}),
+            context: Arc::new(json!({})),
             trace_id: None,
             message_seen: false,
         }
@@ -118,8 +142,29 @@ impl TransactionBuffer {
         index
     }
 
-    pub fn push_row(&mut self, row: ChangeRow) {
+    /// Кладёт строку журнала в буфер. Ошибка — потолок буфера превышен:
+    /// уже накопленные строки остаются, отвергнутая — нет; диагностика
+    /// (warn) пишется здесь, на момент превышения, а попытка целиком
+    /// завершается реконнектом с backoff (тикет #48).
+    pub fn push_row(&mut self, row: ChangeRow) -> Result<()> {
+        if self.rows.len() >= self.max_rows {
+            warn!(
+                xid = self.xid,
+                rows = self.rows.len(),
+                limit = self.max_rows,
+                "потолок буфера транзакции превышен — транзакция отбрасывается, повтор после реконнекта с чекпоинта"
+            );
+            return Err(anyhow::anyhow!(
+                "потолок буфера транзакции превышен: xid {} уже буферизовал {} строк \
+                 при потолке {} — гигантская транзакция клиента отброшена, \
+                 после реконнекта переиграется с чекпоинта и упрётся снова",
+                self.xid,
+                self.rows.len(),
+                self.max_rows
+            ));
+        }
         self.rows.push(row);
+        Ok(())
     }
 
     /// Регистрирует MESSAGE транзакции (ADR-0004): payload становится
@@ -138,16 +183,17 @@ impl TransactionBuffer {
         }
         self.message_seen = true;
         self.trace_id = trace_id_from_payload(&context);
-        self.context = context;
+        self.context = Arc::new(context);
     }
 
     /// Проставляет контекст последнего MESSAGE (payload и `trace_id`)
     /// всем строкам изменений транзакции — включая строки до MESSAGE.
-    /// Вызывается при коммите. Контекст не выходит за пределы буфера своей
-    /// транзакции: строки других транзакций он не затрагивает.
+    /// Вызывается при коммите. Владение разделяется (Arc): строки делят
+    /// один payload без клонирования. Контекст не выходит за пределы
+    /// буфера своей транзакции: строки других транзакций он не затрагивает.
     pub fn apply_transaction_context(&mut self) {
         for row in &mut self.rows {
-            row.context = self.context.clone();
+            row.context = Arc::clone(&self.context);
             row.trace_id = self.trace_id.clone();
         }
     }
@@ -339,7 +385,7 @@ async fn flush_once(
                 .push_bind(row.operation)
                 .push_bind(&row.before)
                 .push_bind(&row.after)
-                .push_bind(&row.context)
+                .push_bind(&*row.context)
                 .push_bind(row.committed_at)
                 .push_bind(row.queued_at)
                 .push_bind(row.transaction_id)
@@ -370,6 +416,7 @@ async fn flush_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_TX_BUFFER_MAX_ROWS;
 
     /// Строка журнала с заданной операцией для тестов агрегатора.
     fn journal_row_fixture(operation: &'static str) -> ChangeRow {
@@ -382,7 +429,7 @@ mod tests {
             operation,
             before: json!({}),
             after: json!({}),
-            context: json!({}),
+            context: empty_context(),
             committed_at: Utc::now(),
             queued_at: Utc::now(),
             transaction_id: 1,
@@ -409,7 +456,7 @@ mod tests {
 
     #[test]
     fn event_indexes_are_sequential_across_kinds() {
-        let mut buffer = TransactionBuffer::new(77);
+        let mut buffer = TransactionBuffer::with_row_limit(77, DEFAULT_TX_BUFFER_MAX_ROWS);
         assert_eq!(buffer.xid, 77);
         assert_eq!(buffer.next_index(), 0);
         assert_eq!(buffer.next_index(), 1);
@@ -418,14 +465,65 @@ mod tests {
 
     #[test]
     fn take_rows_empties_buffer_but_keeps_counter() {
-        let mut buffer = TransactionBuffer::new(1);
+        let mut buffer = TransactionBuffer::with_row_limit(1, DEFAULT_TX_BUFFER_MAX_ROWS);
         buffer.next_index();
-        buffer.push_row(journal_row_fixture("TRUNCATE"));
+        buffer
+            .push_row(journal_row_fixture("TRUNCATE"))
+            .expect("строка в пределах потолка");
         let rows = buffer.take_rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].event_index, 0);
         assert!(buffer.take_rows().is_empty());
         assert_eq!(buffer.next_index(), 1, "счётчик событий не сбрасывается");
+    }
+
+    /// AC (тикет #48): транзакция сверх потолка буфера не роняет процесс —
+    /// строка сверх потолка отвергается с явной ошибкой, уже накопленные
+    /// строки остаются в буфере; попытка целиком завершится реконнектом
+    /// с backoff, транзакция переиграется слотом с чекпоинта.
+    #[test]
+    fn push_row_over_limit_fails_without_buffering() {
+        let mut buffer = TransactionBuffer::with_row_limit(9, 2);
+
+        buffer
+            .push_row(journal_row_fixture("CREATE"))
+            .expect("первая строка в пределах потолка");
+        buffer
+            .push_row(journal_row_fixture("UPDATE"))
+            .expect("вторая строка в пределах потолка");
+
+        let error = buffer
+            .push_row(journal_row_fixture("DELETE"))
+            .expect_err("строка сверх потолка отвергается с ошибкой");
+        assert!(
+            error.to_string().contains("потолок"),
+            "диагностика называет потолок буфера: {error}"
+        );
+        assert_eq!(
+            buffer.take_rows().len(),
+            2,
+            "отвергнутая строка не попадает в буфер"
+        );
+    }
+
+    /// Потолок — максимум строк в буфере, включительно: транзакция ровно
+    /// в потолок проходит целиком; потолок ниже 1 поднимается до 1.
+    #[test]
+    fn row_limit_is_inclusive_and_clamped() {
+        let mut buffer = TransactionBuffer::with_row_limit(1, 1);
+        buffer
+            .push_row(journal_row_fixture("CREATE"))
+            .expect("одна строка — ровно потолок");
+        assert!(
+            buffer.push_row(journal_row_fixture("CREATE")).is_err(),
+            "вторая строка сверх потолка"
+        );
+
+        let mut buffer = TransactionBuffer::with_row_limit(1, 0);
+        buffer
+            .push_row(journal_row_fixture("CREATE"))
+            .expect("нулевой потолок поднят до 1");
+        assert!(buffer.push_row(journal_row_fixture("CREATE")).is_err());
     }
 
     #[test]
@@ -566,12 +664,38 @@ mod tests {
         );
     }
 
+    /// Владение контекстом разделяется (Arc): строки одной транзакции
+    /// делят один payload без полного клона на строку (тикет #48).
+    #[test]
+    fn transaction_context_is_shared_between_rows_not_cloned() {
+        let mut buffer = TransactionBuffer::with_row_limit(1, DEFAULT_TX_BUFFER_MAX_ROWS);
+        buffer
+            .push_row(journal_row_fixture("CREATE"))
+            .expect("строка в пределах потолка");
+        buffer
+            .push_row(journal_row_fixture("UPDATE"))
+            .expect("строка в пределах потолка");
+        buffer.push_message(json!({"trace_id": "op-1"}));
+
+        buffer.apply_transaction_context();
+        let rows = buffer.take_rows();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            Arc::ptr_eq(&rows[0].context, &rows[1].context),
+            "строки транзакции делят один контекст без клонирования"
+        );
+    }
+
     #[test]
     fn message_creates_no_journal_row_and_enriches_change_rows() {
-        let mut buffer = TransactionBuffer::new(7);
-        buffer.push_row(journal_row_fixture("CREATE"));
+        let mut buffer = TransactionBuffer::with_row_limit(7, DEFAULT_TX_BUFFER_MAX_ROWS);
+        buffer
+            .push_row(journal_row_fixture("CREATE"))
+            .expect("строка в пределах потолка");
         buffer.push_message(json!({"trace_id": "op-1"}));
-        buffer.push_row(journal_row_fixture("UPDATE"));
+        buffer
+            .push_row(journal_row_fixture("UPDATE"))
+            .expect("строка в пределах потолка");
 
         buffer.apply_transaction_context();
         let rows = buffer.take_rows();
@@ -579,15 +703,17 @@ mod tests {
         // Обе строки изменения: контекст MESSAGE и trace_id в колонке,
         // включая строку до MESSAGE.
         for row in &rows {
-            assert_eq!(row.context, json!({"trace_id": "op-1"}));
+            assert_eq!(*row.context, json!({"trace_id": "op-1"}));
             assert_eq!(row.trace_id.as_deref(), Some("op-1"));
         }
     }
 
     #[test]
     fn last_message_wins_for_change_rows() {
-        let mut buffer = TransactionBuffer::new(7);
-        buffer.push_row(journal_row_fixture("CREATE"));
+        let mut buffer = TransactionBuffer::with_row_limit(7, DEFAULT_TX_BUFFER_MAX_ROWS);
+        buffer
+            .push_row(journal_row_fixture("CREATE"))
+            .expect("строка в пределах потолка");
         buffer.push_message(json!({"trace_id": "op-1"}));
         buffer.push_message(json!({"trace_id": "op-2", "user": "bob"}));
 
@@ -596,25 +722,27 @@ mod tests {
         assert_eq!(rows.len(), 1, "повторный MESSAGE строк не добавляет");
         // Строка изменения: контекст последнего MESSAGE, даже если она
         // была до него.
-        assert_eq!(rows[0].context, json!({"trace_id": "op-2", "user": "bob"}));
+        assert_eq!(*rows[0].context, json!({"trace_id": "op-2", "user": "bob"}));
         assert_eq!(rows[0].trace_id.as_deref(), Some("op-2"));
     }
 
     #[test]
     fn message_without_trace_id_leaves_column_empty() {
-        let mut buffer = TransactionBuffer::new(1);
-        buffer.push_row(journal_row_fixture("UPDATE"));
+        let mut buffer = TransactionBuffer::with_row_limit(1, DEFAULT_TX_BUFFER_MAX_ROWS);
+        buffer
+            .push_row(journal_row_fixture("UPDATE"))
+            .expect("строка в пределах потолка");
         buffer.push_message(json!({"user": "bob"}));
 
         buffer.apply_transaction_context();
         let rows = buffer.take_rows();
         assert_eq!(rows[0].trace_id, None, "колонка пустая без ключа");
-        assert_eq!(rows[0].context, json!({"user": "bob"}));
+        assert_eq!(*rows[0].context, json!({"user": "bob"}));
     }
 
     #[test]
     fn message_only_transaction_creates_no_rows() {
-        let mut buffer = TransactionBuffer::new(1);
+        let mut buffer = TransactionBuffer::with_row_limit(1, DEFAULT_TX_BUFFER_MAX_ROWS);
         // MESSAGE расходует индекс события, но строку журнала не создаёт:
         // индекс остаётся детерминированной функцией содержимого транзакции.
         buffer.next_index();
@@ -628,26 +756,29 @@ mod tests {
 
     #[test]
     fn transaction_context_does_not_leak_into_next_buffer() {
-        let mut buffer = TransactionBuffer::new(1);
+        let mut buffer = TransactionBuffer::with_row_limit(1, DEFAULT_TX_BUFFER_MAX_ROWS);
         buffer.push_message(json!({"trace_id": "op-1"}));
         buffer.apply_transaction_context();
 
         // Новая транзакция без MESSAGE — строки с пустым контекстом.
-        let mut next = TransactionBuffer::new(2);
-        next.push_row(journal_row_fixture("DELETE"));
+        let mut next = TransactionBuffer::with_row_limit(2, DEFAULT_TX_BUFFER_MAX_ROWS);
+        next.push_row(journal_row_fixture("DELETE"))
+            .expect("строка в пределах потолка");
         next.apply_transaction_context();
         let rows = next.take_rows();
-        assert_eq!(rows[0].context, json!({}));
+        assert_eq!(*rows[0].context, json!({}));
         assert_eq!(rows[0].trace_id, None);
     }
 
     #[test]
     fn change_rows_without_messages_keep_empty_context() {
-        let mut buffer = TransactionBuffer::new(1);
-        buffer.push_row(journal_row_fixture("UPDATE"));
+        let mut buffer = TransactionBuffer::with_row_limit(1, DEFAULT_TX_BUFFER_MAX_ROWS);
+        buffer
+            .push_row(journal_row_fixture("UPDATE"))
+            .expect("строка в пределах потолка");
         buffer.apply_transaction_context();
         let rows = buffer.take_rows();
-        assert_eq!(rows[0].context, json!({}));
+        assert_eq!(*rows[0].context, json!({}));
         assert_eq!(rows[0].trace_id, None);
     }
 

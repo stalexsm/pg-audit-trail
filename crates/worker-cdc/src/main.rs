@@ -61,6 +61,7 @@ async fn main() -> ExitCode {
     info!(
         reconnect_initial_backoff_ms = config.reconnect_initial_backoff_ms,
         reconnect_max_backoff_ms = config.reconnect_max_backoff_ms,
+        tx_buffer_max_rows = config.tx_buffer_max_rows,
         "worker-cdc: супервизор источников — настройки источников читаются из реестра (ADR-0005)"
     );
 

@@ -87,6 +87,7 @@ mod tests {
             database_url: "postgresql://audit/db".to_owned(),
             reconnect_initial_backoff_ms: 250,
             reconnect_max_backoff_ms: 45_000,
+            tx_buffer_max_rows: 100_000,
         };
         assert_eq!(
             reconnect_delay(&config, 0),
