@@ -115,13 +115,29 @@ fn cors_layer_for(origins: Option<Vec<String>>) -> anyhow::Result<CorsLayer> {
 }
 
 /// Проверяет элемент белого списка и переводит его в значение заголовка.
-/// Двойная проверка: `Url::parse` отсекает мусор («не-origin с пробелом»,
+/// Тройная проверка: `Url::parse` отсекает мусор («не-origin с пробелом»,
 /// относительные пути) ещё до старта — кривой конфиг не должен молча
-/// отрезать читателей; `HeaderValue::from_str` отсекает управляющие
-/// символы, которые парсер URL молча вырезал бы.
+/// отрезать читателей; происхождение обязано быть голым (scheme://host[:port]):
+/// записи с путём, query, fragment, userinfo и даже слэшем на конце
+/// никогда не совпадут с Origin, который браузер шлёт без них — Url::parse
+/// такие значения пропускает (слэш на конце нормализуется в корень),
+/// поэтому слэш проверяется по исходной строке; `HeaderValue::from_str`
+/// отсекает управляющие символы, которые парсер URL молча вырезал бы.
+/// Порт разрешён: браузер включает его в Origin для нестандартных портов.
 fn validated_origin(origin: &str) -> anyhow::Result<HeaderValue> {
     let fail = || format!("{CORS_ALLOWED_ORIGINS_ENV_VAR}: невалидный origin {origin:?}");
-    url::Url::parse(origin).with_context(fail)?;
+    let url = url::Url::parse(origin).with_context(fail)?;
+    // Парсер всегда достраивает корневой путь «/»: для голого происхождения
+    // это он и есть; слэш на конце виден только в исходной строке.
+    let bare = (url.path() == "/" || url.path().is_empty())
+        && url.query().is_none()
+        && url.fragment().is_none();
+    if !bare || origin.ends_with('/') || !url.username().is_empty() || url.password().is_some() {
+        return Err(anyhow::anyhow!(
+            "{CORS_ALLOWED_ORIGINS_ENV_VAR}: элемент {origin:?} — не происхождение \
+             (требуется scheme://host[:port], без пути, query и userinfo)"
+        ));
+    }
     HeaderValue::from_str(origin).with_context(fail)
 }
 
@@ -328,6 +344,39 @@ mod tests {
         // Слой — значение must_use: привязываем, чтобы проверить сам факт
         // сборки дефолта без обращения к окружению.
         let _layer = cors_layer_for(None).expect("дефолтный разрешительный слой строится");
+    }
+
+    /// Элемент белого списка обязан быть голым происхождением
+    /// scheme://host[:port]: записи с путём, query, fragment и userinfo
+    /// Url::parse пропускает, но с Origin браузера они никогда не
+    /// совпадут и молча отрезали бы читателя (ревью #54, P2).
+    #[test]
+    fn validated_origin_requires_bare_origin() {
+        // Валидные: хост и хост с нестандартным портом (браузер включит
+        // его в Origin), не только https.
+        for valid in [
+            "https://audit.example",
+            "http://localhost:57992",
+            "https://audit.example:8443",
+        ] {
+            validated_origin(valid).expect("голое происхождение проходит");
+        }
+
+        // Не-происхождения: Url::parse их пропускает — отклоняем строго.
+        for not_bare in [
+            "https://audit.example/x",
+            "https://audit.example/",
+            "https://user:pass@audit.example",
+            "https://user@audit.example",
+            "https://audit.example?trace=1",
+            "https://audit.example#frag",
+        ] {
+            let error = validated_origin(not_bare).expect_err("не-происхождение отклоняется");
+            assert!(
+                format!("{error:#}").contains("не происхождение"),
+                "диагностика называет причину: {error:#}"
+            );
+        }
     }
 
     #[test]
