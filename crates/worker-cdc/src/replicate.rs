@@ -145,6 +145,64 @@ pub(crate) async fn stream_session(
     }
 }
 
+/// Координаты и креды источника, разобранные из URL подключения.
+pub(crate) struct SourceEndpoint {
+    /// Хост источника.
+    pub(crate) host: String,
+    /// Порт источника.
+    pub(crate) port: u16,
+    /// Пользователь (percent-decoded).
+    pub(crate) user: String,
+    /// Пароль (percent-decoded), пустая строка — пароля в URL нет.
+    pub(crate) password: String,
+    /// Имя базы (percent-decoded).
+    pub(crate) database: String,
+}
+
+/// Разбирает URL источника в эндпоинт для подключения: user/password/имя
+/// базы декодируются из percent-encoding. Крейт `url` хранит компоненты
+/// закодированными как есть, а sqlx при разборе той же строки декодирует
+/// (`PgConnectOptions::from_str` → `percent_decode_str`): без декодирования
+/// репликационный тракт с паролем со спецсимволами (@, :, /, %) не проходит
+/// аутентификацию walsender, тогда как бутстрап по той же строке подключается
+/// (тикет #43). Для декодирования — крейт `percent-encoding`: каноничная
+/// зависимость самого `url`, уже присутствующая в дереве.
+/// Хост и порт не декодируются: `url` нормализует их сам (IDNA, число).
+pub(crate) fn endpoint_from_url(url: &str) -> Result<SourceEndpoint> {
+    let url = url::Url::parse(url).context("разбор URL источника")?;
+    let host = url
+        .host_str()
+        .context("в URL источника нет хоста")?
+        .to_owned();
+    let port = url.port_or_known_default().context("порт источника")?;
+    let user = if url.username().is_empty() {
+        "postgres".to_owned()
+    } else {
+        percent_decode(url.username(), "имени пользователя")?
+    };
+    let password = match url.password() {
+        Some(raw) => percent_decode(raw, "пароля")?,
+        None => String::new(),
+    };
+    let database = percent_decode(url.path().trim_start_matches('/'), "имени базы")?;
+    Ok(SourceEndpoint {
+        host,
+        port,
+        user,
+        password,
+        database,
+    })
+}
+
+/// Декодирует один percent-encoded компонент URL; невалидная UTF-8
+/// последовательность после декодирования — ошибка разбора источника.
+fn percent_decode(raw: &str, what: &str) -> Result<String> {
+    percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .map(|decoded| decoded.into_owned())
+        .with_context(|| format!("декодирование {what} из URL источника"))
+}
+
 /// Подключение к walsender источника: `START_REPLICATION … messages 'true'`.
 ///
 /// Обязательство спеки «отвечать на все keepalive с reply_requested и слать
@@ -161,29 +219,17 @@ pub(crate) async fn connect_replication(
     start_lsn: Lsn,
 ) -> Result<ReplicationClient> {
     let slot = record.slot();
-    let url = url::Url::parse(&record.url).context("разбор URL источника")?;
-    let host = url
-        .host_str()
-        .context("в URL источника нет хоста")?
-        .to_owned();
-    let port = url.port_or_known_default().context("порт источника")?;
-    let user = if url.username().is_empty() {
-        "postgres".to_owned()
-    } else {
-        url.username().to_owned()
-    };
-    let password = url.password().unwrap_or_default().to_owned();
-    let database = url.path().trim_start_matches('/').to_owned();
+    let endpoint = endpoint_from_url(&record.url)?;
 
     let mut repl_config = ReplicationConfig::new(
-        host,
-        user,
-        password,
-        database,
+        endpoint.host,
+        endpoint.user,
+        endpoint.password,
+        endpoint.database,
         slot.clone(),
         record.publication(),
     )
-    .with_port(port)
+    .with_port(endpoint.port)
     .with_start_lsn(start_lsn);
     // Durable-позиция воркера: слот не подтверждается дальше чекпоинта.
     repl_config.ack_lsn = Some(start_lsn);
@@ -397,5 +443,36 @@ mod tests {
 
         let other = journal_row_fixture("client_b", "otherdb");
         assert_ne!(row.source, other.source);
+    }
+
+    /// Креды и имя базы декодируются из percent-encoding: пароль со
+    /// спецсимволами (@, :, /, %) и имя пользователя (`:` в позиции username
+    /// обязан кодироваться), закодированные в URL источника, обязаны дойти
+    /// до аутентификации walsender в исходном виде — так же, как их
+    /// видит sqlx-тракт при разборе той же строки (тикет #43).
+    #[test]
+    fn endpoint_decodes_percent_encoded_credentials() {
+        let endpoint = endpoint_from_url(
+            "postgresql://repl%3Aops:p%40ss%3Aw%2Frd%25@db.example:5433/clien%2Ft%20db",
+        )
+        .expect("разбор URL источника");
+        assert_eq!(endpoint.host, "db.example");
+        assert_eq!(endpoint.port, 5433);
+        assert_eq!(endpoint.user, "repl:ops");
+        assert_eq!(endpoint.password, "p@ss:w/rd%");
+        assert_eq!(endpoint.database, "clien/t db");
+    }
+
+    /// Без кредов в URL — дефолтный пользователь postgres и пустой пароль
+    /// (прежнее поведение репликационного тракта).
+    #[test]
+    fn endpoint_defaults_without_credentials() {
+        let endpoint = endpoint_from_url("postgresql://db.example:5433/clientdb")
+            .expect("разбор URL источника");
+        assert_eq!(endpoint.host, "db.example");
+        assert_eq!(endpoint.port, 5433);
+        assert_eq!(endpoint.user, "postgres");
+        assert_eq!(endpoint.password, "");
+        assert_eq!(endpoint.database, "clientdb");
     }
 }

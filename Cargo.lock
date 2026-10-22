@@ -2674,6 +2674,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "config",
+ "percent-encoding",
  "pgoutput",
  "pgwire-replication",
  "serde",
