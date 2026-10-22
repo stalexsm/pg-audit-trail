@@ -1,0 +1,64 @@
+# Конфиг гейта supply-chain cargo-deny: advisories (уязвимости RustSec),
+# bans (запреты и дубликаты крейтов), licenses (белый список лицензий).
+# Локальная проверка: cargo deny check advisories bans licenses
+# Схема: https://embarkstudios.github.io/cargo-deny/checks/cfg.html
+
+[graph]
+# Цели не ограничиваем: гейт смотрит весь граф из Cargo.lock, включая
+# platform-зависимые крейты под любую ОС.
+
+[advisories]
+version = 2
+# Уязвимости RustSec запрещены. Исключения — только с комментарием-обоснованием
+# и ссылкой на тикет с обновлением зависимости.
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    # webpki-roots: набор корневых сертификатов под CDLA-Permissive-2.0.
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+# Workspace-крейты наследуют лицензию репозитория (MIT, LICENSE в корне);
+# поля license в их манифестах нет, поэтому выражение уточняем явно.
+# license-files с точным хэшем — обязательная привязка к содержимому файла:
+# при изменении LICENSE хэш перестанет совпадать, крейты снова станут
+# unlicensed и гейт упадёт — тогда обновите и хэши, и выражение.
+# Хэш — XxHash32 по нормализованному тексту (алгоритм cargo-deny get_file_source).
+[[licenses.clarify]]
+crate = "api"
+expression = "MIT"
+license-files = [{ path = "../../LICENSE", hash = 0x5d3b380a }]
+
+[[licenses.clarify]]
+crate = "pgoutput"
+expression = "MIT"
+license-files = [{ path = "../../LICENSE", hash = 0x5d3b380a }]
+
+[[licenses.clarify]]
+crate = "worker-cdc"
+expression = "MIT"
+license-files = [{ path = "../../LICENSE", hash = 0x5d3b380a }]
+
+[bans]
+# Дубликаты версий — предупреждение: жёсткий запрет ломается на транзитивных
+# зависимостях третьих крейтов, которыми эта полоса не владеет.
+multiple-versions = "warn"
+# `*` в requirements — предупреждение: intra-workspace path-зависимости
+# (pgoutput без версии) cargo трактует как `*`, а манифесты крейтов —
+# вне этой полосы правок.
+wildcards = "warn"
+deny = []
+
+[output]
+feature-depth = 1

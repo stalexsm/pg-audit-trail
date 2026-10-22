@@ -6,6 +6,7 @@
 #   test    — все тесты workspace, включая живые интеграционные (два PostgreSQL
 #             поднимаются из compose.yaml: db1 :54399 и db-src :54398);
 #   docker  — сборка образа из Dockerfile (тот же target final, что идёт в compose);
+#   deny    — supply-chain: уязвимости RustSec, bans и licenses (конфиг — deny.toml);
 #   skylos  — Python: мёртвый код, секреты, уязвимости (конфиг — skylos.toml);
 #   semgrep — SAST по правилам p/default (Semgrep Community Edition, без токена).
 #
@@ -14,6 +15,9 @@
 #
 # Actions запинены на полные commit SHA (проверяется гейтом skylos, SKY-D292):
 # обновление — осознанная замена SHA с комментарием версии.
+#
+# У каждой джобы — timeout-minutes: верхний предел времени не даёт зависшему
+# шагу (например, живому тесту) съедать раннер до дефолтных 6 часов.
 
 name: CI
 
@@ -40,6 +44,7 @@ jobs:
   fmt:
     name: fmt
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -53,6 +58,7 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -67,6 +73,7 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -86,6 +93,7 @@ jobs:
   docker:
     name: docker
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -100,9 +108,24 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  deny:
+    # Supply-chain гейт: уязвимости RustSec (advisories), bans и licenses.
+    # Конфиг — deny.toml в корне репозитория, проверяется ровно он.
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories bans licenses
+
   skylos:
     name: skylos
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -126,6 +149,7 @@ jobs:
   semgrep:
     name: semgrep
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -144,7 +168,8 @@ jobs:
   gates:
     # Сводный гейт для branch protection: required status check «gates»
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, docker, skylos, semgrep]
+    timeout-minutes: 5
+    needs: [fmt, clippy, test, docker, deny, skylos, semgrep]
     if: always()
     steps:
       - name: Все гейты зелёные
