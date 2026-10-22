@@ -43,7 +43,11 @@ RUN --mount=type=cache,target=/app/target/ \
 # runtime dependencies for the application. This often uses a different base
 # image from the build stage where the necessary files are copied from the build
 # stage.
-FROM alpine:3.18 AS final
+# Alpine 3.24 — актуальная поддерживаемая ветка (alpinelinux.org/releases,
+# сверено 2026-10-22): поддержка с EOL 2028-06-01, ветка получает патчи
+# безопасности (текущий минор на дату сверки — 3.24.3). Прежняя база
+# alpine:3.18 завершила поддержку 2025-05-09 и перестала получать CVE-фиксы.
+FROM alpine:3.24 AS final
 
 # curl — healthcheck сервиса api
 RUN apk add --no-cache curl
