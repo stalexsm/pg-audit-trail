@@ -44,6 +44,18 @@ const _: () = assert!(CHANGE_ROW_PARAMS * MAX_ROWS_PER_STATEMENT <= MAX_STATEMEN
 /// линейно с номером попытки (200, 400, …).
 const RETRY_BASE_DELAY_MS: u64 = 200;
 
+/// Пауза перед повтором вставки: база — именованная константа
+/// `RETRY_BASE_DELAY_MS`, рост — линейный по номеру попытки. Отдельная
+/// чистая функция: формула паузы проверяется тестом, а не спрятана
+/// в цикле с обращением к БД (тикет #54).
+fn retry_delay(attempt: u32) -> Duration {
+    Duration::from_millis(RETRY_BASE_DELAY_MS * u64::from(attempt))
+}
+
+/// Предел попыток вставки одного батча: после неё — ошибка попытки
+/// источника (реконнект по backoff задачи источника).
+const MAX_ATTEMPTS: u32 = 3;
+
 /// Разделяемый пустой контекст: дефолт строк до первого MESSAGE — без
 /// аллокации на каждую строку (один Arc на все строки без MESSAGE).
 static EMPTY_CONTEXT: LazyLock<Arc<Value>> = LazyLock::new(|| Arc::new(json!({})));
@@ -331,7 +343,6 @@ pub async fn flush(
     batch_size: usize,
     token: &CancellationToken,
 ) -> FlushEnd {
-    const MAX_ATTEMPTS: u32 = 3;
     let mut attempt = 1;
     loop {
         // Детерминированная проверка до попытки: с уже отменённым токеном
@@ -349,9 +360,7 @@ pub async fn flush(
                 warn!(attempt, error = %e, "вставка батча не удалась, повторяем");
                 tokio::select! {
                     _ = token.cancelled() => return FlushEnd::Cancelled,
-                    _ = tokio::time::sleep(Duration::from_millis(
-                        RETRY_BASE_DELAY_MS * u64::from(attempt),
-                    )) => {}
+                    _ = tokio::time::sleep(retry_delay(attempt)) => {}
                 }
                 attempt += 1;
             }
@@ -549,6 +558,22 @@ mod tests {
         let long = "x".repeat(MAX_TRACE_ID_LEN + 10);
         let extracted = trace_id_from_payload(&json!({ "trace_id": long }));
         assert_eq!(extracted.expect("строка").len(), MAX_TRACE_ID_LEN);
+    }
+
+    #[test]
+    fn insert_retry_delay_grows_linearly_from_named_base() {
+        // База паузы ретраев вставки — именованная константа, рост —
+        // линейный по номеру попытки (тикет #54).
+        assert_eq!(retry_delay(1), Duration::from_millis(RETRY_BASE_DELAY_MS));
+        assert_eq!(
+            retry_delay(2),
+            Duration::from_millis(RETRY_BASE_DELAY_MS * 2)
+        );
+        assert_eq!(
+            retry_delay(MAX_ATTEMPTS),
+            Duration::from_millis(RETRY_BASE_DELAY_MS * u64::from(MAX_ATTEMPTS)),
+            "последняя незавершающая попытка тоже по формуле"
+        );
     }
 
     #[test]
