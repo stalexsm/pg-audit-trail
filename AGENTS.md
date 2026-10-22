@@ -60,8 +60,12 @@ cargo test --workspace
 
 - Любая работа — в новой ветке, созданной от актуального `main`; прямые коммиты в `main` запрещены. Имя ветки — `тип/краткое-описание` латиницей, по типу будущего коммита: `feat/enrich-response-body`, `fix/worker-reconnect`.
 - Conventional Commits с русским описанием: `feat:`, `fix:`, `doc:`, `build:`, `ci:`, `chore(deps):`.
-- `CHANGELOG.md` генерируется git-cliff по `cliff.toml` — не редактируй его вручную.
-- Версия задаётся один раз в `[workspace.package]`; релиз — тег вида `v0.3.0`.
+- `CHANGELOG.md` генерируется git-cliff по `cliff.toml` — не редактируй вручную. Основные команды:
+  - просмотр не вышедших изменений — `git-cliff --unreleased`;
+  - релизная секция поверх существующего файла — `git-cliff --unreleased --tag X.Y.Z --prepend CHANGELOG.md` (заголовок встанет с тегом до коммита самого тега); полный пересбор файла — `git-cliff -o CHANGELOG.md`;
+  - релизный коммит называй `chore(release): prepare for X.Y.Z` — `cliff.toml` исключает его из будущих генераций;
+  - следующая версия по коммитам считает сам git-cliff: `git-cliff --bumped-version` (печать) и `git-cliff --bump` (генерация с новой версией).
+- Версия задаётся один раз в `[workspace.package]`. Релиз: git-тег без префикса (`0.4.0`, как все исторические теги) на релизном коммите в `main` после мерджа PR — не в ветке; GitHub Release создаётся на этот тег с именем `vX.Y.Z`.
 
 ## Agent skills
 

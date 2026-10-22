@@ -1,6 +1,23 @@
 # Waltrail — журнал аудита изменений PostgreSQL
 
-## Локальная разработка
+[![CI](https://github.com/stalexsm/waltrail/actions/workflows/ci.yml/badge.svg)](https://github.com/stalexsm/waltrail/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+Журнал аудита изменений PostgreSQL на логической репликации. Один Rust-процесс `worker-cdc` читает pgoutput-поток из слота источника и пишет изменения в таблицу `changes` БД аудита; REST API раздаёт журнал с фильтрами и пагинацией. Kafka, Debezium, Redis и JVM-обвязка не нужны: весь тракт — один воркер, одна таблица, один канал контекста (ADR-0001).
+
+Контекст операции приложение передаёт вызовом `pg_logical_emit_message` в своей транзакции: ключ `trace_id` из payload попадает в одноимённую колонку журнала, остальной payload дословно — в колонку `context` всех изменений этой транзакции (ADR-0002, ADR-0004).
+
+## Возможности
+
+- Один тракт инжеста: слот логической репликации → `changes` (ADR-0001). Работает на PostgreSQL 14+; стенд и тесты — на PostgreSQL 17.
+- Изменения строк с полными образами «до/после»: INSERT, UPDATE, DELETE, TRUNCATE; переживает `ALTER TABLE` источника (кэш отношений), дочитывает неизменённые TOAST-значения.
+- MESSAGE — только канал контекста: строк журнала не создаёт, обогащает `context` и `trace_id` строк своей транзакции (ADR-0004).
+- Мультиисточность через реестр источников с REST-управлением (ADR-0005): подхват и удаление источников без перезапуска воркера, у клиента публикация и слот создаются сами.
+- Доставка at-least-once с дедупликацией по `(commit_lsn, event_index)`: чекпоинт в транзакции вставки, ack слота после коммита, продолжение с чекпоинта после сбоя.
+- REST API: список журнала с пагинацией, сортировкой и фильтрами (источник, `trace_id`, таблица, операция, время, вхождение в `context`), детальная строка, Swagger на `/swagger-ui`.
+- Рекурсивное маскирование образов и контекста по единому словарю (ADR-0006).
+
+## Быстрый старт
 
 ```bash
 cp env.example .env
@@ -23,13 +40,9 @@ Compose поднимает минимальный стек:
 
 Поддерживаемая версия СУБД — PostgreSQL 17: стенд и live-тесты выполняются на актуальном миноре ветки 17 (`postgres:17.11` на дату сверки 2026-10-22 — [релизы PostgreSQL](https://www.postgresql.org/docs/release/)); версии пересматриваются при выходе новых миноров или завершении поддержки ветки.
 
-Единственный тракт инжеста — слот логической репликации (ADR-0001): воркер `worker-cdc` читает pgoutput-поток источника и пишет журнал в таблицу `changes`. API читает журнал только из `changes`: `GET /api/changes` (список с пагинацией, сортировкой и фильтрами — источник, `trace_id`, таблица, операция, время, вхождение в `context`) и `GET /api/changes/{id}` (детальная); Swagger — на `/swagger-ui`. Строки журнала помечены ключом источника (`source`): пустая строка — источник неизвестен (строки до переезда на мультиисточность); уникальные констрейнты журнала включают ключ, поэтому LSN/txid разных серверов не коллидируют (ADR-0005).
+### Сквозной сценарий
 
-Реестр источников (ADR-0005) управляется через REST: `POST /api/sources` (регистрация — полный URL передаётся только здесь), `GET /api/sources` (список со статусами воркеров), `GET /api/sources/{name}`, `PATCH /api/sources/{name}` (только служебные таблицы, префикс MESSAGE и размер батча — URL неизменяем), `DELETE /api/sources/{name}` (помечает к удалению, `202`; исполнение — за воркером). Строка подключения хранится в реестре для воркера, но в ответах маскируется (тикет #38): видны схема и хост, креды, порт и имя базы скрыты (`postgresql://*****@db-client`) — анонимное чтение реестра не раскрывает креды. Воркер-супервизор опрашивает реестр и держит по задаче на каждый источник: зарегистрированный источник подхватывается без перезапуска — воркер сам создаёт у клиента публикацию `audit_<имя>` и слот `waltrail_<имя>`, помечает строки журнала ключом источника и пишет статус (подключен/ошибка, время последнего события) обратно в реестр.
-
-Удаление исполняется воркером: задача помеченного источника останавливается, у клиента дропаются слот и публикация, строка реестра удаляется; строки журнала удалённого источника остаются в `changes`. Клиент недоступен — воркер повторяет дроп с backoff, состояние застрявшего удаления видно в реестре (`worker_state=deleting`, текст ошибки в `last_error`) до успеха: строка реестра не снимается, пока слот не дропнут — брошенный слот не копит WAL.
-
-Сквозной сценарий «регистрация источника → эмит → журнал → REST-фильтр по trace_id»:
+Регистрация источника, изменение с контекстом, чтение журнала по `trace_id`:
 
 ```bash
 # Регистрируем db-src как источник журнала: воркер подхватит его без
@@ -59,7 +72,7 @@ curl 'http://localhost:8000/api/changes?trace_id=demo-1'
 curl 'http://localhost:8000/api/sources/demo'
 ```
 
-Воркер-супервизор применяет миграции и держит по задаче репликации на каждый источник реестра: подхват новых источников — без перезапуска, после остановки (Ctrl+C/SIGTERM) каждая задача возобновляет со своего чекпоинта. Настройки источников — в реестре (REST API, ADR-0005): строки подключения, служебные таблицы, префикс MESSAGE, размер батча; из окружения читаются только глобальные настройки — `CDC_RECONNECT_INITIAL_BACKOFF_MS`, `CDC_RECONNECT_MAX_BACKOFF_MS`, `CDC_TX_BUFFER_MAX_ROWS` (значения по умолчанию — в [`env.example`](env.example)).
+Подготовка источника для dev: достаточно `wal_level=logical` — публикация и слот создаются воркером автоматически при подхвате источника (регистрация — `POST /api/sources`, см. сквозной сценарий выше).
 
 > Слоты удерживают WAL источников: если воркер на dev-стенде больше не нужен, удалите источники через API (воркер дропнет слоты и публикации у клиентов) либо снесите слоты руками, чтобы WAL не копился:
 >
@@ -67,27 +80,297 @@ curl 'http://localhost:8000/api/sources/demo'
 > SELECT pg_drop_replication_slot('waltrail_demo');
 > ```
 
-Подготовка источника для dev: достаточно `wal_level=logical` — публикация и слот создаются воркером автоматически при подхвате источника (регистрация — `POST /api/sources`, см. сквозной сценарий выше).
+## Подключение клиента (PostgreSQL)
 
-### PoC-бенчмарк пропускной способности
+1. Включите логический WAL и перезапустите базу (полный restart: `wal_level` не применяется через reload):
 
-Генератор потока (200+ тыс. событий/сек узкими строками) и монитор стенда — в [`scripts/loadgen/`](scripts/loadgen); сводки по трём ступеням конвейера (walsender → intake → вставка) воркер пишет в лог каждые 10 с (цель `worker_cdc::metrics`):
+   ```SQL
+   ALTER SYSTEM SET wal_level = logical;
+   -- затем рестарт сервера, например: systemctl restart postgresql
+   ```
+
+2. Зарегистрируйте источник через API (`POST /api/sources`): воркер сам создаст у клиента публикацию `audit_<имя>` (FOR ALL TABLES) и слот `waltrail_<имя>` при подхвате. Если предпочитаете создать публикацию руками — воркер переиспользует существующую:
+
+   ```SQL
+   -- Публикация "audit_<имя>" для всех таблиц (обычно не нужна — создаётся воркером)
+   CREATE PUBLICATION audit_<имя> FOR ALL TABLES;
+
+   -- Или только для выбранных таблиц
+   CREATE PUBLICATION audit_<имя> FOR TABLE [table1], [table2];
+
+   -- Полная репликационная идентичность: в журнал попадают образы "до" (UPDATE/DELETE)
+   ALTER TABLE [table1] REPLICA IDENTITY FULL;
+   ALTER TABLE [table2] REPLICA IDENTITY FULL;
+
+   -- Чтобы включить отслеживание изменений данных для новой таблицы:
+   ALTER PUBLICATION audit_<имя> ADD TABLE [table3];
+   ALTER TABLE [table3] REPLICA IDENTITY FULL;
+
+   -- Чтобы остановить отслеживание изменений данных для таблицы:
+   ALTER PUBLICATION audit_<имя> DROP TABLE [table3];
+   ALTER TABLE [table3] REPLICA IDENTITY DEFAULT;
+   ```
+
+3. Контекст операции передаётся через `pg_logical_emit_message` в собственной транзакции клиента (ADR-0004): ключ `trace_id` верхнего уровня payload становится колонкой журнала, а весь payload — контекстом всех изменений этой транзакции. MESSAGE строк журнала не создаёт: единственное содержимое журнала — изменения строк, событие без изменений строк в него не попадает (журнал событий приложение ведёт само):
+
+   ```SQL
+   BEGIN;
+   UPDATE orders SET status = 'paid' WHERE id = 42;
+   SELECT pg_logical_emit_message(
+       true,
+       '_audit',
+       '{"trace_id":"op-123","user":"alice","app":"my-app"}'
+   );
+   COMMIT;
+   ```
+
+4. Контекст из приложения — готовые сниппеты. Общий контракт (ADR-0002): payload — произвольный JSON, ключ `trace_id` верхнего уровня воркер копирует в одноимённую колонку журнала, остальное дословно уходит в `context`; префикс MESSAGE — настройка источника в реестре (по умолчанию `_audit`). Оба сниппета держат MESSAGE и изменения в одной транзакции.
+
+   TypeScript (`npm install pg`, драйвер [node-postgres](https://node-postgres.com/)):
+
+   ```TypeScript
+   import { Pool, type PoolClient } from "pg";
+
+   const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+   // Контекст операции и изменения — одна транзакция (ADR-0004):
+   // MESSAGE обогащает context и trace_id строк именно этой транзакции.
+   async function withAuditContext<T>(
+     traceId: string,
+     context: Record<string, unknown>,
+     work: (tx: PoolClient) => Promise<T>,
+   ): Promise<T> {
+     const tx = await pool.connect();
+     try {
+       await tx.query("BEGIN");
+       await tx.query("SELECT pg_logical_emit_message(true, '_audit', $1)", [
+         JSON.stringify({ trace_id: traceId, ...context }),
+       ]);
+       const result = await work(tx);
+       await tx.query("COMMIT");
+       return result;
+     } catch (error) {
+       await tx.query("ROLLBACK");
+       throw error;
+     } finally {
+       tx.release();
+     }
+   }
+
+   // Использование: "op-123" — в колонку trace_id журнала, остальное — в context.
+   // main-обёртка — чтобы сниппет работал и в CJS-, и в ESM-проекте.
+   async function main() {
+     await withAuditContext("op-123", { user: "alice", app: "my-app" }, (tx) =>
+       tx.query("UPDATE orders SET status = 'paid' WHERE id = 42"),
+     );
+     await pool.end();
+   }
+
+   main();
+   ```
+
+   Python (`pip install "psycopg[binary]"`, драйвер [psycopg 3](https://www.psycopg.org/psycopg3/)). Контекст операции живёт в `ContextVar` — веб-приложение ставит его в middleware один раз на запрос, а emit вызывается уже внутри транзакции с изменениями:
+
+   ```Python
+   import json
+   import os
+   from contextvars import ContextVar
+
+   import psycopg
+
+
+   class Audit:
+       """Контекст операции для журнала Waltrail (ADR-0004).
+
+       Контекст кладётся в ContextVar на время операции (например, в middleware),
+       emit вызывается внутри транзакции с изменениями: MESSAGE обогащает
+       context и trace_id строк именно этой транзакции.
+       """
+
+       _context_var: ContextVar[dict | None] = ContextVar("audit", default=None)
+
+       @staticmethod
+       def set_context(context: dict) -> None:
+           Audit._context_var.set(context)
+
+       @staticmethod
+       def emit(conn: psycopg.Connection) -> None:
+           """MESSAGE в текущей транзакции: trace_id — в колонку журнала, остальное — в context."""
+           context = Audit._context_var.get()
+           if context is None:
+               return
+           conn.execute(
+               # Префикс "_audit" — настройка источника в реестре Waltrail (дефолт "_audit")
+               "SELECT pg_logical_emit_message(true, '_audit', %s)",
+               (json.dumps(context),),
+           )
+
+
+   # Контекст текущей операции (в веб-приложении — в middleware, на каждый запрос)
+   Audit.set_context({"trace_id": "op-123", "user": "alice", "app": "my-app"})
+
+   # MESSAGE и изменения — одна транзакция
+   with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+       with conn.transaction():
+           Audit.emit(conn)
+           conn.execute("UPDATE orders SET status = 'paid' WHERE id = 42")
+   ```
+
+## Архитектура
+
+Единственный тракт инжеста — слот логической репликации (ADR-0001): воркер `worker-cdc` читает pgoutput-поток источника и пишет журнал в таблицу `changes`. API читает журнал только из `changes`: `GET /api/changes` (список с пагинацией, сортировкой и фильтрами — источник, `trace_id`, таблица, операция, время, вхождение в `context`) и `GET /api/changes/{id}` (детальная); Swagger — на `/swagger-ui`. Строки журнала помечены ключом источника (`source`): пустая строка — источник неизвестен (строки до переезда на мультиисточность); уникальные констрейнты журнала включают ключ, поэтому LSN/txid разных серверов не коллидируют (ADR-0005).
+
+Реестр источников (ADR-0005) управляется через REST:
+
+| Метод и путь | Действие |
+| ------------ | -------- |
+| `POST /api/sources` | Регистрация источника; полный URL передаётся только здесь |
+| `GET /api/sources` | Список источников со статусами воркеров |
+| `GET /api/sources/{name}` | Статус одного источника |
+| `PATCH /api/sources/{name}` | Служебные таблицы, префикс MESSAGE, размер батча; URL неизменяем |
+| `DELETE /api/sources/{name}` | Помечает к удалению (`202`); исполнение — за воркером |
+
+Примеры тел (Swagger со всеми полями — на `/swagger-ui`):
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -r scripts/loadgen/requirements.txt
-.venv/bin/python scripts/loadgen/generate.py --duration 60 --sessions 3 --rows-per-tx 10000 --payload-bytes 100
-.venv/bin/python scripts/loadgen/monitor.py --duration 120 > monitor.csv
+# Регистрация: обязательны name и url, остальное — со значениями по умолчанию
+curl -X POST http://localhost:8000/api/sources -H 'content-type: application/json' -d '{
+  "name": "client_a",
+  "url": "postgresql://user:pass@db-client:5432/postgres",
+  "ignore_tables": ["public.migrations"],
+  "message_prefix": "_audit",
+  "batch_size": 500
+}'
+
+# Правка настроек живого источника: опущенное поле остаётся без изменений;
+# поле url в теле — явный 400 (URL задаётся при регистрации и неизменяем)
+curl -X PATCH http://localhost:8000/api/sources/client_a -H 'content-type: application/json' -d '{
+  "batch_size": 100
+}'
+
+# Удаление: 202, воркер остановит задачу и дропнет у клиента слот и публикацию
+curl -X DELETE http://localhost:8000/api/sources/client_a
 ```
 
-Методика, числа и вердикт гейта — в [`docs/benchmarks/0007-poc-пропускная-способность.md`](docs/benchmarks/0007-poc-пропускная-способность.md) (вердикт продублирован в [ADR-0003](docs/adr/0003-гейт-производительности-no-go-вставка-в-changes.md)).
+Правила полей: `name` — латиница нижним регистром, цифры, подчёркивание, до 54 символов (слот `waltrail_<имя>` обязан помещаться в 63); `batch_size` — от 1 до 4095 (бюджет параметров протокола); `message_prefix` — до 63 символов. По умолчанию `ignore_tables` закрывает таблицы типовых миграторов (`alembic_version`, `schema_migrations`, `_sqlx_migrations`, `django_migrations`), `message_prefix` — `_audit`, `batch_size` — 500.
 
-**Внимание:** история миграций переписана под целевую схему журнала без мёртвых объектов (issue #11), а данные сервисов живут в именованных volumes. Если у вас остался старый volume — пересоздайте его:
+Ответ (201) уже маскирует строку подключения: видны схема и хост, креды, порт и имя базы скрыты одной маской:
 
-```bash
-docker compose down -v && docker compose up -d
+```JSON
+{
+  "name": "client_a",
+  "url": "postgresql://*****@db-client",
+  "ignore_tables": ["public.migrations"],
+  "message_prefix": "_audit",
+  "batch_size": 100,
+  "worker_state": "pending",
+  "last_event_at": null,
+  "last_error": null,
+  "deleted_at": null,
+  "created_at": "2026-10-22T18:38:49Z",
+  "updated_at": "2026-10-22T18:38:49Z"
+}
 ```
 
-> `down -v` удаляет локальные данные dev-стенда (в том числе volume БД аудита).
+Строка подключения хранится в реестре для воркера, но в ответах маскируется (тикет #38): видны схема и хост, креды, порт и имя базы скрыты (`postgresql://*****@db-client`) — анонимное чтение реестра не раскрывает креды. Воркер-супервизор опрашивает реестр и держит по задаче на каждый источник: зарегистрированный источник подхватывается без перезапуска — воркер сам создаёт у клиента публикацию `audit_<имя>` и слот `waltrail_<имя>`, помечает строки журнала ключом источника и пишет статус (подключен/ошибка, время последнего события) обратно в реестр.
+
+Удаление исполняется воркером: задача помеченного источника останавливается, у клиента дропаются слот и публикация, строка реестра удаляется; строки журнала удалённого источника остаются в `changes`. Клиент недоступен — воркер повторяет дроп с backoff, состояние застрявшего удаления видно в реестре (`worker_state=deleting`, текст ошибки в `last_error`) до успеха: строка реестра не снимается, пока слот не дропнут — брошенный слот не копит WAL.
+
+Воркер-супервизор применяет миграции и держит по задаче репликации на каждый источник реестра: подхват новых источников — без перезапуска, после остановки (Ctrl+C/SIGTERM) каждая задача возобновляет со своего чекпоинта. Настройки источников — в реестре (REST API, ADR-0005): строки подключения, служебные таблицы, префикс MESSAGE, размер батча; из окружения читаются только глобальные настройки — `CDC_RECONNECT_INITIAL_BACKOFF_MS`, `CDC_RECONNECT_MAX_BACKOFF_MS`, `CDC_TX_BUFFER_MAX_ROWS` (значения по умолчанию — в [`env.example`](env.example)).
+
+```mermaid
+flowchart LR
+
+Client[Client]
+
+subgraph M_Audit
+  W["Rust Worker CDC"]
+  A["Rust API"]
+  PG[(PostgreSQL<br>журнал)]
+end
+
+subgraph M_Any
+  PG_ANY[(PostgreSQL<br>клиента)]
+  A_Any["API"]
+end
+
+%% Client interaction
+Client --> A
+
+%% M_Audit internal
+A -->|Read| PG
+W -->|Write| PG
+
+%% M_Any internal
+A_Any <--> |Write/Read| PG_ANY
+
+%% Cross-system flows
+A_Any -.->|pg_logical_emit_message в транзакции| PG_ANY
+PG_ANY -->|CDC: слот логической репликации pgoutput| W
+```
+
+## Эксплуатация
+
+### Мониторинг слотов
+
+Каждый источник реестра держит у клиента слот `waltrail_<имя>`; слот удерживает WAL, пока воркер его не подтвердит. Отставание копит лаг, инвалидация слота — потеря изменений. Готовый запрос — по всем слотам Waltrail на источнике:
+
+```SQL
+SELECT slot_name,
+       active,
+       wal_status,
+       confirmed_flush_lsn,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS lag
+FROM pg_replication_slots
+WHERE slot_name LIKE 'waltrail\_%'
+ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn) DESC NULLS LAST;
+```
+
+- `lag` — объём WAL, который источник ещё не отдал в журнал; норма — около нуля, растёт при простое или лаге воркера.
+- `wal_status`: `reserved` — норма; `extended` — лаг превысил `max_slot_wal_keep_size`, WAL ещё держится; `unreserved` — WAL уже может быть скинут чекпойнтом, слот на пороге инвалидации; `lost` (а `confirmed_flush_lsn` — `NULL`) — слот инвалидирован: изменения с момента инвалидации не могут быть прочитаны.
+- `active = false` при живом воркере — задача источника не читает слот: статус и текст ошибки — в реестре (`GET /api/sources`).
+
+Минимум алертинга: `wal_status <> 'reserved'` и `lag` выше порога (см. ниже).
+
+### Порог max_slot_wal_keep_size
+
+Порог задаётся на источнике и ограничивает WAL, который слот вправе удерживать:
+
+```SQL
+-- Стартовая рекомендация 10 ГиБ: вместить лаг за допустимый простой воркера
+-- (деплой, отладка) с запасом; подберите по пиковой генерации WAL вашего
+-- клиента и по поведению wal_status в мониторинге выше
+ALTER SYSTEM SET max_slot_wal_keep_size = '10GB';
+SELECT pg_reload_conf();
+```
+
+Без лимита (дефолт `-1`) долгий простой воркера переполняет диск источника — это хуже ограниченной потери хвоста. При превышении порога `wal_status` проходит `extended` → `unreserved` → `lost`: слот инвалидирован, восстановление — по шагам ниже (воркер при этом повторяет попытки с backoff и держит статус `error` в реестре, остальные источники продолжают работать).
+
+### Runbook: переключение источника на новый узел (failover)
+
+Слот не переезжает на standby автоматически — поведение определяется версией PostgreSQL источника.
+
+**PostgreSQL 17+ (failover slots)** — слот синхронизируется на standby и переживает `promote`:
+
+1. На standby: `hot_standby = on`, `sync_replication_slots = on`; рекомендуется `hot_standby_feedback = on` ([дока PostgreSQL 17](https://www.postgresql.org/docs/17/logical-replication-failover.html)).
+2. Слот должен быть создан с `failover = true`. Воркер создаёт слот без этого флага, поэтому для защищаемых источников создайте слот до регистрации источника — воркер переиспользует существующий слот (именованные аргументы — чтобы не перепутать порядок булевых флагов):
+
+   ```SQL
+   SELECT * FROM pg_create_logical_replication_slot(
+       slot_name => 'waltrail_<имя>',
+       plugin => 'pgoutput',
+       failover => true
+   );
+   ```
+
+3. После `promote` слот уже на новом primary: воркер переподключится по неизменному DSN (VIP/балансировщик) и продолжит с `confirmed_flush_lsn` слота — без потерь.
+
+**PostgreSQL < 17 (и слоты без `failover = true`)** — слот на новом primary отсутствует:
+
+- воркер восстановится сам: очередная попытка задачи обнаружит отсутствие слота и создаст новый с текущей позиции WAL — непрочитанный хвост (от последнего подтверждения до переключения) в журнал не попадёт;
+- плановое переключение без потерь: дождитесь `lag ≈ 0` в мониторинге выше, остановите запись клиентов, переключайте — хвоста не будет.
+
+Если при переключении сменился хост в строке подключения (не VIP): URL источника неизменяем (ADR-0005) — удалите источник (`DELETE /api/sources/<имя>`; воркер дропнет у клиента слот и публикацию по старому URL, строки журнала останутся в `changes`) и зарегистрируйте заново с тем же именем и новым URL — новый слот стартует с текущей позиции, непрочитанный хвост в журнал не попадает. Если старый узел окончательно недоступен и дроп исполнить нельзя, источник останется в `worker_state=deleting` — строка реестра не снимается, пока слот не дропнут (см. [Архитектура](#архитектура)).
 
 ## Безопасность
 
@@ -129,76 +412,31 @@ docker compose down -v && docker compose up -d
 
    Строки журнала, прочитанные старой версией до переезда, остаются в `changes` с пустым ключом источника (`source=""`).
 
-## Подключение клиента (PostgreSQL)
+## Разработка
 
-1. Включите логический WAL и перезапустите базу:
-```SQL
-    ALTER SYSTEM SET wal_level = logical;
+### PoC-бенчмарк пропускной способности
+
+Генератор потока (200+ тыс. событий/сек узкими строками) и монитор стенда — в [`scripts/loadgen/`](scripts/loadgen); сводки по трём ступеням конвейера (walsender → intake → вставка) воркер пишет в лог каждые 10 с (цель `worker_cdc::metrics`):
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r scripts/loadgen/requirements.txt
+.venv/bin/python scripts/loadgen/generate.py --duration 60 --sessions 3 --rows-per-tx 10000 --payload-bytes 100
+.venv/bin/python scripts/loadgen/monitor.py --duration 120 > monitor.csv
 ```
 
-__Обязательно нужно перезагрузить postgres!!!__
+Методика, числа и вердикт гейта — в [`docs/benchmarks/0007-poc-пропускная-способность.md`](docs/benchmarks/0007-poc-пропускная-способность.md) (вердикт продублирован в [ADR-0003](docs/adr/0003-гейт-производительности-no-go-вставка-в-changes.md)).
 
-2. Зарегистрируйте источник через API (`POST /api/sources`): воркер сам создаст у клиента публикацию `audit_<имя>` (FOR ALL TABLES) и слот `waltrail_<имя>` при подхвате. Если предпочитаете создать публикацию руками — воркер переиспользует существующую:
-```SQL
--- Публикация "audit_<имя>" для всех таблиц (обычно не нужна — создаётся воркером)
-CREATE PUBLICATION audit_<имя> FOR ALL TABLES;
+**Внимание:** история миграций переписана под целевую схему журнала без мёртвых объектов (issue #11), а данные сервисов живут в именованных volumes. Если у вас остался старый volume — пересоздайте его:
 
--- Или только для выбранных таблиц
-CREATE PUBLICATION audit_<имя> FOR TABLE [table1], [table2];
-
--- Полная репликационная идентичность: в журнал попадают образы "до" (UPDATE/DELETE)
-ALTER TABLE [table1] REPLICA IDENTITY FULL;
-ALTER TABLE [table2] REPLICA IDENTITY FULL;
-
--- Чтобы включить отслеживание изменений данных для новой таблицы:
-ALTER PUBLICATION audit_<имя> ADD TABLE [table3];
-ALTER TABLE [table3] REPLICA IDENTITY FULL;
-
--- Чтобы остановить отслеживание изменений данных для таблицы:
-ALTER PUBLICATION audit_<имя> DROP TABLE [table3];
-ALTER TABLE [table3] REPLICA IDENTITY DEFAULT;
+```bash
+docker compose down -v && docker compose up -d
 ```
 
-3. Контекст операции передаётся через `pg_logical_emit_message` в собственной транзакции клиента (ADR-0004): ключ `trace_id` верхнего уровня payload становится колонкой журнала, а весь payload — контекстом всех изменений этой транзакции. MESSAGE строк журнала не создаёт: единственное содержимое журнала — изменения строк, событие без изменений строк в него не попадает (журнал событий приложение ведёт само):
+> `down -v` удаляет локальные данные dev-стенда (в том числе volume БД аудита).
 
-```SQL
-BEGIN;
-UPDATE orders SET status = 'paid' WHERE id = 42;
-SELECT pg_logical_emit_message(
-    true,
-    '_audit',
-    '{"trace_id":"op-123","user":"alice","app":"my-app"}'
-);
-COMMIT;
-```
+### Документация
 
-```mermaid
-flowchart LR
-
-Client[Client]
-
-subgraph M_Audit
-  W["Rust Worker CDC"]
-  A["Rust API"]
-  PG[(PostgreSQL<br>журнал)]
-end
-
-subgraph M_Any
-  PG_ANY[(PostgreSQL<br>клиента)]
-  A_Any["API"]
-end
-
-%% Client interaction
-Client --> A
-
-%% M_Audit internal
-A -->|Read| PG
-W -->|Write| PG
-
-%% M_Any internal
-A_Any <--> |Write/Read| PG_ANY
-
-%% Cross-system flows
-A_Any -.->|pg_logical_emit_message в транзакции| PG_ANY
-PG_ANY -->|CDC: слот логической репликации pgoutput| W
-```
+- [GLOSSARY.md](GLOSSARY.md) — словарь терминов проекта.
+- [docs/adr/](docs/adr/) — архитектурные решения: [ADR-0001](docs/adr/0001-pgoutput-воркер-вместо-debezium-kafka-redis.md) (pgoutput-воркер), [ADR-0002](docs/adr/0002-одна-сущность-changes-trace_id-один-канал.md) (одна сущность `changes`, `trace_id`, один канал контекста), [ADR-0003](docs/adr/0003-гейт-производительности-no-go-вставка-в-changes.md) (гейт производительности), [ADR-0004](docs/adr/0004-журнал-только-изменения-message-контекст.md) (MESSAGE — только контекст), [ADR-0005](docs/adr/0005-мультиисточность-через-реестр-источников.md) (мультиисточность), [ADR-0006](docs/adr/0006-маскирование-образов-и-контекста-единый-словарь.md) (маскирование), [ADR-0007](docs/adr/0007-сетевая-изоляция-контура-реестра-источников.md) (сетевая изоляция).
+- [`env.example`](env.example) — переменные окружения с комментариями.
+- [CHANGELOG.md](CHANGELOG.md) — генерируется [git-cliff](https://git-cliff.org) по Conventional Commits.
