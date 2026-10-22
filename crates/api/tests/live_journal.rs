@@ -312,11 +312,16 @@ async fn filter_by_context_containment() {
 async fn detail_returns_full_row_and_masks_password() {
     let (pool, db_name, router) = spawn_env("detail").await;
 
-    let mut change = row("UPDATE", "accounts", json!({"app": "BORiY"}), at(14, 9));
+    let mut change = row(
+        "UPDATE",
+        "accounts",
+        json!({"app": "BORiY", "auth": {"token": "t-1"}}),
+        at(14, 9),
+    );
     change.primary_key = Some("id=7".to_string());
     change.trace_id = Some("op-c".to_string());
-    change.before = json!({"id": 7, "name": "old", "password": "s3cret"});
-    change.after = json!({"id": 7, "name": "new", "password": "n3w"});
+    change.before = json!({"id": 7, "name": "old", "password": "s3cret", "api_key": "k-0"});
+    change.after = json!({"id": 7, "name": "new", "password": "n3w", "api_key": "k-1"});
     insert_row(&pool, &change).await;
 
     let (status, body) = get_json(router.clone(), &format!("/api/changes/{}", change.id)).await;
@@ -328,18 +333,50 @@ async fn detail_returns_full_row_and_masks_password() {
     assert_eq!(body["operation"], "UPDATE");
     assert_eq!(body["primary_key"], "id=7");
     assert_eq!(body["trace_id"], "op-c");
-    // Пароль маскируется в обоих образах, остальные значения целы.
+    // Словарь чувствительных ключей (ADR-0006): пароль и синонимы
+    // маскируются в обоих образах, вложенный токен контекста — тоже;
+    // остальные значения целы.
     assert_eq!(
         body["before"],
-        json!({"id": 7, "name": "old", "password": "*****"})
+        json!({"id": 7, "name": "old", "password": "*****", "api_key": "*****"})
     );
     assert_eq!(
         body["after"],
-        json!({"id": 7, "name": "new", "password": "*****"})
+        json!({"id": 7, "name": "new", "password": "*****", "api_key": "*****"})
     );
-    assert_eq!(body["context"], json!({"app": "BORiY"}));
+    assert_eq!(
+        body["context"],
+        json!({"app": "BORiY", "auth": {"token": "*****"}})
+    );
     assert_eq!(body["created_at"], "2025-01-14T09:00:00Z");
     assert_eq!(body["committed_at"], "2025-01-14T09:00:00Z");
+
+    // Список маскирует ту же запись так же: сводка образов скрывает
+    // значения чувствительных колонок, контекст — рекурсивно.
+    let (status, body) = get_json(router.clone(), "/api/changes").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["rows"].as_array().expect("rows").len(), 1);
+    let listed = &body["rows"][0];
+    assert_eq!(listed["id"], json!(change.id));
+    for entry in listed["changes"].as_array().expect("сводка образов") {
+        let key = entry["key"].as_str().expect("имя колонки");
+        if matches!(key, "password" | "api_key") {
+            assert_eq!(entry["before"], "*****", "сводка: {key}.до");
+            assert_eq!(entry["after"], "*****", "сводка: {key}.после");
+        } else {
+            assert_ne!(entry["before"], "*****", "сводка: {key}.до цело");
+        }
+    }
+    assert_eq!(
+        listed["context"],
+        json!({"app": "BORiY", "auth": {"token": "*****"}})
+    );
+    for leaked in ["s3cret", "n3w", "k-0", "k-1", "t-1"] {
+        assert!(
+            !listed.to_string().contains(leaked),
+            "список утекает {leaked}"
+        );
+    }
 
     // Несуществующая запись — 404 с пояснением.
     let unknown = Uuid::new_v4();
