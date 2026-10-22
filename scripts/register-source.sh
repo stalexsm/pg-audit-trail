@@ -27,8 +27,15 @@ SOURCE_URL="${2:-${WALTRAIL_SOURCE_URL:-postgresql://postgres:postgres@db-src:54
 WAIT_ATTEMPTS=30
 WAIT_INTERVAL_SECS=2
 
+# Печатает шапку файла (строки-комментарии после шебанга) — это текст --help:
+# правки шапки не требуют правки этой функции (длина не зафиксирована).
 usage() {
-    sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    awk 'NR > 1 && !/^#/ { exit } NR > 1 { print substr($0, 3) }' "${BASH_SOURCE[0]}"
+}
+
+connection_lost() {
+    echo "Ошибка: соединение с API потеряно ($API_URL)" >&2
+    exit 1
 }
 
 # Печатает значение поля плоского JSON-объекта (пусто — поля нет или null).
@@ -89,6 +96,16 @@ check_existing() {
     return 1
 }
 
+# Тело регистрации: JSON собирает python3 — экранирование кавычек и слэшей
+# в имени и URL не зависит от их содержимого.
+json_body() {
+    python3 - "$SOURCE_NAME" "$SOURCE_URL" <<'PY'
+import json, sys
+
+print(json.dumps({"name": sys.argv[1], "url": sys.argv[2]}))
+PY
+}
+
 case "${1:-}" in
     -h | --help)
         usage
@@ -103,10 +120,7 @@ http_request GET "/api/sources/$SOURCE_NAME"
 case "$STATUS" in
     200) check_existing ;;
     404) ;;
-    0)
-        echo "Ошибка: соединение с API потеряно ($API_URL)" >&2
-        exit 1
-        ;;
+    0) connection_lost ;;
     *)
         echo "Ошибка: GET /api/sources/$SOURCE_NAME ответил $STATUS: $BODY" >&2
         exit 1
@@ -119,7 +133,7 @@ fi
 
 # Регистрация: 201 — успех; 400 с дубликатом имени — гонка с параллельным
 # регистратором, перепроверяем реестр.
-http_request POST /api/sources "{\"name\":\"$SOURCE_NAME\",\"url\":\"$SOURCE_URL\"}"
+http_request POST /api/sources "$(json_body)"
 case "$STATUS" in
     201)
         echo "Источник '$SOURCE_NAME' зарегистрирован: $SOURCE_URL"
@@ -135,10 +149,7 @@ case "$STATUS" in
             exit 1
         fi
         ;;
-    0)
-        echo "Ошибка: соединение с API потеряно ($API_URL)" >&2
-        exit 1
-        ;;
+    0) connection_lost ;;
     *)
         echo "Ошибка: POST /api/sources ответил $STATUS: $BODY" >&2
         exit 1

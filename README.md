@@ -34,7 +34,10 @@ Compose поднимает минимальный стек:
 #  -d '{"name":"demo","url":"postgresql://postgres:postgres@db-src:5432/postgres"}')
 scripts/register-source.sh
 
-# Демо-таблица на источнике (публикация FOR ALL TABLES подхватит её сама)
+# Демо-таблица на источнике (публикация FOR ALL TABLES подхватит её сама);
+# слот создаётся воркером при первом опросе реестра — после регистрации
+# дайте стенду пару секунд, иначе изменения между регистрацией и созданием
+# слота в журнал не попадут
 docker compose exec db-src psql -U postgres -c \
   "CREATE TABLE IF NOT EXISTS demo (id int PRIMARY KEY, note text)"
 
@@ -99,7 +102,7 @@ docker compose down -v && docker compose up -d
 3. Проверьте журнал: внесите тестовое изменение на клиенте и убедитесь, что оно попало в журнал с ключом источника (`worker_state=connected`, время последнего события — в `GET /api/sources/<имя>`):
 
    ```bash
-   curl 'http://localhost:8000/api/changes?source=demo&limit=5'
+   curl 'http://localhost:8000/api/changes?source=demo&per_page=5'
    curl 'http://localhost:8000/api/sources/demo'
    ```
 
