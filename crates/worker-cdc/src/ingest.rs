@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::QueryBuilder;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::Result;
@@ -37,6 +38,10 @@ const MAX_ROWS_PER_STATEMENT: usize = MAX_STATEMENT_PARAMS / CHANGE_ROW_PARAMS;
 
 // Инвариант бюджета: полный чанк обязан влезать в лимит statement.
 const _: () = assert!(CHANGE_ROW_PARAMS * MAX_ROWS_PER_STATEMENT <= MAX_STATEMENT_PARAMS);
+
+/// Базовая пауза между повторами вставки батча, миллисекунды: растёт
+/// линейно с номером попытки (200, 400, …).
+const RETRY_BASE_DELAY_MS: u64 = 200;
 
 /// Предел длины `primary_key` под колонку `primary_key` VARCHAR(255).
 ///
@@ -251,29 +256,60 @@ fn chunk_size(batch_size: usize) -> usize {
     batch_size.clamp(1, MAX_ROWS_PER_STATEMENT)
 }
 
+/// Чем закончилась вставка батча в журнал.
+pub(crate) enum FlushEnd {
+    /// Батч и чекпоинт закоммичены.
+    Committed,
+    /// Остановка пришла во время вставки или между повторами: попытка
+    /// прервана досрочно, недосохранённое доиграет replay слота
+    /// (дубли гасятся дедупликацией по `(commit_lsn, event_index)`).
+    Cancelled,
+    /// Вставка не удалась после всех попыток.
+    Failed(anyhow::Error),
+}
+
 /// Вставляет строки батчами (`push_values`) в одной транзакции с чекпоинтом.
 ///
 /// Дедупликация replay-дублей — `ON CONFLICT DO NOTHING` по уникальному
 /// ключу `(commit_lsn, event_index)`. Слот подтверждается только после
 /// коммита этой транзакции (вызывающий код делает `update_applied_lsn`).
+///
+/// Остановка отзывчивая: и сама попытка вставки (даже зажатая блокировкой
+/// или зависшей сетью), и пауза между повторами прерываются токеном
+/// (`FlushEnd::Cancelled`) — SIGTERM не ждёт ни БД, ни хвоста повторов.
 pub async fn flush(
     audit: &PgPool,
     rows: &[ChangeRow],
     slot: &str,
     commit_end_lsn: i64,
     batch_size: usize,
-) -> Result<()> {
+    token: &CancellationToken,
+) -> FlushEnd {
     const MAX_ATTEMPTS: u32 = 3;
     let mut attempt = 1;
     loop {
-        match flush_once(audit, rows, slot, commit_end_lsn, batch_size).await {
-            Ok(()) => return Ok(()),
+        // Детерминированная проверка до попытки: с уже отменённым токеном
+        // к БД не обращаемся вовсе.
+        if token.is_cancelled() {
+            return FlushEnd::Cancelled;
+        }
+        let once = tokio::select! {
+            _ = token.cancelled() => return FlushEnd::Cancelled,
+            once = flush_once(audit, rows, slot, commit_end_lsn, batch_size) => once,
+        };
+        match once {
+            Ok(()) => return FlushEnd::Committed,
             Err(e) if attempt < MAX_ATTEMPTS => {
                 warn!(attempt, error = %e, "вставка батча не удалась, повторяем");
-                tokio::time::sleep(Duration::from_millis(200 * u64::from(attempt))).await;
+                tokio::select! {
+                    _ = token.cancelled() => return FlushEnd::Cancelled,
+                    _ = tokio::time::sleep(Duration::from_millis(
+                        RETRY_BASE_DELAY_MS * u64::from(attempt),
+                    )) => {}
+                }
                 attempt += 1;
             }
-            Err(e) => return Err(e),
+            Err(e) => return FlushEnd::Failed(e),
         }
     }
 }
@@ -613,5 +649,28 @@ mod tests {
         let rows = buffer.take_rows();
         assert_eq!(rows[0].context, json!({}));
         assert_eq!(rows[0].trace_id, None);
+    }
+
+    /// Отмена до первой попытки: с уже отменённым токеном цикл вставки
+    /// не обращается к БД — пул ленивый и указывает на недоступный адрес,
+    /// любая попытка упёрлась бы в acquire_timeout. Остановка не ждёт
+    /// ни попыток, ни пауз повторов (тикет #46).
+    #[tokio::test]
+    async fn flush_with_cancelled_token_aborts_before_any_attempt() {
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let audit = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://invalid:invalid@127.0.0.1:1/none")
+            .expect("ленивый пул создаётся без подключения");
+
+        let started = std::time::Instant::now();
+        let end = flush(&audit, &[], "слот-отмены", 1, 10, &token).await;
+
+        assert!(matches!(end, FlushEnd::Cancelled));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "отменённый flush не должен обращаться к БД: {:?}",
+            started.elapsed()
+        );
     }
 }
