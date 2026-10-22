@@ -2,6 +2,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use axum_valid::Valid;
@@ -9,11 +10,11 @@ use sqlx::{PgPool, Pool, Postgres};
 use utoipa::OpenApi;
 use uuid::Uuid;
 
-use crate::AppResult;
 use crate::dto::{
     ChangeDetailDTO, ChangePageDTO, ChangeRowDTO, QChange, QSourceCreate, QSourcePatch, SourceDTO,
 };
 use crate::handlers as s;
+use crate::{AppError, AppResult};
 
 #[derive(OpenApi)]
 #[openapi(
@@ -53,6 +54,14 @@ pub fn api_router() -> Router<Pool<Postgres>> {
                 .patch(patch_source)
                 .delete(delete_source),
         )
+}
+
+/// Фолбэк роутера: маршрут не существует (404). Строится общим хелпером
+/// `AppError::not_found`, как и 404 швов API, — единый JSON-формат
+/// ответов 404 по всему приложению (тикет #54).
+pub async fn not_found_fallback() -> Response {
+    AppError::not_found("Данной страницы не существует. Проверьте правильность адреса...")
+        .into_response()
 }
 
 /// Метод для получения списка журнала: изменения строк источника.

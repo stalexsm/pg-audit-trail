@@ -1,4 +1,3 @@
-use anyhow::anyhow;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -59,10 +58,7 @@ pub async fn get_change_by_id(
 ) -> AppResult<ChangeDetailDTO> {
     match ChangeRepo::get_by_id(&pool, id).await? {
         Some(res) => Ok(res),
-        None => Err(AppError(
-            StatusCode::NOT_FOUND,
-            anyhow!("Данной записи не существует!"),
-        )),
+        None => Err(AppError::not_found("Данной записи не существует!")),
     }
 }
 

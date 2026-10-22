@@ -1,7 +1,7 @@
 use anyhow::Context;
-use api::routes::{ApiDoc, api_router};
+use api::routes::{ApiDoc, api_router, not_found_fallback};
 use api::startup::{connect_pool, database_url_from_env, port_from_env};
-use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::get};
+use axum::{Json, Router, routing::get};
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::signal;
@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
             .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
             .route("/health", get(health))
             .merge(api_router())
-            .fallback(handler_404)
+            .fallback(not_found_fallback)
             .layer(TraceLayer::new_for_http())
             .layer(CorsLayer::new().allow_origin(Any).allow_headers(Any))
             .layer(CompressionLayer::new())
@@ -102,12 +102,4 @@ pub struct Health {
 //Метод для проверки работоспособности API
 async fn health() -> AppResult<Json<Health>> {
     Ok(Json(Health { ok: true }))
-}
-
-/// Обработка не существующих запросов.
-async fn handler_404() -> impl IntoResponse {
-    (
-        StatusCode::NOT_FOUND,
-        "Данной страницы не существует. Проверьте правильность адреса...",
-    )
 }
