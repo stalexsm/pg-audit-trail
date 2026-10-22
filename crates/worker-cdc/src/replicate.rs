@@ -119,10 +119,11 @@ pub(crate) async fn stream_session(
                         &record.slot(),
                         end_lsn.as_u64() as i64,
                         record.batch_size,
+                        token,
                     )
                     .await
                     {
-                        Ok(()) => {
+                        ingest::FlushEnd::Committed => {
                             metrics::add_flush(flush_started.elapsed(), rows.len());
                             info!(source = %record.name, rows = rows.len(), end_lsn = %end_lsn, "транзакция источника сохранена в журнал");
                             // Статус источника: время последнего события
@@ -131,7 +132,16 @@ pub(crate) async fn stream_session(
                             // Ack слоту строго после коммита транзакции вставки.
                             client.update_applied_lsn(end_lsn);
                         }
-                        Err(e) => return SessionEnd::Reconnect(e.context("вставка транзакции в журнал")),
+                        ingest::FlushEnd::Cancelled => {
+                            info!(
+                                source = %record.name,
+                                "остановка во время вставки транзакции: недосохранённое доиграет replay слота"
+                            );
+                            return SessionEnd::Cancelled;
+                        }
+                        ingest::FlushEnd::Failed(e) => {
+                            return SessionEnd::Reconnect(e.context("вставка транзакции в журнал"));
+                        }
                     }
                 }
                 // KeepAlive: ответы и статусные апдейты транспорт берёт на себя.
@@ -214,6 +224,10 @@ fn percent_decode(raw: &str, what: &str) -> Result<String> {
 /// Подтверждаемая слоту позиция (`ack_lsn`) — точка старта сессии: слот
 /// не продвигается дальше durable-чекпоинта, пока вставки не закоммичены
 /// и не вызван `update_applied_lsn`.
+///
+/// Сам `connect` у клиента фоновый и возвращается сразу: реальное
+/// подключение (TCP, аутентификация, START_REPLICATION) ограничено
+/// таймаутом на `wait_started` у вызывающего кода (REPLICATION_START_TIMEOUT_SECS).
 pub(crate) async fn connect_replication(
     record: &SourceRecord,
     start_lsn: Lsn,

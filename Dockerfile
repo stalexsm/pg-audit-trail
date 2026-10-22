@@ -29,10 +29,12 @@ COPY migrations ./migrations
 # Кэш-маунты (target, git db, registry) дают инкрементальность между сборками.
 # Каталог migrations нужен на этапе сборки: макрос sqlx::migrate! встраивает
 # миграции в бинарник при компиляции.
+# --locked: образ собирается строго по закоммиченному Cargo.lock — supply-chain
+# гейт (см. deny.toml и CI) проверяет именно этот граф зависимостей.
 RUN --mount=type=cache,target=/app/target/ \
     --mount=type=cache,target=/usr/local/cargo/git/db \
     --mount=type=cache,target=/usr/local/cargo/registry/ \
-    cargo build --release && \
+    cargo build --release --locked && \
     cp ./target/release/$API_NAME /bin/ && \
     cp ./target/release/$WORKER_CDC_NAME /bin/
 

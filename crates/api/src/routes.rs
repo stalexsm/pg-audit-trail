@@ -66,7 +66,7 @@ pub fn api_router() -> Router<Pool<Postgres>> {
     responses(
         (status = 200, description = "Страница журнала", body = ChangePageDTO),
         (status = 400, description = "Некорректные параметры запроса"),
-        (status = 500, description = "Ошибка сервера")
+        (status = 500, description = "Ошибка сервера: нейтральное сообщение и correlation id (детали — только в логе, тикет #45)")
     )
 )]
 pub async fn get_list_changes(
@@ -89,7 +89,7 @@ pub async fn get_list_changes(
         (status = 200, description = "Детальная строки журнала", body = ChangeDetailDTO),
         (status = 400, description = "Некорректные параметры запроса"),
         (status = 404, description = "Записи не существует"),
-        (status = 500, description = "Ошибка сервера")
+        (status = 500, description = "Ошибка сервера: нейтральное сообщение и correlation id (детали — только в логе, тикет #45)")
     )
 )]
 pub async fn get_change_by_id(
@@ -111,7 +111,7 @@ pub async fn get_change_by_id(
     responses(
         (status = 201, description = "Источник зарегистрирован", body = SourceDTO),
         (status = 400, description = "Ошибка валидации: невалидное имя, URL или дубликат имени"),
-        (status = 500, description = "Ошибка сервера")
+        (status = 500, description = "Ошибка сервера: нейтральное сообщение и correlation id (детали — только в логе, тикет #45)")
     )
 )]
 pub async fn post_source(
@@ -130,7 +130,7 @@ pub async fn post_source(
     tag = "Sources",
     responses(
         (status = 200, description = "Источники реестра, по имени", body = Vec<SourceDTO>),
-        (status = 500, description = "Ошибка сервера")
+        (status = 500, description = "Ошибка сервера: нейтральное сообщение и correlation id (детали — только в логе, тикет #45)")
     )
 )]
 pub async fn get_list_sources(State(pool): State<PgPool>) -> AppResult<Json<Vec<SourceDTO>>> {
@@ -148,7 +148,7 @@ pub async fn get_list_sources(State(pool): State<PgPool>) -> AppResult<Json<Vec<
     responses(
         (status = 200, description = "Источник реестра", body = SourceDTO),
         (status = 404, description = "Источника не существует"),
-        (status = 500, description = "Ошибка сервера")
+        (status = 500, description = "Ошибка сервера: нейтральное сообщение и correlation id (детали — только в логе, тикет #45)")
     )
 )]
 pub async fn get_source_by_name(
@@ -173,7 +173,7 @@ pub async fn get_source_by_name(
         (status = 400, description = "Ошибка валидации тела"),
         (status = 404, description = "Источника не существует"),
         (status = 409, description = "Источник помечен к удалению"),
-        (status = 500, description = "Ошибка сервера")
+        (status = 500, description = "Ошибка сервера: нейтральное сообщение и correlation id (детали — только в логе, тикет #45)")
     )
 )]
 pub async fn patch_source(
@@ -196,7 +196,7 @@ pub async fn patch_source(
     responses(
         (status = 202, description = "Источник помечен к удалению"),
         (status = 404, description = "Источника не существует"),
-        (status = 500, description = "Ошибка сервера")
+        (status = 500, description = "Ошибка сервера: нейтральное сообщение и correlation id (детали — только в логе, тикет #45)")
     )
 )]
 pub async fn delete_source(
