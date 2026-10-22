@@ -12,9 +12,18 @@ use crate::{AppError, AppResult};
 /// Диапазон времени фильтра: (нижняя граница, верхняя граница).
 pub(crate) type TimeRange = (Option<DateTime<chrono::Utc>>, Option<DateTime<chrono::Utc>>);
 
+/// Верхняя граница номера страницы: глубже журнал не листается.
+/// Экстремальный, но синтаксически валидный номер больше не уходит в БД
+/// миллионными смещениями (смещение всё равно считается в i64, тикет #41);
+/// значение обязано совпадать с литералом `maximum` в `#[param(...)]`
+/// ниже: в Swagger-схему utoipa принимает только литерал.
+const MAX_PAGE: i32 = 1_000_000;
+
 /// Строка журнала: изменение одной строки источника (ADR-0004).
 ///
 /// `changes` — краткая сводка образов «до/после» по первым четырём ключам.
+/// Значения по чувствительным ключам словаря (ADR-0006) в сводке образов и
+/// контексте маскируются — так же, как в детальной строке.
 #[derive(Debug, Clone, Serialize, FromRow, ToSchema)]
 pub struct ChangeRowDTO {
     pub id: Uuid,
@@ -31,8 +40,10 @@ pub struct ChangeRowDTO {
         value_type = Vec<serde_json::Value>,
         example = "[{\"key\": \"name\", \"before\": \"John\", \"after\": \"Jane\"}]",
     )]
+    #[serde(serialize_with = "mask_sensitive_data")]
     pub changes: serde_json::Value,
     #[schema(value_type = serde_json::Value)]
+    #[serde(serialize_with = "mask_sensitive_data")]
     pub context: serde_json::Value,
     /// Когда запись была изменена в источнике; NULL — строки старого пайплайна.
     pub committed_at: Option<DateTime<chrono::Utc>>,
@@ -59,9 +70,9 @@ pub struct ChangePageDTO {
 #[derive(Deserialize, Debug, Validate, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct QChange {
-    /// Номер страницы, с единицы.
-    #[param(minimum = 1)]
-    #[validate(range(min = 1))]
+    /// Номер страницы, с единицы; выше верхней границы (`MAX_PAGE`) — 400.
+    #[param(minimum = 1, maximum = 1000000)]
+    #[validate(range(min = 1, max = MAX_PAGE))]
     #[serde(default = "default_page")]
     pub page: i32,
 
@@ -79,10 +90,14 @@ pub struct QChange {
     /// пустое значение параметра — без фильтра.
     pub source: Option<String>,
 
-    /// Имя таблицы, без учёта регистра.
+    /// Имя таблицы; параметр приводится к нижнему регистру (как
+    /// PostgreSQL хранит идентификаторы без кавычек) и сравнивается с
+    /// колонкой напрямую — фильтр остаётся sargable.
     pub table: Option<String>,
 
-    /// Операция: CREATE, UPDATE, DELETE или TRUNCATE, без учёта регистра.
+    /// Операция: CREATE, UPDATE, DELETE или TRUNCATE; параметр приводится
+    /// к верхнему регистру (словарь операций журнала) и сравнивается с
+    /// колонкой напрямую — фильтр остаётся sargable.
     pub operation: Option<String>,
 
     /// Диапазон времени сохранения в журнал: `2025-01-01..2025-12-31`;
@@ -184,7 +199,8 @@ fn validate_sortable(val: &str) -> Result<(), ValidationError> {
 
 /// Детальная строка журнала: полные образы «до/после» и контекст.
 ///
-/// Значения ключа `password` в образах маскируются.
+/// Значения по чувствительным ключам словаря (ADR-0006) в образах и
+/// контексте маскируются — так же, как в списке.
 #[derive(Debug, Clone, Serialize, FromRow, ToSchema)]
 pub struct ChangeDetailDTO {
     pub id: Uuid,
@@ -203,30 +219,75 @@ pub struct ChangeDetailDTO {
     #[serde(serialize_with = "mask_sensitive_data")]
     pub after: serde_json::Value,
     #[schema(value_type = serde_json::Value)]
+    #[serde(serialize_with = "mask_sensitive_data")]
     pub context: serde_json::Value,
     pub committed_at: Option<DateTime<chrono::Utc>>,
     pub created_at: DateTime<chrono::Utc>,
 }
 
-/// Маскирует чувствительные ключи верхнего уровня образа.
+/// Словарь чувствительных ключей (ADR-0006): значения по этим ключам в
+/// образах «до/после» и контексте маскируются во всех точках выдачи —
+/// и в списке, и в детальной строке. Сравнение ключей точное.
+const SENSITIVE_KEYS: [&str; 6] = ["password", "passwd", "pwd", "token", "secret", "api_key"];
+
+/// Маска чувствительного значения в образах и контексте.
+///
+/// Отдельна от `SOURCE_URL_MASK` (маска строки подключения реестра):
+/// домены разные — значения журнала и url источника, — смена одной
+/// маски не должна менять формат другой выдачи.
+const SENSITIVE_VALUE_MASK: &str = "*****";
+
+/// Ключ чувствителен по словарю (ADR-0006)?
+fn is_sensitive_key(key: &str) -> bool {
+    SENSITIVE_KEYS.contains(&key)
+}
+
+/// Единая точка маскирования журнала (ADR-0006): рекурсивно заменяет
+/// значения по чувствительным ключам словаря маской — в образах «до/после»,
+/// их краткой сводке списка и контексте приложения, заходя внутрь вложенных
+/// объектов и массивов на любую глубину.
+///
+/// Краткая сводка списка (`{"key": ..., "before": ..., "after": ...}`)
+/// обрабатывается как образ: чувствительное имя колонки в `key` скрывает
+/// значения обоих образов целиком — сами значения лежат в ней не под
+/// чувствительным ключом, а под `before`/`after`.
+fn mask_sensitive_values(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let hidden_summary = map
+                .get("key")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(is_sensitive_key);
+
+            map.iter()
+                .map(|(key, val)| {
+                    if is_sensitive_key(key)
+                        || (hidden_summary && matches!(key.as_str(), "before" | "after"))
+                    {
+                        (
+                            key.clone(),
+                            serde_json::Value::String(SENSITIVE_VALUE_MASK.to_owned()),
+                        )
+                    } else {
+                        (key.clone(), mask_sensitive_values(val))
+                    }
+                })
+                .collect()
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(mask_sensitive_values).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Сериализатор образов и контекста: пропускает значение через единую
+/// точку маскирования (ADR-0006).
 fn mask_sensitive_data<S>(value: &serde_json::Value, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
-    let mut masked_value = value.clone();
-
-    // Список чувствительных ключей
-    let sensitive_keys = ["password"];
-
-    if let serde_json::Value::Object(obj) = &mut masked_value {
-        for key in obj.keys().cloned().collect::<Vec<String>>() {
-            if sensitive_keys.contains(&key.as_str()) {
-                obj.insert(key, serde_json::Value::String("*****".to_string()));
-            }
-        }
-    }
-
-    masked_value.serialize(serializer)
+    mask_sensitive_values(value).serialize(serializer)
 }
 
 /// Значение номера страницы по умолчанию.
@@ -366,6 +427,10 @@ fn validate_slot_name(name: &str) -> Result<(), ValidationError> {
 }
 
 /// Маска чувствительной части строки подключения в ответах API.
+///
+/// Отдельна от `SENSITIVE_VALUE_MASK` (маска образов и контекста журнала):
+/// домены разные — url источника и значения журнала, — смена одной маски
+/// не должна менять формат другой выдачи.
 pub(crate) const SOURCE_URL_MASK: &str = "*****";
 
 /// Маскирует строку подключения источника для ответов API: видны только
@@ -683,5 +748,142 @@ mod tests {
         // функция не имеет права вернуть вход как есть.
         assert_eq!(mask_source_url("not-a-url"), "*****");
         assert_eq!(mask_source_url(""), "*****");
+    }
+
+    // === Единое маскирование образов и контекста (ADR-0006, тикет #39) ===
+
+    /// Сериализует DTO в JSON — так маскирование видит клиент API.
+    fn serialized<T: serde::Serialize>(value: &T) -> serde_json::Value {
+        serde_json::to_value(value).expect("сериализация DTO")
+    }
+
+    #[test]
+    fn mask_covers_password_synonyms() {
+        // Словарь из тикета #39, ключи перечислены литералами — независимо
+        // от константы в коде.
+        let masked = mask_sensitive_values(&serde_json::json!({
+            "login": "alice",
+            "password": "p-1",
+            "passwd": "p-2",
+            "pwd": "p-3",
+            "token": "t-1",
+            "secret": "s-1",
+            "api_key": "k-1",
+        }));
+
+        assert_eq!(masked["login"], "alice");
+        for key in ["password", "passwd", "pwd", "token", "secret", "api_key"] {
+            assert_eq!(masked[key], "*****", "ключ {key} обязан быть замаскирован");
+        }
+    }
+
+    #[test]
+    fn mask_recurses_into_nested_objects_and_arrays() {
+        let masked = mask_sensitive_values(&serde_json::json!({
+            "user": {"login": "alice", "auth": {"token": "t-1"}},
+            "items": [{"api_key": "k-1"}, {"note": "ок"}],
+            "deep": {"a": {"b": {"passwd": "p-1"}}},
+        }));
+
+        assert_eq!(masked["user"]["login"], "alice");
+        assert_eq!(masked["user"]["auth"]["token"], "*****");
+        assert_eq!(masked["items"][0]["api_key"], "*****");
+        assert_eq!(masked["items"][1], serde_json::json!({"note": "ок"}));
+        assert_eq!(masked["deep"]["a"]["b"]["passwd"], "*****");
+    }
+
+    #[test]
+    fn list_summary_hides_images_of_sensitive_key() {
+        // Краткая сводка списка: значения образа чувствительной колонки
+        // лежат под before/after — скрываются целиком; образы обычной
+        // колонки остаются видимыми.
+        let masked = mask_sensitive_values(&serde_json::json!([
+            {"key": "password", "before": "old", "after": "new"},
+            {"key": "name", "before": "John", "after": "Jane"},
+        ]));
+
+        assert_eq!(
+            masked[0],
+            serde_json::json!({"key": "password", "before": "*****", "after": "*****"})
+        );
+        assert_eq!(
+            masked[1],
+            serde_json::json!({"key": "name", "before": "John", "after": "Jane"})
+        );
+    }
+
+    /// Одна запись журнала, как её видят обе точки выдачи: список — через
+    /// `ChangeRowDTO`, деталь — через `ChangeDetailDTO`.
+    fn one_record() -> (ChangeRowDTO, ChangeDetailDTO) {
+        let image = serde_json::json!({
+            "login": "alice",
+            "password": "s3cret",
+            "profile": {"api_key": "k-1"},
+        });
+        let context = serde_json::json!({"user": {"token": "t-1"}, "note": "ок"});
+        let summary = serde_json::json!([
+            {"key": "password", "before": "old", "after": "s3cret"},
+        ]);
+
+        let id = Uuid::new_v4();
+
+        let row = ChangeRowDTO {
+            id,
+            source: String::new(),
+            database: "client_db".to_string(),
+            schema: "public".to_string(),
+            table: "accounts".to_string(),
+            operation: "UPDATE".to_string(),
+            primary_key: None,
+            trace_id: None,
+            changes: summary,
+            context: context.clone(),
+            committed_at: None,
+            created_at: chrono::Utc::now(),
+        };
+        let detail = ChangeDetailDTO {
+            id,
+            source: String::new(),
+            database: "client_db".to_string(),
+            schema: "public".to_string(),
+            table: "accounts".to_string(),
+            operation: "UPDATE".to_string(),
+            primary_key: None,
+            trace_id: None,
+            before: image.clone(),
+            after: image,
+            context,
+            committed_at: None,
+            created_at: chrono::Utc::now(),
+        };
+        (row, detail)
+    }
+
+    #[test]
+    fn list_and_detail_hide_sensitive_values_alike() {
+        let (row, detail) = one_record();
+        let (row, detail) = (serialized(&row), serialized(&detail));
+
+        // Ни одно чувствительное значение не видно ни в списке, ни в детали.
+        for leaked in ["s3cret", "k-1", "t-1", "old"] {
+            assert!(!row.to_string().contains(leaked), "список утекает {leaked}");
+            assert!(
+                !detail.to_string().contains(leaked),
+                "деталь утекает {leaked}"
+            );
+        }
+
+        // Одинаковый результат маскирования для одной записи: одна и та же
+        // маска у одного и того же значения в обеих точках выдачи.
+        assert_eq!(detail["before"]["password"], detail["after"]["password"]);
+        assert_eq!(
+            detail["before"]["profile"]["api_key"],
+            row["context"]["user"]["token"]
+        );
+        assert_eq!(row["changes"][0]["after"], detail["after"]["password"]);
+
+        // Нечувствительные значения целы.
+        assert_eq!(detail["before"]["login"], "alice");
+        assert_eq!(detail["context"]["note"], "ок");
     }
 }

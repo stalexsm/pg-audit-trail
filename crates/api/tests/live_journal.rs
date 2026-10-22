@@ -141,6 +141,41 @@ async fn invalid_query_params_give_400() {
     drop_db(&connect_admin(&audit_admin_url()).await, &db_name).await;
 }
 
+/// Верхняя граница номера страницы из валидации api/dto.rs (`MAX_PAGE`);
+/// в тесте повторяется литералом — шов проверяется снаружи, через HTTP.
+const MAX_PAGE_PARAM: i32 = 1_000_000;
+
+#[tokio::test]
+async fn huge_page_gives_empty_page_not_500() {
+    let (pool, db_name, router) = spawn_env("hugepage").await;
+
+    let mut early = row("CREATE", "orders", json!({}), at(16, 9));
+    early.after = json!({"id": 1});
+    insert_row(&pool, &early).await;
+
+    // Экстремальный, но валидный номер страницы: смещение считается в i64
+    // без переполнения, ответ — корректная пустая страница (200), а не 500.
+    let (status, body) = get_json(
+        router.clone(),
+        &format!("/api/changes?page={MAX_PAGE_PARAM}&per_page=200"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["page"], MAX_PAGE_PARAM);
+    assert_eq!(body["pages"], 1);
+    assert_eq!(body["rows"], json!([]));
+
+    // За верхней границей номера страницы — 400 валидации, без похода в БД.
+    let (status, body) = get_json(
+        router,
+        &format!("/api/changes?page={}&per_page=200", MAX_PAGE_PARAM + 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "тело: {body}");
+
+    drop_db(&connect_admin(&audit_admin_url()).await, &db_name).await;
+}
+
 #[tokio::test]
 async fn trace_id_returns_whole_operation() {
     let (pool, db_name, router) = spawn_env("trace").await;
@@ -309,14 +344,19 @@ async fn filter_by_context_containment() {
 }
 
 #[tokio::test]
-async fn detail_returns_full_row_and_masks_password() {
+async fn masks_sensitive_keys_recursively_in_list_and_detail() {
     let (pool, db_name, router) = spawn_env("detail").await;
 
-    let mut change = row("UPDATE", "accounts", json!({"app": "BORiY"}), at(14, 9));
+    let mut change = row(
+        "UPDATE",
+        "accounts",
+        json!({"app": "BORiY", "auth": {"token": "t-1"}}),
+        at(14, 9),
+    );
     change.primary_key = Some("id=7".to_string());
     change.trace_id = Some("op-c".to_string());
-    change.before = json!({"id": 7, "name": "old", "password": "s3cret"});
-    change.after = json!({"id": 7, "name": "new", "password": "n3w"});
+    change.before = json!({"id": 7, "name": "old", "password": "s3cret", "api_key": "k-0"});
+    change.after = json!({"id": 7, "name": "new", "password": "n3w", "api_key": "k-1"});
     insert_row(&pool, &change).await;
 
     let (status, body) = get_json(router.clone(), &format!("/api/changes/{}", change.id)).await;
@@ -328,18 +368,50 @@ async fn detail_returns_full_row_and_masks_password() {
     assert_eq!(body["operation"], "UPDATE");
     assert_eq!(body["primary_key"], "id=7");
     assert_eq!(body["trace_id"], "op-c");
-    // Пароль маскируется в обоих образах, остальные значения целы.
+    // Словарь чувствительных ключей (ADR-0006): пароль и синонимы
+    // маскируются в обоих образах, вложенный токен контекста — тоже;
+    // остальные значения целы.
     assert_eq!(
         body["before"],
-        json!({"id": 7, "name": "old", "password": "*****"})
+        json!({"id": 7, "name": "old", "password": "*****", "api_key": "*****"})
     );
     assert_eq!(
         body["after"],
-        json!({"id": 7, "name": "new", "password": "*****"})
+        json!({"id": 7, "name": "new", "password": "*****", "api_key": "*****"})
     );
-    assert_eq!(body["context"], json!({"app": "BORiY"}));
+    assert_eq!(
+        body["context"],
+        json!({"app": "BORiY", "auth": {"token": "*****"}})
+    );
     assert_eq!(body["created_at"], "2025-01-14T09:00:00Z");
     assert_eq!(body["committed_at"], "2025-01-14T09:00:00Z");
+
+    // Список маскирует ту же запись так же: сводка образов скрывает
+    // значения чувствительных колонок, контекст — рекурсивно.
+    let (status, body) = get_json(router.clone(), "/api/changes").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["rows"].as_array().expect("rows").len(), 1);
+    let listed = &body["rows"][0];
+    assert_eq!(listed["id"], json!(change.id));
+    for entry in listed["changes"].as_array().expect("сводка образов") {
+        let key = entry["key"].as_str().expect("имя колонки");
+        if matches!(key, "password" | "api_key") {
+            assert_eq!(entry["before"], "*****", "сводка: {key}.до");
+            assert_eq!(entry["after"], "*****", "сводка: {key}.после");
+        } else {
+            assert_ne!(entry["before"], "*****", "сводка: {key}.до цело");
+        }
+    }
+    assert_eq!(
+        listed["context"],
+        json!({"app": "BORiY", "auth": {"token": "*****"}})
+    );
+    for leaked in ["s3cret", "n3w", "k-0", "k-1", "t-1"] {
+        assert!(
+            !listed.to_string().contains(leaked),
+            "список утекает {leaked}"
+        );
+    }
 
     // Несуществующая запись — 404 с пояснением.
     let unknown = Uuid::new_v4();
