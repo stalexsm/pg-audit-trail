@@ -336,7 +336,9 @@ fn journal_row(
         database: boot.source_database.clone(),
         schema: relation.schema.clone(),
         table: relation.name.clone(),
-        primary_key,
+        // Ключ обрезается под ширину колонки (VARCHAR(255)) по границе
+        // символов: слишком длинный ключ уронил бы всю транзакцию вставки.
+        primary_key: ingest::truncate_primary_key(primary_key),
         operation,
         before,
         after,

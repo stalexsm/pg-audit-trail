@@ -38,6 +38,17 @@ const MAX_ROWS_PER_STATEMENT: usize = MAX_STATEMENT_PARAMS / CHANGE_ROW_PARAMS;
 // Инвариант бюджета: полный чанк обязан влезать в лимит statement.
 const _: () = assert!(CHANGE_ROW_PARAMS * MAX_ROWS_PER_STATEMENT <= MAX_STATEMENT_PARAMS);
 
+/// Предел длины `primary_key` под колонку `primary_key` VARCHAR(255).
+///
+/// Тот же подход, что и для `trace_id`: VARCHAR считает символы, а режем
+/// по байтам — строка из ≤255 байт всегда влезает в VARCHAR(255). Ключ
+/// формируется в pgoutput (составной — JSON-массивом), поэтому обрезается
+/// итоговое закодированное значение уже на шве вставки в журнал. Без
+/// обрезки вставка слишком длинного ключа уронила бы всю транзакцию
+/// вставки: транзакция-«отравитель» зацикливала бы реконнект и копила
+/// неподтверждённый WAL слота.
+pub const MAX_PRIMARY_KEY_LEN: usize = 255;
+
 /// Строка журнала, подготовленная к вставке в `changes`.
 #[derive(Debug, Clone)]
 pub struct ChangeRow {
@@ -167,6 +178,38 @@ pub fn is_ignored(ignore_tables: &[String], schema: &str, table: &str) -> bool {
     ignore_tables.iter().any(|entry| entry == &qualified)
 }
 
+/// Срез строки по байтовому пределу с отступом назад до границы символа:
+/// многобайтные символы не рвутся. Вызывающий код гарантирует, что строка
+/// длиннее предела.
+fn truncate_on_char_boundary(value: &str, max_bytes: usize) -> &str {
+    debug_assert!(value.len() > max_bytes);
+    let mut cutoff = max_bytes;
+    while !value.is_char_boundary(cutoff) {
+        cutoff -= 1;
+    }
+    &value[..cutoff]
+}
+
+/// Обрезает ключ строки под ширину колонки `primary_key` VARCHAR(255).
+///
+/// Обрезается итоговое закодированное значение: составной ключ,
+/// закодированный JSON-массивом, тоже может превысить границу колонки.
+/// Срез по границе символов (см. `truncate_on_char_boundary`); ключ в
+/// пределах лимита проходит без изменений, отсутствие ключа — не ошибка.
+pub fn truncate_primary_key(key: Option<String>) -> Option<String> {
+    key.map(|key| {
+        if key.len() <= MAX_PRIMARY_KEY_LEN {
+            key
+        } else {
+            warn!(
+                original_len = key.len(),
+                "primary_key длиннее {MAX_PRIMARY_KEY_LEN} байт — обрезан"
+            );
+            truncate_on_char_boundary(&key, MAX_PRIMARY_KEY_LEN).to_owned()
+        }
+    })
+}
+
 /// Извлекает `trace_id` верхнего уровня payload MESSAGE (ADR-0004).
 ///
 /// В колонку попадает только строковое значение ключа `trace_id`; сам
@@ -189,17 +232,11 @@ fn trace_id_from_payload(payload: &Value) -> Option<String> {
             if trace_id.len() <= MAX_TRACE_ID_LEN {
                 Some(trace_id.to_owned())
             } else {
-                // Срез по границе символов: отступаем от байтового предела
-                // назад, чтобы не рвать многобайтные символы.
-                let mut cutoff = MAX_TRACE_ID_LEN;
-                while !trace_id.is_char_boundary(cutoff) {
-                    cutoff -= 1;
-                }
                 warn!(
                     original_len = trace_id.len(),
                     "trace_id длиннее {MAX_TRACE_ID_LEN} байт — обрезан"
                 );
-                Some(trace_id[..cutoff].to_owned())
+                Some(truncate_on_char_boundary(trace_id, MAX_TRACE_ID_LEN).to_owned())
             }
         }
     }
@@ -449,6 +486,48 @@ mod tests {
         let extracted = trace_id_from_payload(&json!({ "trace_id": long })).expect("строка");
         assert!(extracted.len() <= MAX_TRACE_ID_LEN);
         assert!(extracted.chars().all(|c| c == 'ж'));
+    }
+
+    #[test]
+    fn primary_key_is_truncated_to_column_width() {
+        let long = "k".repeat(MAX_PRIMARY_KEY_LEN + 10);
+        let truncated = truncate_primary_key(Some(long)).expect("строка");
+        assert_eq!(truncated.len(), MAX_PRIMARY_KEY_LEN);
+    }
+
+    #[test]
+    fn multibyte_primary_key_is_truncated_on_char_boundary() {
+        // «ключ-» — 9 байт: байтовый предел 255 попадает в середину символа.
+        let long = "ключ-".repeat(60);
+        let truncated = truncate_primary_key(Some(long)).expect("строка");
+        assert!(truncated.len() <= MAX_PRIMARY_KEY_LEN);
+        assert!(truncated.chars().all(|c| "ключ-".contains(c)));
+        assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[test]
+    fn composite_key_encoded_as_json_is_truncated_as_whole_value() {
+        // Составной ключ кодируется JSON-массивом строк (pgoutput:
+        // key_string): компоненты по отдельности короткие, итоговое
+        // закодированное значение — длиннее предела. Обрезается значение
+        // целиком: закрывающая кавычка и скобка JSON не сохраняются.
+        let encoded = json!(["a".repeat(200), "b".repeat(200)]).to_string();
+        assert!(encoded.len() > MAX_PRIMARY_KEY_LEN);
+        let truncated = truncate_primary_key(Some(encoded)).expect("строка");
+        let a = "a".repeat(200);
+        let b = "b".repeat(50);
+        assert_eq!(truncated, format!("[\"{a}\",\"{b}"));
+    }
+
+    #[test]
+    fn primary_key_within_limit_passes_through_unchanged() {
+        assert_eq!(truncate_primary_key(None), None);
+        assert_eq!(truncate_primary_key(Some("7".into())).as_deref(), Some("7"));
+        let exact = "x".repeat(MAX_PRIMARY_KEY_LEN);
+        assert_eq!(
+            truncate_primary_key(Some(exact.clone())).as_deref(),
+            Some(exact.as_str())
+        );
     }
 
     #[test]
