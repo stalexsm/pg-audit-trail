@@ -45,3 +45,6 @@ pgwire-replication = "0.5.0"
 bytes = "1.12.1"
 config = { version = "0.15.27", default-features = false }
 url = "2.5.8"
+# Декодирование percent-encoding компонентов URL источника (крейт `url`
+# хранит компоненты закодированными; та же зависимость у него внутри).
+percent-encoding = "2.3.2"

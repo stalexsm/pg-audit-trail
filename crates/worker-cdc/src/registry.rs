@@ -80,8 +80,10 @@ pub(crate) async fn list_sources(audit: &PgPool) -> Result<Vec<SourceRecord>> {
         .into_iter()
         .map(
             |(name, url, ignore_tables, message_prefix, batch_size, deleted_at)| SourceRecord {
-                // Границы размера батча проверяет API (1..=10 000); защита
-                // от нуля/отрицательных — на случай правок реестра в обход API.
+                // Границы размера батча проверяет API (1..=4095 — бюджет
+                // параметров statement в ingest.rs); защита от нуля и
+                // отрицательных — на случай правок реестра в обход API,
+                // значения выше бюджета сжимает нарезка чанков вставки.
                 batch_size: usize::try_from(batch_size.max(1)).unwrap_or(1),
                 name,
                 url,

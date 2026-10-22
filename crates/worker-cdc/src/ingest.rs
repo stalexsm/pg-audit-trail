@@ -19,6 +19,36 @@ pub const TRACE_ID_KEY: &str = "trace_id";
 /// слишком длинного значения уронила бы всю транзакцию вставки.
 pub const MAX_TRACE_ID_LEN: usize = 255;
 
+/// Лимит протокола PostgreSQL на параметры одного extended-запроса: 65535
+/// на statement (UInt16 в wire-протоколе); превышение — ошибка протокола,
+/// соединение рвётся.
+const MAX_STATEMENT_PARAMS: usize = 65_535;
+
+/// Число bind-параметров на одну строку журнала в INSERT `changes`
+/// (`flush_once`: по колонке на каждое поле `ChangeRow`, включая LSN
+/// коммита, общий для всех строк чанка).
+const CHANGE_ROW_PARAMS: usize = 16;
+
+/// Максимум строк журнала в одном statement — бюджет параметров протокола
+/// в пересчёте на строку (65535 / 16 = 4095). Верхняя граница `batch_size`
+/// в API совпадает с этим пределом; чанки вставки не превышают его, даже
+/// если в реестре значение больше (правка в обход API, исторические записи).
+const MAX_ROWS_PER_STATEMENT: usize = MAX_STATEMENT_PARAMS / CHANGE_ROW_PARAMS;
+
+// Инвариант бюджета: полный чанк обязан влезать в лимит statement.
+const _: () = assert!(CHANGE_ROW_PARAMS * MAX_ROWS_PER_STATEMENT <= MAX_STATEMENT_PARAMS);
+
+/// Предел длины `primary_key` под колонку `primary_key` VARCHAR(255).
+///
+/// Тот же подход, что и для `trace_id`: VARCHAR считает символы, а режем
+/// по байтам — строка из ≤255 байт всегда влезает в VARCHAR(255). Ключ
+/// формируется в pgoutput (составной — JSON-массивом), поэтому обрезается
+/// итоговое закодированное значение уже на шве вставки в журнал. Без
+/// обрезки вставка слишком длинного ключа уронила бы всю транзакцию
+/// вставки: транзакция-«отравитель» зацикливала бы реконнект и копила
+/// неподтверждённый WAL слота.
+pub const MAX_PRIMARY_KEY_LEN: usize = 255;
+
 /// Строка журнала, подготовленная к вставке в `changes`.
 #[derive(Debug, Clone)]
 pub struct ChangeRow {
@@ -148,6 +178,38 @@ pub fn is_ignored(ignore_tables: &[String], schema: &str, table: &str) -> bool {
     ignore_tables.iter().any(|entry| entry == &qualified)
 }
 
+/// Срез строки по байтовому пределу с отступом назад до границы символа:
+/// многобайтные символы не рвутся. Вызывающий код гарантирует, что строка
+/// длиннее предела.
+fn truncate_on_char_boundary(value: &str, max_bytes: usize) -> &str {
+    debug_assert!(value.len() > max_bytes);
+    let mut cutoff = max_bytes;
+    while !value.is_char_boundary(cutoff) {
+        cutoff -= 1;
+    }
+    &value[..cutoff]
+}
+
+/// Обрезает ключ строки под ширину колонки `primary_key` VARCHAR(255).
+///
+/// Обрезается итоговое закодированное значение: составной ключ,
+/// закодированный JSON-массивом, тоже может превысить границу колонки.
+/// Срез по границе символов (см. `truncate_on_char_boundary`); ключ в
+/// пределах лимита проходит без изменений, отсутствие ключа — не ошибка.
+pub fn truncate_primary_key(key: Option<String>) -> Option<String> {
+    key.map(|key| {
+        if key.len() <= MAX_PRIMARY_KEY_LEN {
+            key
+        } else {
+            warn!(
+                original_len = key.len(),
+                "primary_key длиннее {MAX_PRIMARY_KEY_LEN} байт — обрезан"
+            );
+            truncate_on_char_boundary(&key, MAX_PRIMARY_KEY_LEN).to_owned()
+        }
+    })
+}
+
 /// Извлекает `trace_id` верхнего уровня payload MESSAGE (ADR-0004).
 ///
 /// В колонку попадает только строковое значение ключа `trace_id`; сам
@@ -170,20 +232,23 @@ fn trace_id_from_payload(payload: &Value) -> Option<String> {
             if trace_id.len() <= MAX_TRACE_ID_LEN {
                 Some(trace_id.to_owned())
             } else {
-                // Срез по границе символов: отступаем от байтового предела
-                // назад, чтобы не рвать многобайтные символы.
-                let mut cutoff = MAX_TRACE_ID_LEN;
-                while !trace_id.is_char_boundary(cutoff) {
-                    cutoff -= 1;
-                }
                 warn!(
                     original_len = trace_id.len(),
                     "trace_id длиннее {MAX_TRACE_ID_LEN} байт — обрезан"
                 );
-                Some(trace_id[..cutoff].to_owned())
+                Some(truncate_on_char_boundary(trace_id, MAX_TRACE_ID_LEN).to_owned())
             }
         }
     }
+}
+
+/// Размер чанка вставки: настройка источника, зажатая бюджетом параметров
+/// протокола. `batch_size` из реестра может превышать бюджет (правка реестра
+/// в обход API, исторические значения) — тогда чанк сжимается до лимита
+/// statement, иначе сервер отвергнет вставку и инжест зациклится на
+/// реконнекте, копя WAL без ack.
+fn chunk_size(batch_size: usize) -> usize {
+    batch_size.clamp(1, MAX_ROWS_PER_STATEMENT)
 }
 
 /// Вставляет строки батчами (`push_values`) в одной транзакции с чекпоинтом.
@@ -222,7 +287,7 @@ async fn flush_once(
 ) -> Result<()> {
     let mut tx = audit.begin().await?;
 
-    for chunk in rows.chunks(batch_size.max(1)) {
+    for chunk in rows.chunks(chunk_size(batch_size)) {
         let mut builder = QueryBuilder::new(
             "INSERT INTO changes \
              (source, database, schema, \"table\", primary_key, operation, before, after, context, \
@@ -353,12 +418,116 @@ mod tests {
     }
 
     #[test]
+    fn rows_per_statement_fits_protocol_parameter_budget() {
+        // Бюджет параметров протокола: 65535 на statement, 16 на строку
+        // журнала → максимум 4095 строк; инвариант полного чанка —
+        // compile-тайм проверка рядом с константами.
+        assert_eq!(MAX_STATEMENT_PARAMS, 65_535);
+        assert_eq!(CHANGE_ROW_PARAMS, 16);
+        assert_eq!(CHANGE_ROW_PARAMS * MAX_ROWS_PER_STATEMENT, 65_520);
+        assert_eq!(MAX_ROWS_PER_STATEMENT, 4_095);
+    }
+
+    #[test]
+    fn chunk_size_clamps_batch_to_statement_budget() {
+        assert_eq!(chunk_size(0), 1, "нулевой batch_size не ломает вставку");
+        assert_eq!(chunk_size(1), 1);
+        assert_eq!(chunk_size(500), 500, "обычная настройка не сжимается");
+        assert_eq!(
+            chunk_size(MAX_ROWS_PER_STATEMENT),
+            MAX_ROWS_PER_STATEMENT,
+            "верхняя граница бюджета исполняется одним statement"
+        );
+        assert_eq!(
+            chunk_size(10_000),
+            MAX_ROWS_PER_STATEMENT,
+            "batch_size выше бюджета (историческая граница API) сжимается"
+        );
+    }
+
+    #[test]
+    fn budget_chunking_covers_every_row_without_oversize_chunks() {
+        // Тест чанкования: 10 000 строк (историческая верхняя граница API)
+        // нарезаются на чанки в пределах бюджета, без потерь и дублей.
+        let rows = vec![journal_row_fixture("CREATE"); 10_000];
+        let lengths: Vec<usize> = rows
+            .chunks(chunk_size(10_000))
+            .map(<[ChangeRow]>::len)
+            .collect();
+
+        assert!(lengths.iter().all(|len| *len <= MAX_ROWS_PER_STATEMENT));
+        assert_eq!(
+            lengths.iter().sum::<usize>(),
+            rows.len(),
+            "строки не теряются"
+        );
+        assert_eq!(
+            lengths,
+            vec![
+                MAX_ROWS_PER_STATEMENT,
+                MAX_ROWS_PER_STATEMENT,
+                10_000 - 2 * MAX_ROWS_PER_STATEMENT,
+            ],
+            "нарезка: полные чанки по бюджету + хвост"
+        );
+
+        // Настройка источника меньше бюджета тоже соблюдается.
+        let lengths: Vec<usize> = rows
+            .chunks(chunk_size(500))
+            .map(<[ChangeRow]>::len)
+            .collect();
+        assert_eq!(lengths, vec![500; 20]);
+    }
+
+    #[test]
     fn multibyte_trace_id_is_truncated_on_char_boundary() {
         // «ж» — 2 байта: байтовый предел 255 попадает в середину символа.
         let long = "ж".repeat(130);
         let extracted = trace_id_from_payload(&json!({ "trace_id": long })).expect("строка");
         assert!(extracted.len() <= MAX_TRACE_ID_LEN);
         assert!(extracted.chars().all(|c| c == 'ж'));
+    }
+
+    #[test]
+    fn primary_key_is_truncated_to_column_width() {
+        let long = "k".repeat(MAX_PRIMARY_KEY_LEN + 10);
+        let truncated = truncate_primary_key(Some(long)).expect("строка");
+        assert_eq!(truncated.len(), MAX_PRIMARY_KEY_LEN);
+    }
+
+    #[test]
+    fn multibyte_primary_key_is_truncated_on_char_boundary() {
+        // «ключ-» — 9 байт: байтовый предел 255 попадает в середину символа.
+        let long = "ключ-".repeat(60);
+        let truncated = truncate_primary_key(Some(long)).expect("строка");
+        assert!(truncated.len() <= MAX_PRIMARY_KEY_LEN);
+        assert!(truncated.chars().all(|c| "ключ-".contains(c)));
+        assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[test]
+    fn composite_key_encoded_as_json_is_truncated_as_whole_value() {
+        // Составной ключ кодируется JSON-массивом строк (pgoutput:
+        // key_string): компоненты по отдельности короткие, итоговое
+        // закодированное значение — длиннее предела. Обрезается значение
+        // целиком: закрывающая кавычка и скобка JSON не сохраняются.
+        let encoded = json!(["a".repeat(200), "b".repeat(200)]).to_string();
+        assert!(encoded.len() > MAX_PRIMARY_KEY_LEN);
+        let truncated = truncate_primary_key(Some(encoded)).expect("строка");
+        let a = "a".repeat(200);
+        let b = "b".repeat(50);
+        assert_eq!(truncated, format!("[\"{a}\",\"{b}"));
+    }
+
+    #[test]
+    fn primary_key_within_limit_passes_through_unchanged() {
+        assert_eq!(truncate_primary_key(None), None);
+        assert_eq!(truncate_primary_key(Some("7".into())).as_deref(), Some("7"));
+        let exact = "x".repeat(MAX_PRIMARY_KEY_LEN);
+        assert_eq!(
+            truncate_primary_key(Some(exact.clone())).as_deref(),
+            Some(exact.as_str())
+        );
     }
 
     #[test]
