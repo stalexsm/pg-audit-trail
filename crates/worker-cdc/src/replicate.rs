@@ -37,7 +37,9 @@ pub(crate) enum SessionEnd {
 /// Одна сессия репликации источника: чтение потока до отмены, ошибки или
 /// закрытия сервером. Кэш отношений и буфер транзакции живут внутри сессии —
 /// новое подключение получает Relation заново, недоконченная транзакция
-/// переигрывается слотом от последнего чекпоинта.
+/// переигрывается слотом от последнего чекпоинта. Буфер ограничен потолком
+/// строк из конфигурации воркера (тикет #48).
+#[allow(clippy::too_many_arguments)] // все параметры — контекст одной сессии репликации
 pub(crate) async fn stream_session(
     client: &mut ReplicationClient,
     audit: &PgPool,
@@ -46,6 +48,7 @@ pub(crate) async fn stream_session(
     record: &SourceRecord,
     status: &StatusWriter<'_>,
     token: &CancellationToken,
+    tx_buffer_max_rows: usize,
 ) -> SessionEnd {
     let mut cache = RelationCache::new(boot.server_major);
     let mut buffer: Option<TransactionBuffer> = None;
@@ -58,7 +61,7 @@ pub(crate) async fn stream_session(
             }
             event = client.recv() => match event {
                 Ok(Some(ReplicationEvent::Begin { xid, .. })) => {
-                    buffer = Some(TransactionBuffer::new(xid));
+                    buffer = Some(TransactionBuffer::with_row_limit(xid, tx_buffer_max_rows));
                 }
                 Ok(Some(ReplicationEvent::XLogData { wal_start, data, .. })) => {
                     metrics::add_wire(data.len());
@@ -318,7 +321,7 @@ async fn handle_xlog(
                 wal_start,
                 event_index,
                 buf.xid,
-            ));
+            ))?;
             metrics::add_event();
         }
         DecodedEvent::Truncate(relation_oids) => {
@@ -341,7 +344,7 @@ async fn handle_xlog(
                     wal_start,
                     event_index,
                     buf.xid,
-                ));
+                ))?;
                 metrics::add_event();
             }
         }
@@ -403,7 +406,7 @@ fn journal_row(
         before,
         after,
         // Контекст последнего MESSAGE проставляется при коммите (ADR-0004).
-        context: json!({}),
+        context: ingest::empty_context(),
         committed_at: Utc::now(), // перезаписывается временем коммита
         queued_at: Utc::now(),
         transaction_id: xid,
@@ -437,7 +440,7 @@ mod tests {
             operation: "CREATE",
             before: json!({}),
             after: json!({}),
-            context: json!({}),
+            context: ingest::empty_context(),
             committed_at: Utc::now(),
             queued_at: Utc::now(),
             transaction_id: 1,

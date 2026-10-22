@@ -24,3 +24,9 @@ pub(crate) type Result<T, E = anyhow::Error> = core::result::Result<T, E>;
 
 pub use config::WorkerConfig;
 pub use supervisor::run;
+
+/// Тестовые швы библиотеки: только для живых тестов, в продукте не используются.
+#[doc(hidden)]
+pub mod test_hooks {
+    pub use crate::source_task::arm_task_panic;
+}
