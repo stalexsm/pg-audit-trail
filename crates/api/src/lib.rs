@@ -10,6 +10,7 @@ pub mod dto;
 pub mod handlers;
 pub mod repositories;
 pub mod routes;
+pub mod startup;
 
 pub type AppResult<T, E = AppError> = Result<T, E>;
 

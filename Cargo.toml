@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/api", "crates/pgoutput", "crates/worker-cdc"]
+members = ["crates/api", "crates/pgoutput", "crates/waltrail-log", "crates/worker-cdc"]
 
 resolver = "3"
 
@@ -33,6 +33,7 @@ print_stderr = "warn"
 
 [workspace.dependencies]
 pgoutput = { path = "crates/pgoutput" }
+waltrail-log = { path = "crates/waltrail-log" }
 
 anyhow = "1.0.104"
 chrono = { version = "0.4.45", features = ["serde"] }

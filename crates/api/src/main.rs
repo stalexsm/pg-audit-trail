@@ -1,8 +1,8 @@
+use anyhow::Context;
 use api::routes::{ApiDoc, api_router};
+use api::startup::{connect_pool, database_url_from_env, port_from_env};
 use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::get};
 use serde::Serialize;
-use sqlx::postgres::PgPoolOptions;
-use std::{env, path::PathBuf, time::Duration};
 use tokio::net::TcpListener;
 use tokio::signal;
 use tower_http::{
@@ -10,71 +10,37 @@ use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
 };
-
-use ::api::AppResult;
-use tracing::info;
-use tracing_appender::rolling;
-use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing::{error, info};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
+use ::api::AppResult;
+
+/// Хост, на котором слушает HTTP-сервер (в контейнере — все интерфейсы).
+const BIND_HOST: &str = "0.0.0.0";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Определение правильного пути к файлам
-    let base_dir = if cfg!(debug_assertions) {
-        // В режиме разработки используем корень проекта
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
-    } else {
-        // В продакшене используем директорию, где находится исполняемый файл
-        env::current_exe()?
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or(env::current_exe()?)
-    };
+    // Общая обвязка логирования workspace (waltrail-log): фильтр по RUST_LOG,
+    // файл с ротацией по дням и вывод в терминал. Guard неблокирующего
+    // писателя держим до конца работы процесса.
+    let _log_guard = waltrail_log::init("api.log").context("инициализация логирования")?;
 
-    let log_file = rolling::daily(base_dir.join("logs"), "api.log"); // Лог-файл, создается каждый день
-    let (non_blocking, _guard) = tracing_appender::non_blocking(log_file);
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // Строка подключения не включается в текст ошибки: пароль из DSN не
+    // должен уходить в логи контейнера при неудачном старте.
+    let pool = connect_pool(&database_url_from_env()?).await?;
 
-    // Настройка логирования
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(
-            fmt::layer()
-                .with_writer(non_blocking) // Пишем в файл
-                .with_ansi(false) // Без цветов
-                .with_level(true)
-                .with_target(false),
-        ) // Убираем target
-        .with(
-            fmt::layer()
-                .with_ansi(true) // Цветной вывод в терминал
-                .with_level(true)
-                .with_target(false),
-        )
-        .init();
-
-    // Получение env.DATABASE_URL
-    let url = env::var("DATABASE_URL").unwrap_or_else(|_| {
-        panic!("An error occurred while getting `DATABASE_URL` from ENV. Add a variable to the environment!")
-    });
-
-    let pool = PgPoolOptions::new()
-        .max_connections(20)
-        .acquire_timeout(Duration::from_secs(3))
-        .connect(&url)
+    let port = port_from_env()?;
+    let listener = TcpListener::bind((BIND_HOST, port))
         .await
-        .unwrap_or_else(|_| panic!("Failed to create Postgres connection pool! URL: {url}"));
-
-    let listener = TcpListener::bind("0.0.0.0:8000").await?;
+        .with_context(|| format!("не удалось занять порт {BIND_HOST}:{port}"))?;
     info!("listening on {}", listener.local_addr()?);
 
     // Запуск миграций
-    sqlx::migrate!("../../migrations").run(&pool).await?;
+    sqlx::migrate!("../../migrations")
+        .run(&pool)
+        .await
+        .context("не удалось применить миграции")?;
 
     axum::serve(
         listener,
@@ -92,24 +58,40 @@ async fn main() -> anyhow::Result<()> {
     // В контейнере процесс — PID 1 без init: без установленного обработчика
     // ядро не доставит SIGTERM, и `docker stop` ждал бы таймаута до SIGKILL.
     .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    .await
+    .context("работа HTTP-сервера")?;
 
     Ok(())
 }
 
 /// Остановка api по SIGTERM/SIGINT: сервер перестаёт принимать новые
 /// соединения и дождивается активных запросов (конвенция остановки по
-/// сигналам — как у worker-cdc).
+/// сигналам — как у worker-cdc). Ошибка регистрации обработчиков не
+/// паникует: логируем и ждём SIGKILL оркестратора — future намеренно
+/// не завершается, иначе `axum::serve` вернул бы `Ok(())`, main вышел
+/// бы с кодом 0 и сбой был бы замаскирован.
 async fn shutdown_signal() {
+    if let Err(err) = shutdown_signal_result().await {
+        error!(
+            error = %err,
+            "Не удалось зарегистрировать обработчики сигналов остановки — ждём SIGKILL оркестратора"
+        );
+        std::future::pending::<()>().await;
+    }
+}
+
+async fn shutdown_signal_result() -> anyhow::Result<()> {
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
-        .expect("Не удалось зарегистрировать обработчик SIGTERM");
+        .context("Не удалось зарегистрировать обработчик SIGTERM")?;
     let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
-        .expect("Не удалось зарегистрировать обработчик SIGINT");
+        .context("Не удалось зарегистрировать обработчик SIGINT")?;
 
     tokio::select! {
         _ = sigterm.recv() => info!("Получен SIGTERM, останавливаем api"),
         _ = sigint.recv() => info!("Получен SIGINT (Ctrl+C), останавливаем api"),
     }
+
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
