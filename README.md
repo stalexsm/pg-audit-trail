@@ -131,12 +131,11 @@ docker compose down -v && docker compose up -d
 
 ## Подключение клиента (PostgreSQL)
 
-1. Включите логический WAL и перезапустите базу:
+1. Включите логический WAL и перезапустите базу (полный restart: `wal_level` не применяется через reload):
 ```SQL
     ALTER SYSTEM SET wal_level = logical;
+    -- затем рестарт сервера, например: systemctl restart postgresql
 ```
-
-__Обязательно нужно перезагрузить postgres!!!__
 
 2. Зарегистрируйте источник через API (`POST /api/sources`): воркер сам создаст у клиента публикацию `audit_<имя>` (FOR ALL TABLES) и слот `waltrail_<имя>` при подхвате. Если предпочитаете создать публикацию руками — воркер переиспользует существующую:
 ```SQL
@@ -172,6 +171,98 @@ SELECT pg_logical_emit_message(
 COMMIT;
 ```
 
+4. Контекст из приложения — готовые сниппеты. Общий контракт (ADR-0002): payload — произвольный JSON, ключ `trace_id` верхнего уровня воркер копирует в одноимённую колонку журнала, остальное дословно уходит в `context`; префикс MESSAGE — настройка источника в реестре (по умолчанию `_audit`). Оба сниппета держат MESSAGE и изменения в одной транзакции:
+
+TypeScript (`npm install pg`, драйвер [node-postgres](https://node-postgres.com/)):
+
+```TypeScript
+import { Pool, type PoolClient } from "pg";
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+// Контекст операции и изменения — одна транзакция (ADR-0004):
+// MESSAGE обогащает context и trace_id строк именно этой транзакции.
+async function withAuditContext<T>(
+  traceId: string,
+  context: Record<string, unknown>,
+  work: (tx: PoolClient) => Promise<T>,
+): Promise<T> {
+  const tx = await pool.connect();
+  try {
+    await tx.query("BEGIN");
+    await tx.query("SELECT pg_logical_emit_message(true, '_audit', $1)", [
+      JSON.stringify({ trace_id: traceId, ...context }),
+    ]);
+    const result = await work(tx);
+    await tx.query("COMMIT");
+    return result;
+  } catch (error) {
+    await tx.query("ROLLBACK");
+    throw error;
+  } finally {
+    tx.release();
+  }
+}
+
+// Использование: "op-123" — в колонку trace_id журнала, остальное — в context.
+// main-обёртка — чтобы сниппет работал и в CJS-, и в ESM-проекте.
+async function main() {
+  await withAuditContext("op-123", { user: "alice", app: "my-app" }, (tx) =>
+    tx.query("UPDATE orders SET status = 'paid' WHERE id = 42"),
+  );
+  await pool.end();
+}
+
+main();
+```
+
+Python (`pip install "psycopg[binary]"`, драйвер [psycopg 3](https://www.psycopg.org/psycopg3/)). Контекст операции живёт в `ContextVar` — веб-приложение ставит его в middleware один раз на запрос, а emit вызывается уже внутри транзакции с изменениями:
+
+```Python
+import json
+import os
+from contextvars import ContextVar
+
+import psycopg
+
+
+class Audit:
+    """Контекст операции для журнала Waltrail (ADR-0004).
+
+    Контекст кладётся в ContextVar на время операции (например, в middleware),
+    emit вызывается внутри транзакции с изменениями: MESSAGE обогащает
+    context и trace_id строк именно этой транзакции.
+    """
+
+    _context_var: ContextVar[dict | None] = ContextVar("audit", default=None)
+
+    @staticmethod
+    def set_context(context: dict) -> None:
+        Audit._context_var.set(context)
+
+    @staticmethod
+    def emit(conn: psycopg.Connection) -> None:
+        """MESSAGE в текущей транзакции: trace_id — в колонку журнала, остальное — в context."""
+        context = Audit._context_var.get()
+        if context is None:
+            return
+        conn.execute(
+            # Префикс "_audit" — настройка источника в реестре Waltrail (дефолт "_audit")
+            "SELECT pg_logical_emit_message(true, '_audit', %s)",
+            (json.dumps(context),),
+        )
+
+
+# Контекст текущей операции (в веб-приложении — в middleware, на каждый запрос)
+Audit.set_context({"trace_id": "op-123", "user": "alice", "app": "my-app"})
+
+# MESSAGE и изменения — одна транзакция
+with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+    with conn.transaction():
+        Audit.emit(conn)
+        conn.execute("UPDATE orders SET status = 'paid' WHERE id = 42")
+```
+
 ```mermaid
 flowchart LR
 
@@ -202,3 +293,66 @@ A_Any <--> |Write/Read| PG_ANY
 A_Any -.->|pg_logical_emit_message в транзакции| PG_ANY
 PG_ANY -->|CDC: слот логической репликации pgoutput| W
 ```
+
+## Эксплуатация
+
+### Мониторинг слотов
+
+Каждый источник реестра держит у клиента слот `waltrail_<имя>`; слот удерживает WAL, пока воркер его не подтвердит. Отставание копит лаг, инвалидация слота — потеря изменений. Готовый запрос — по всем слотам Waltrail на источнике:
+
+```SQL
+SELECT slot_name,
+       active,
+       wal_status,
+       confirmed_flush_lsn,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS lag
+FROM pg_replication_slots
+WHERE slot_name LIKE 'waltrail\_%'
+ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn) DESC NULLS LAST;
+```
+
+- `lag` — объём WAL, который источник ещё не отдал в журнал; норма — около нуля, растёт при простое или лаге воркера.
+- `wal_status`: `reserved` — норма; `extended` — лаг превысил `max_slot_wal_keep_size`, WAL ещё держится; `unreserved` — WAL уже может быть скинут чекпойнтом, слот на пороге инвалидации; `lost` (а `confirmed_flush_lsn` — `NULL`) — слот инвалидирован: изменения с момента инвалидации не могут быть прочитаны.
+- `active = false` при живом воркере — задача источника не читает слот: статус и текст ошибки — в реестре (`GET /api/sources`).
+
+Минимум алертинга: `wal_status <> 'reserved'` и `lag` выше порога (см. ниже).
+
+### Порог max_slot_wal_keep_size
+
+Порог задаётся на источнике и ограничивает WAL, который слот вправе удерживать:
+
+```SQL
+-- Стартовая рекомендация 10 ГиБ: вместить лаг за допустимый простой воркера
+-- (деплой, отладка) с запасом; подберите по пиковой генерации WAL вашего
+-- клиента и по поведению wal_status в мониторинге выше
+ALTER SYSTEM SET max_slot_wal_keep_size = '10GB';
+SELECT pg_reload_conf();
+```
+
+Без лимита (дефолт `-1`) долгий простой воркера переполняет диск источника — это хуже ограниченной потери хвоста. При превышении порога `wal_status` проходит `extended` → `unreserved` → `lost`: слот инвалидирован, восстановление — по шагам ниже (воркер при этом повторяет попытки с backoff и держит статус `error` в реестре, остальные источники продолжают работать).
+
+### Runbook: переключение источника на новый узел (failover)
+
+Слот не переезжает на standby автоматически — поведение определяется версией PostgreSQL источника.
+
+**PostgreSQL 17+ (failover slots)** — слот синхронизируется на standby и переживает `promote`:
+
+1. На standby: `hot_standby = on`, `sync_replication_slots = on`; рекомендуется `hot_standby_feedback = on` ([дока PostgreSQL 17](https://www.postgresql.org/docs/17/logical-replication-failover.html)).
+2. Слот должен быть создан с `failover = true`. Воркер создаёт слот без этого флага, поэтому для защищаемых источников создайте слот до регистрации источника — воркер переиспользует существующий слот (именованные аргументы — чтобы не перепутать порядок булевых флагов):
+
+```SQL
+SELECT * FROM pg_create_logical_replication_slot(
+    slot_name => 'waltrail_<имя>',
+    plugin => 'pgoutput',
+    failover => true
+);
+```
+
+3. После `promote` слот уже на новом primary: воркер переподключится по неизменному DSN (VIP/балансировщик) и продолжит с `confirmed_flush_lsn` слота — без потерь.
+
+**PostgreSQL < 17 (и слоты без `failover = true`)** — слот на новом primary отсутствует:
+
+- воркер восстановится сам: очередная попытка задачи обнаружит отсутствие слота и создаст новый с текущей позиции WAL — непрочитанный хвост (от последнего подтверждения до переключения) в журнал не попадёт;
+- плановое переключение без потерь: дождитесь `lag ≈ 0` в мониторинге выше, остановите запись клиентов, переключайте — хвоста не будет.
+
+Если при переключении сменился хост в строке подключения (не VIP): URL источника неизменяем (ADR-0005) — удалите источник (`DELETE /api/sources/<имя>`; воркер дропнет у клиента слот и публикацию по старому URL, строки журнала останутся в `changes`) и зарегистрируйте заново с тем же именем и новым URL — новый слот стартует с текущей позиции, непрочитанный хвост в журнал не попадает. Если старый узел окончательно недоступен и дроп исполнить нельзя, источник останется в `worker_state=deleting` — строка реестра не снимается, пока слот не дропнут (см. раздел о реестре выше).
