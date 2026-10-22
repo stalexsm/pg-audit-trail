@@ -268,7 +268,11 @@ const MAX_BATCH_SIZE: i32 = 10_000;
 #[derive(Debug, Clone, Serialize, FromRow, ToSchema)]
 pub struct SourceDTO {
     pub name: String,
-    /// Строка подключения к базе клиента с кредами; неизменяема после создания.
+    /// Строка подключения в замаскированном виде: видны схема и хост;
+    /// креды, порт и имя базы скрыты одной маской. Полный url передаётся
+    /// только при регистрации и хранится в реестре для воркера, в ответах
+    /// API не раскрывается (тикет #38); неизменяем после создания.
+    #[schema(example = "postgresql://*****@db-client")]
     pub url: String,
     /// Служебные таблицы источника в виде `schema.table`, не попадающие в журнал.
     pub ignore_tables: Vec<String>,
@@ -359,6 +363,27 @@ fn validate_slot_name(name: &str) -> Result<(), ValidationError> {
             "имя источника: латиница нижним регистром, цифры, подчёркивание; не пусто и не длиннее 54 символов — слот waltrail_<имя> обязан помещаться в 63 символа",
         ))
     }
+}
+
+/// Маска чувствительной части строки подключения в ответах API.
+pub(crate) const SOURCE_URL_MASK: &str = "*****";
+
+/// Маскирует строку подключения источника для ответов API: видны только
+/// схема и хост; креды (пользователь и пароль), порт и имя базы скрыты
+/// одной маской (тикет #38). Разобрать строку не удалось — в ответ уходит
+/// голая маска: функция не имеет права вернуть вход как есть.
+pub(crate) fn mask_source_url(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .filter(|parsed| parsed.host_str().is_some_and(|host| !host.is_empty()))
+        .map(|parsed| {
+            format!(
+                "{}://{SOURCE_URL_MASK}@{}",
+                parsed.scheme(),
+                parsed.host_str().expect("хост проверен выше")
+            )
+        })
+        .unwrap_or_else(|| SOURCE_URL_MASK.to_owned())
 }
 
 /// Проверка строки подключения: схема postgres(q), непустой хост.
@@ -628,5 +653,35 @@ mod tests {
         .expect("правка с лишним url");
         assert_eq!(patch.batch_size, Some(100));
         assert!(patch.validate().is_ok());
+    }
+
+    #[test]
+    fn source_url_masks_credentials_port_and_database() {
+        // Видны схема и хост; креды, порт и имя базы скрыты одной маской —
+        // независимо от того, что из них было в исходной строке.
+        assert_eq!(
+            mask_source_url("postgresql://user:pass@db-client:5432/mydb"),
+            "postgresql://*****@db-client"
+        );
+        assert_eq!(
+            mask_source_url("postgres://user@db-client/db"),
+            "postgres://*****@db-client"
+        );
+        assert_eq!(
+            mask_source_url("postgresql://db-client"),
+            "postgresql://*****@db-client"
+        );
+        assert_eq!(
+            mask_source_url("postgresql://u:p@[::1]:5432/db"),
+            "postgresql://*****@[::1]"
+        );
+    }
+
+    #[test]
+    fn source_url_mask_never_leaks_unparseable_string() {
+        // Разобрать не удалось — в ответ уходит маска без деталей:
+        // функция не имеет права вернуть вход как есть.
+        assert_eq!(mask_source_url("not-a-url"), "*****");
+        assert_eq!(mask_source_url(""), "*****");
     }
 }

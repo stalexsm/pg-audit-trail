@@ -93,8 +93,10 @@ async fn post_creates_source_with_defaults() {
     assert_eq!(status, StatusCode::CREATED);
 
     // Ответ — реестровая строка целиком: настройки, статус воркера.
+    // URL в ответе маскирован (тикет #38): видны схема и хост; креды,
+    // порт и имя базы скрыты. Полный url — только в БД (для воркера).
     assert_eq!(body["name"], "client_a");
-    assert_eq!(body["url"], "postgresql://user:pass@host:5432/db");
+    assert_eq!(body["url"], "postgresql://*****@host");
     assert_eq!(
         body["ignore_tables"],
         json!([
@@ -117,8 +119,9 @@ async fn post_creates_source_with_defaults() {
     assert!(body["created_at"].is_string());
     assert!(body["updated_at"].is_string());
 
-    // Строка реестра реально в БД: ключ источника и статус по умолчанию.
-    let row = sqlx::query("SELECT worker_state, deleted_at FROM sources WHERE name = $1")
+    // Строка реестра реально в БД: ключ источника и статус по умолчанию;
+    // полный url сохранён как был — инжест не меняется (тикет #38).
+    let row = sqlx::query("SELECT worker_state, deleted_at, url FROM sources WHERE name = $1")
         .bind("client_a")
         .fetch_one(&pool)
         .await
@@ -127,6 +130,10 @@ async fn post_creates_source_with_defaults() {
     assert!(
         row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("deleted_at")
             .is_none()
+    );
+    assert_eq!(
+        row.get::<String, _>("url"),
+        "postgresql://user:pass@host:5432/db"
     );
 
     drop_db(&connect_admin(&audit_admin_url()).await, &db_name).await;
@@ -225,13 +232,18 @@ async fn list_and_one_return_registry_fields_with_worker_status() {
         );
         assert!(source["last_event_at"].is_null());
         assert!(source["last_error"].is_null());
+        // Ни один ответ реестра не раскрывает креды (тикет #38).
+        let url = source["url"].as_str().expect("url");
+        let name = source["name"].as_str().expect("name");
+        assert_eq!(url, format!("postgresql://*****@{name}-host"));
+        assert!(!url.contains("pass"), "пароль не виден в списке: {url}");
     }
 
     // Чтение одного.
     let (status, body) = get_json(router.clone(), "/api/sources/client_a").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["name"], "client_a");
-    assert_eq!(body["url"], "postgresql://user:pass@client_a-host:5432/db");
+    assert_eq!(body["url"], "postgresql://*****@client_a-host");
     assert_eq!(body["batch_size"], 500);
 
     // Неизвестное имя — 404.
@@ -309,7 +321,7 @@ async fn patch_updates_only_provided_fields_and_keeps_url() {
     assert_eq!(status, StatusCode::OK, "правка батча: {body}");
     assert_eq!(body["batch_size"], 100);
     assert_eq!(body["message_prefix"], "_audit");
-    assert_eq!(body["url"], "postgresql://user:pass@client_a-host:5432/db");
+    assert_eq!(body["url"], "postgresql://*****@client_a-host");
 
     // URL неизменяем (ADR-0005): поле в теле игнорируется, прочие поля
     // применяются; пустой список служебных таблиц — валидная очистка.
@@ -325,7 +337,7 @@ async fn patch_updates_only_provided_fields_and_keeps_url() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "правка настроек: {body}");
-    assert_eq!(body["url"], "postgresql://user:pass@client_a-host:5432/db");
+    assert_eq!(body["url"], "postgresql://*****@client_a-host");
     assert_eq!(body["ignore_tables"], json!(["public.kv_migrations"]));
     assert_eq!(body["message_prefix"], "_ctx");
     assert_eq!(body["batch_size"], 100, "опущенное поле осталось");

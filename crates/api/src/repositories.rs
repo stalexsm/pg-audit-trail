@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::{
     AppError, AppResult,
-    dto::{ChangeDetailDTO, ChangeRowDTO, SourceDTO, TimeRange},
+    dto::{ChangeDetailDTO, ChangeRowDTO, SourceDTO, TimeRange, mask_source_url},
 };
 
 /// Число ключей в краткой сводке образов строки списка.
@@ -254,7 +254,11 @@ fn insert_nested(obj: &mut Map<String, Value>, path: &[&str], value: Value) {
 // === Реестр источников (ADR-0005, тикет #28) ===
 
 /// Колонки реестра источников для SELECT/RETURNING — точно в порядке полей
-/// `SourceDTO`.
+/// `SourceDTO`. Инвариант безопасности (тикет #38): url в каждой строке,
+/// построенной из этой выборки, маскируется (`with_masked_url`) перед
+/// выдачей из репозитория — новая выборка обязана пройти через ту же
+/// маску, иначе утечёт полный url в ответ API (страховка — live-тесты
+/// реестра, проверяющие все ответы).
 const SOURCE_COLUMNS: &str = "name, url, ignore_tables, message_prefix, batch_size, \
     worker_state, last_event_at, last_error, deleted_at, created_at, updated_at";
 
@@ -275,6 +279,13 @@ pub(crate) struct SourcePatch {
     pub ignore_tables: Option<Vec<String>>,
     pub message_prefix: Option<String>,
     pub batch_size: Option<i32>,
+}
+
+/// Маскирует url в реестровой строке перед выдачей из репозитория:
+/// полный url не покидает слой данных и не уходит в ответы API (тикет #38).
+fn with_masked_url(mut source: SourceDTO) -> SourceDTO {
+    source.url = mask_source_url(&source.url);
+    source
 }
 
 /// Репозиторий реестра источников: единственная сущность — `sources`
@@ -301,6 +312,7 @@ impl SourceRepo {
             .bind(source.batch_size)
             .fetch_one(pool)
             .await
+            .map(with_masked_url)
             .map_err(map_create_error)
     }
 
@@ -313,7 +325,7 @@ impl SourceRepo {
 
         let rows = builder.build_query_as().fetch_all(pool).await?;
 
-        Ok(rows)
+        Ok(rows.into_iter().map(with_masked_url).collect())
     }
 
     /// Один источник по имени; `None` — источника нет (404).
@@ -326,7 +338,7 @@ impl SourceRepo {
 
         let found = builder.build_query_as().fetch_optional(pool).await?;
 
-        Ok(found)
+        Ok(found.map(with_masked_url))
     }
 
     /// Меняет только переданные настройки источника; помеченный к удалению
@@ -357,7 +369,7 @@ impl SourceRepo {
 
         let updated = builder.build_query_as().fetch_optional(pool).await?;
 
-        Ok(updated)
+        Ok(updated.map(with_masked_url))
     }
 
     /// Помечает источник к удалению (ADR-0005: исполнение — за воркером);
