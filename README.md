@@ -5,7 +5,10 @@
 ```bash
 cp env.example .env
 docker compose up -d
+scripts/register-source.sh
 ```
+
+Последний шаг — [`scripts/register-source.sh`](scripts/register-source.sh) — идемпотентно регистрирует источник демо-стенда (`db-src`) в реестре через REST API: повторный запуск с тем же URL завершается успехом, имя с другой строкой подключения — ошибкой (URL источника неизменяем, ADR-0005). Скрипту нужны `curl` и `python3`; параметры — `scripts/register-source.sh ИМЯ URL`, окружение — `WALTRAIL_API_URL` (по умолчанию `http://localhost:8000`) и `WALTRAIL_SOURCE_URL`.
 
 Compose поднимает минимальный стек:
 
@@ -27,8 +30,9 @@ Compose поднимает минимальный стек:
 ```bash
 # Регистрируем db-src как источник журнала: воркер подхватит его без
 # перезапуска и сам создаст у клиента публикацию и слот
-curl -s http://localhost:8000/api/sources -H 'content-type: application/json' \
-  -d '{"name":"demo","url":"postgresql://postgres:postgres@db-src:5432/postgres"}'
+# (то же вручную: curl -X POST http://localhost:8000/api/sources -H 'content-type: application/json' \
+#  -d '{"name":"demo","url":"postgresql://postgres:postgres@db-src:5432/postgres"}')
+scripts/register-source.sh
 
 # Демо-таблица на источнике (публикация FOR ALL TABLES подхватит её сама)
 docker compose exec db-src psql -U postgres -c \
@@ -77,6 +81,36 @@ docker compose down -v && docker compose up -d
 ```
 
 > `down -v` удаляет локальные данные dev-стенда (в том числе volume БД аудита).
+
+## Переезд со старой одноисточниковой версии (runbook)
+
+Версии до реестра источников читали ровно один клиентский источник, заданный при старте воркера: `SOURCE_DATABASE_URL` (строка подключения), `CDC_SLOT` (слот, по умолчанию `waltrail`), `CDC_PUBLICATION` (публикация, по умолчанию `audit`), `CDC_MESSAGE_PREFIX`, `CDC_IGNORE_TABLES`, `CDC_BATCH_SIZE`. В мультиисточниковой версии эти переменные удалены: единственный источник правды — реестр (REST API, ADR-0005), из окружения читаются только `DATABASE_URL`, логирование и глобальные параметры воркера (см. [`env.example`](env.example)).
+
+1. Обновите сервисы: доставьте новые образы/бинарники и поднимите стек (`docker compose up -d`; миграции применяются на старте). Реестр пока пуст — старый слот `waltrail` у клиента продолжает жить и копить WAL; на время переезда это не страшно, дропнуть его сможем на шаге 4.
+2. Перерегистрируйте прежний источник в реестре — тем же именем, каким хотите помечать его строки в журнале, и с той же строкой подключения, что была в `SOURCE_DATABASE_URL`:
+
+   ```bash
+   scripts/register-source.sh demo 'postgresql://postgres:postgres@db-client:5432/postgres'
+   # или вручную: curl -X POST http://localhost:8000/api/sources -H 'content-type: application/json' \
+   #  -d '{"name":"demo","url":"postgresql://postgres:postgres@db-client:5432/postgres"}'
+   ```
+
+   Воркер создаст у клиента публикацию `audit_<имя>` и слот `waltrail_<имя>` и продолжит сбор. Учтите: новый слот стартует с текущей позиции WAL клиента — непрочитанный хвост старого слота в журнал не попадает; если он нужен, вычитайте его прежней версией воркера до обновления.
+3. Проверьте журнал: внесите тестовое изменение на клиенте и убедитесь, что оно попало в журнал с ключом источника (`worker_state=connected`, время последнего события — в `GET /api/sources/<имя>`):
+
+   ```bash
+   curl 'http://localhost:8000/api/changes?source=demo&limit=5'
+   curl 'http://localhost:8000/api/sources/demo'
+   ```
+
+4. Дропните старый слот и публикацию у клиента — пока слот `waltrail` жив, WAL клиента копится:
+
+   ```SQL
+   SELECT pg_drop_replication_slot('waltrail');
+   DROP PUBLICATION IF EXISTS audit;
+   ```
+
+   Строки журнала, прочитанные старой версией до переезда, остаются в `changes` с пустым ключом источника (`source=""`).
 
 ## Подключение клиента (PostgreSQL)
 
