@@ -119,7 +119,7 @@ pub async fn setup_source(source: &PgPool) {
 pub async fn wait_until<F, Fut>(mut predicate: F)
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
+    Fut: Future<Output = bool>,
 {
     for _ in 0..120 {
         if predicate().await {

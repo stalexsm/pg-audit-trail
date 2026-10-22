@@ -7,6 +7,7 @@
 //! реестра (`error` + текст в `last_error`), и задача повторяет попытку
 //! с экспоненциальным backoff до остановки по токену.
 
+use std::sync::Mutex;
 use std::time::Duration;
 
 use sqlx::postgres::PgPoolOptions;
@@ -29,6 +30,38 @@ const TASK_AUDIT_POOL_MAX_CONNECTIONS: u32 = 3;
 
 /// Размер пула к источнику: только чтение каталога (первичные ключи).
 const SOURCE_POOL_MAX_CONNECTIONS: u32 = 2;
+
+/// Взведённая тестовая паника: имя источника и сколько ещё запусков его
+/// задачи запаникуют (каждый запуск расходует одну). Шов живых тестов
+/// самовосстановления супервизора (тикет #47).
+type ArmedTaskPanic = Option<(String, u32)>;
+static TEST_TASK_PANIC: Mutex<ArmedTaskPanic> = Mutex::new(None);
+
+/// Взводит одноразовую панику задачи источника: следующие `times` запусков
+/// задачи источника с именем `source` паникуют до каких-либо подключений.
+/// Только для живых тестов супервизора (тикет #47): в продукте паник не
+/// взводят, шов позволяет детерминированно проверить цикл «паника →
+/// снятие с учёта → перезапуск» без инжекции в реальный тракт репликации.
+pub fn arm_task_panic(source: &str, times: u32) {
+    *TEST_TASK_PANIC
+        .lock()
+        .expect("мьютекс тестового шва паники не отравлен") = Some((source.to_owned(), times));
+}
+
+/// Расходует взведённую панику: `true` — этот запуск задачи должен
+/// запаниковать.
+fn test_panic_due(source: &str) -> bool {
+    let mut armed = TEST_TASK_PANIC
+        .lock()
+        .expect("мьютекс тестового шва паники не отравлен");
+    match armed.as_mut() {
+        Some((name, left)) if name == source && *left > 0 => {
+            *left -= 1;
+            true
+        }
+        _ => false,
+    }
+}
 
 /// Чем закончилась попытка источника (подключение + сессия репликации).
 enum AttemptEnd {
@@ -57,6 +90,11 @@ pub(crate) async fn run(
     token: CancellationToken,
     mut supervisor_gone: watch::Receiver<()>,
 ) {
+    // Тестовый шов (тикет #47): паника до любых ресурсов задачи — ни одного
+    // соединения ещё не открыто, падение безопасно и детерминированно.
+    if test_panic_due(&record.name) {
+        panic!("тестовая паника задачи источника ({})", record.name);
+    }
     // Пул к БД аудита принадлежит задаче: батчи источников не делят
     // соединения, медленный клиент не занимает чужие подключения.
     // Статусы пишутся в тот же пул (заимствование): пул — ресурс задачи,
@@ -95,7 +133,7 @@ pub(crate) async fn run(
             // Супервизор исчез (аварийная остановка): сессия обрывается
             // вместе с будущим попытки, сохранённый прогресс — в чекпоинтах.
             _ = supervisor_gone.changed() => break,
-            outcome = run_attempt(&record, &audit, &status, &token, &mut attempt) => {
+            outcome = run_attempt(&record, &audit, &status, &token, &config, &mut attempt) => {
                 match outcome {
                     AttemptEnd::Cancelled => break,
                     AttemptEnd::Failed(e) => {
@@ -151,11 +189,14 @@ async fn backoff_after_failure(
 /// Подключение к БД источника, бутстрап и подтверждение старта репликации
 /// ограничены таймаутами (config.rs): зависание сети переводит попытку
 /// в видимый `error` с backoff вместо вечного `starting` (тикет #46).
+/// Потолок буфера транзакции — настройка воркера, передаётся в сессию
+/// (тикет #48).
 async fn run_attempt(
     record: &SourceRecord,
     audit: &sqlx::PgPool,
     status: &StatusWriter<'_>,
     token: &CancellationToken,
+    config: &WorkerConfig,
     attempt: &mut u32,
 ) -> AttemptEnd {
     // Пул источника живёт одну попытку: пересоздаётся после обрыва.
@@ -233,8 +274,17 @@ async fn run_attempt(
     status.connected().await;
     info!(source = %record.name, "репликация источника запущена");
 
-    let end =
-        replicate::stream_session(&mut client, audit, &source, &boot, record, status, token).await;
+    let end = replicate::stream_session(
+        &mut client,
+        audit,
+        &source,
+        &boot,
+        record,
+        status,
+        token,
+        config.tx_buffer_max_rows,
+    )
+    .await;
     if matches!(end, replicate::SessionEnd::Cancelled) {
         // Остановка обязана уложиться в grace-окно оркестратора: на
         // зависшей сети закрытие обрывается по таймауту, соединение

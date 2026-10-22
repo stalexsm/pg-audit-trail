@@ -10,8 +10,9 @@ pub mod dto;
 pub mod handlers;
 pub mod repositories;
 pub mod routes;
+pub mod startup;
 
-pub type AppResult<T, E = AppError> = core::result::Result<T, E>;
+pub type AppResult<T, E = AppError> = Result<T, E>;
 
 #[derive(Debug)]
 pub struct AppError(StatusCode, anyhow::Error);

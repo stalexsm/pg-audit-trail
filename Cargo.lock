@@ -53,13 +53,13 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
- "tracing-appender",
  "tracing-subscriber",
  "url",
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
  "validator",
+ "waltrail-log",
 ]
 
 [[package]]
@@ -2428,6 +2428,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "waltrail-log"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "wasi"
 version = "0.11.1+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2683,10 +2692,10 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-appender",
  "tracing-subscriber",
  "url",
  "uuid",
+ "waltrail-log",
 ]
 
 [[package]]

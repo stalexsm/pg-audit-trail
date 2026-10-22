@@ -23,7 +23,7 @@ use crate::Result;
 use crate::config::{DB_ACQUIRE_TIMEOUT_SECS, WorkerConfig};
 use crate::deletion;
 use crate::metrics;
-use crate::registry::{self, SourceRecord};
+use crate::registry::{self, SourceRecord, StatusWriter};
 use crate::source_task;
 
 /// Интервал опроса реестра источников, секунды: определяет задержку
@@ -151,18 +151,18 @@ async fn reconcile(
     };
 
     // Завершившиеся исполнения удаления снимаются с учёта.
-    let finished: Vec<String> = deletions
-        .iter()
-        .filter(|(_, handle)| handle.is_finished())
-        .map(|(name, _)| name.clone())
-        .collect();
-    for name in finished {
+    for name in finished_keys(deletions, JoinHandle::is_finished) {
         if let Some(handle) = deletions.remove(&name)
             && let Err(e) = handle.await
         {
             warn!(source = %name, error = %e, "исполнение удаления завершилось паникой");
         }
     }
+
+    // Завершившиеся сами по себе задачи источников (паника, преждевременный
+    // выход) снимаются с учёта: статус в реестре отражает сбой, шаг запуска
+    // ниже перезапускает задачу без рестарта процесса (тикет #47).
+    reap_finished_tasks(audit, tasks).await;
 
     // Активные источники: не помеченные к удалению.
     let active: HashMap<&str, &SourceRecord> = sources
@@ -237,6 +237,61 @@ async fn stop_task(tasks: &mut HashMap<String, SourceHandle>, name: &str) {
     }
 }
 
+/// Ключи записей карты, чьё значение сообщает о завершении: общая форма
+/// очистки исполнений удаления и задач источников (reap-шаг такта).
+fn finished_keys<T>(map: &HashMap<String, T>, is_finished: impl Fn(&T) -> bool) -> Vec<String> {
+    map.iter()
+        .filter(|(_, value)| is_finished(value))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Снимает с учёта задачи источников, завершившиеся сами по себе (по образцу
+/// очистки исполнений удаления): паника или преждевременный выход без сигнала
+/// остановки диагностируются, диагноз идёт в лог и в статус источника в
+/// реестре (`error` + текст в `last_error` — реестр не показывает устаревшее
+/// `connected`), задача снимается с учёта — шаг запуска того же такта
+/// перезапускает её без рестарта процесса (тикет #47).
+async fn reap_finished_tasks(audit: &PgPool, tasks: &mut HashMap<String, SourceHandle>) {
+    for name in finished_keys(tasks, |handle| handle.handle.is_finished()) {
+        let Some(handle) = tasks.remove(&name) else {
+            continue;
+        };
+        let diagnosis = abnormal_exit_diagnosis(handle.handle.await);
+        warn!(
+            source = %name,
+            "{diagnosis} — задача снята с учёта и перезапускается на том же такте (шаг запуска ниже)"
+        );
+        StatusWriter::new(audit, name.clone())
+            .error(&anyhow::anyhow!("{diagnosis}"))
+            .await;
+    }
+}
+
+/// Диагноз нештатного завершения задачи по результату её JoinHandle:
+/// паника — с текстом payload (Display JoinError текст не несёт),
+/// иначе — завершение без сигнала остановки (задача живёт до остановки
+/// воркера). Текст идёт в лог и в `last_error` статуса реестра.
+fn abnormal_exit_diagnosis(result: std::result::Result<(), tokio::task::JoinError>) -> String {
+    match result {
+        Ok(()) => "задача источника завершилась сама без сигнала остановки".to_owned(),
+        Err(join) if join.is_panic() => {
+            let message = match join.try_into_panic() {
+                Ok(payload) => match payload.downcast_ref::<&str>() {
+                    Some(text) => (*text).to_owned(),
+                    None => payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .unwrap_or_else(|| "паника без текста".to_owned()),
+                },
+                Err(join) => format!("{join}"),
+            };
+            format!("задача источника завершилась паникой: {message}")
+        }
+        Err(join) => format!("задача источника завершилась с ошибкой: {join}"),
+    }
+}
+
 /// Запускает задачу источника с дочерним токеном и снимком настроек.
 /// Задача создаёт свои пулы к обеим БД сама (изоляция медленного клиента)
 /// и останавливается вместе с супервизором (канал `supervisor_gone`).
@@ -282,4 +337,114 @@ fn spawn_deletion(
         supervisor_gone,
     ));
     deletions.insert(record.name.clone(), handle);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(name: &str) -> SourceRecord {
+        SourceRecord {
+            name: name.to_owned(),
+            url: "postgresql://u:p@h:5432/db".to_owned(),
+            ignore_tables: Vec::new(),
+            message_prefix: "_audit".to_owned(),
+            batch_size: 500,
+            deleted_at: None,
+        }
+    }
+
+    /// Ленивый пул в никуда: тест проверяет снятие задачи с учёта, запись
+    /// статуса в реестр (StatusWriter) при недоступной БД лишь логирует warn.
+    fn audit_lazy() -> PgPool {
+        PgPoolOptions::new()
+            .connect_lazy("postgresql://invalid:invalid@127.0.0.1:1/none")
+            .expect("ленивый пул создаётся без подключения")
+    }
+
+    /// Паника задачи диагностируется с текстом payload: текст идёт в лог
+    /// и в `last_error` статуса реестра (тикет #47).
+    #[tokio::test]
+    async fn panic_diagnosis_carries_payload_text() {
+        let handle = tokio::spawn(async {
+            panic!("сломанный источник");
+        });
+        let join_error = handle
+            .await
+            .expect_err("задача с panic! завершается JoinError");
+
+        let diagnosis = abnormal_exit_diagnosis(Err(join_error));
+        assert!(
+            diagnosis.contains("паникой"),
+            "диагноз называет панику: {diagnosis}"
+        );
+        assert!(
+            diagnosis.contains("сломанный источник"),
+            "текст payload паники попадает в диагноз: {diagnosis}"
+        );
+    }
+
+    /// Преждевременный выход задачи без сигнала остановки — тоже нештатное
+    /// завершение: задача живёт до остановки воркера.
+    #[tokio::test]
+    async fn premature_exit_gets_diagnosis() {
+        let handle = tokio::spawn(async {});
+        let diagnosis = abnormal_exit_diagnosis(handle.await);
+        assert!(
+            diagnosis.contains("без сигнала остановки"),
+            "диагноз называет преждевременный выход: {diagnosis}"
+        );
+    }
+
+    /// AC (тикет #47): завершившаяся паникой задача снимается с учёта —
+    /// шаг запуска супервизора перезапустит её без рестарта процесса;
+    /// работающая задача не трогается.
+    #[tokio::test]
+    async fn crashed_task_is_reaped_and_healthy_task_stays() {
+        let audit = audit_lazy();
+        let mut tasks: HashMap<String, SourceHandle> = HashMap::new();
+
+        let crashed = record("crashed_src");
+        tasks.insert(
+            crashed.name.clone(),
+            SourceHandle {
+                record: crashed,
+                token: CancellationToken::new(),
+                handle: tokio::spawn(async {
+                    panic!("тестовая паника задачи источника");
+                }),
+            },
+        );
+
+        let healthy = record("healthy_src");
+        let healthy_token = CancellationToken::new();
+        tasks.insert(
+            healthy.name.clone(),
+            SourceHandle {
+                record: healthy,
+                token: healthy_token.clone(),
+                handle: tokio::spawn(std::future::pending()),
+            },
+        );
+
+        // Ждём фактического завершения паникующей задачи.
+        while !tasks["crashed_src"].handle.is_finished() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        reap_finished_tasks(&audit, &mut tasks).await;
+
+        assert!(
+            !tasks.contains_key("crashed_src"),
+            "упавшая задача снята с учёта — следующий такт её перезапустит"
+        );
+        assert!(
+            tasks.contains_key("healthy_src"),
+            "работающая задача не тронута"
+        );
+        assert!(
+            !healthy_token.is_cancelled(),
+            "токен работающей задачи не отменён"
+        );
+    }
 }

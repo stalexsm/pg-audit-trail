@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/api", "crates/pgoutput", "crates/worker-cdc"]
+members = ["crates/api", "crates/pgoutput", "crates/waltrail-log", "crates/worker-cdc"]
 
 resolver = "3"
 
@@ -10,8 +10,30 @@ description = "Waltrail — журнал аудита изменений Postgre
 
 rust-version = "1.99.1"
 
+# Политика линтов workspace: консервативный набор — то, что ловит реальные
+# дефекты и мусор в коде, но не педантичные придирки, ломающие существующий
+# код. Наследуется всеми крейтами через lints.workspace = true; ужесточения —
+# осознанно, с прогоном всей обязательной проверки из AGENTS.md.
+[workspace.lints.rust]
+# Излишние квалификаторы путей (путь через модуль при уже импортированном
+# имени) — шум в диффах при переименованиях.
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+# Базовый уровень — все правила корректности и стиля по умолчанию.
+all = { level = "warn", priority = -1 }
+# Явные маркеры незавершённости не должны попадать в main — только с
+# обоснованием в коде (#[allow(clippy::todo)] /* причина */).
+todo = "warn"
+unimplemented = "warn"
+# Отладочные распечатки — только tracing, stdout/stderr в коде не используем.
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+
 [workspace.dependencies]
 pgoutput = { path = "crates/pgoutput" }
+waltrail-log = { path = "crates/waltrail-log" }
 
 anyhow = "1.0.104"
 chrono = { version = "0.4.45", features = ["serde"] }

@@ -1,52 +1,39 @@
-use std::{env, path::PathBuf};
+use std::process::ExitCode;
 
-use anyhow::Context;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
-use tracing_appender::rolling;
-use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use worker_cdc::WorkerConfig;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // В режиме разработки логи пишутся в корень проекта, в проде — рядом с бинарником.
-    let base_dir = if cfg!(debug_assertions) {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
-    } else {
-        let exe = env::current_exe()?;
-        exe.parent().map(PathBuf::from).unwrap_or(exe)
+async fn main() -> ExitCode {
+    // Общая обвязка логирования workspace (waltrail-log): фильтр по RUST_LOG,
+    // файл с ротацией по дням и вывод в терминал. Guard неблокирующего
+    // писателя держим до конца работы процесса.
+    let _log_guard = match waltrail_log::init("worker-cdc.log") {
+        Ok(guard) => guard,
+        // Логирование ещё не поднято: подписчика нет, текст ошибки в журнал
+        // не попадёт. Ненулевой код выхода — сигнал оркестратору о фатальной
+        // ошибке запуска (тикет #47).
+        Err(e) => {
+            error!(error = %e, "инициализация логирования worker-cdc");
+            return ExitCode::FAILURE;
+        }
     };
 
-    let log_file = rolling::daily(base_dir.join("logs"), "worker-cdc.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(log_file);
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(
-            fmt::layer()
-                .with_writer(non_blocking)
-                .with_ansi(false)
-                .with_level(true)
-                .with_target(false),
-        )
-        .with(
-            fmt::layer()
-                .with_ansi(true)
-                .with_level(true)
-                .with_target(false),
-        )
-        .init();
-
-    let config = WorkerConfig::from_env().context("переменные окружения воркера CDC")?;
+    // Конфигурация читается до супервизора: некорректное окружение — тоже
+    // фатальная ошибка запуска, процесс завершается с ненулевым кодом.
+    let config = match WorkerConfig::from_env() {
+        Ok(config) => config,
+        Err(e) => {
+            error!(error = %e, "некорректные переменные окружения воркера CDC");
+            return ExitCode::FAILURE;
+        }
+    };
     info!(
         reconnect_initial_backoff_ms = config.reconnect_initial_backoff_ms,
         reconnect_max_backoff_ms = config.reconnect_max_backoff_ms,
+        tx_buffer_max_rows = config.tx_buffer_max_rows,
         "worker-cdc: супервизор источников — настройки источников читаются из реестра (ADR-0005)"
     );
 
@@ -73,11 +60,18 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Запуск worker-cdc...");
 
+    // Фатальная ошибка супервизора — недоступность БД аудита, провал
+    // миграций — ненулевой код выхода: перезапускающая система (оркестратор,
+    // compose restart) видит сбой и реагирует, процесс не живёт впустую
+    // (тикет #47).
     if let Err(e) = worker_cdc::run(config, cancellation_token).await {
-        error!(error = %e, "Ошибка супервизора worker-cdc!");
+        error!(
+            error = %e,
+            "фатальная ошибка супервизора worker-cdc — завершаем процесс с ненулевым кодом выхода"
+        );
+        return ExitCode::FAILURE;
     }
 
     info!("worker-cdc завершён");
-
-    Ok(())
+    ExitCode::SUCCESS
 }

@@ -2,6 +2,7 @@
 #
 # Обязательные проверки (гейты), джоба gates — зелёная только когда все зелёные:
 #   fmt     — форматирование (cargo fmt --check);
+#   msrv    — cargo check на заявленном MSRV (rust-version в workspace.package);
 #   clippy  — линтер без предупреждений (cargo clippy --all --all-targets -- -D warnings);
 #   test    — все тесты workspace, включая живые интеграционные (два PostgreSQL
 #             поднимаются из compose.yaml: db1 :54399 и db-src :54398);
@@ -54,6 +55,24 @@ jobs:
           components: rustfmt
       - name: Форматирование
         run: cargo fmt --check
+
+  msrv:
+    # Заявленный MSRV — не мёртвый конфиг: cargo check на минимальном
+    # тулчейне из rust-version. Отдельный кеш rust-cache — чтобы прогрев
+    # MSRV-тулчейна не перетирал кеш стабильного (ключ по умолчанию — jobId).
+    name: msrv
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # 1.99.1 (MSRV)
+        with:
+          toolchain: "1.99.1"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: cargo check на MSRV
+        run: cargo check
 
   clippy:
     name: clippy
@@ -169,7 +188,7 @@ jobs:
     # Сводный гейт для branch protection: required status check «gates»
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [fmt, clippy, test, docker, deny, skylos, semgrep]
+    needs: [fmt, msrv, clippy, test, docker, deny, skylos, semgrep]
     if: always()
     steps:
       - name: Все гейты зелёные

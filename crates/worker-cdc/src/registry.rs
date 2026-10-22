@@ -113,6 +113,16 @@ pub(crate) mod worker_state {
     pub(crate) const DELETING: &str = "deleting";
 }
 
+/// Неудачная запись статуса в реестр не роняет задачу — только warn.
+fn warn_status_not_written(source: &str, state: &str, error: &sqlx::Error) {
+    warn!(
+        source,
+        state,
+        error = %error,
+        "статус источника в реестр не записан"
+    );
+}
+
 /// Пишет статус источника в реестр (`worker_state`, `last_error`,
 /// `last_event_at`). Пул заимствуется у задачи: пул — ресурс задачи,
 /// статус — один из его потребителей.
@@ -150,19 +160,28 @@ impl<'a> StatusWriter<'a> {
                 .execute(self.audit)
                 .await
         {
-            warn!(
-                source = %self.name,
-                state,
-                error = %e,
-                "статус источника в реестр не записан"
-            );
+            warn_status_not_written(&self.name, state, &e);
+        }
+    }
+
+    /// Записывает только `worker_state`, не трогая `last_error`
+    /// (контракт сохранения текста последней ошибки — у `starting`).
+    async fn write_state(&self, state: &str) {
+        if let Err(e) = sqlx::query("UPDATE sources SET worker_state = $2 WHERE name = $1")
+            .bind(&self.name)
+            .bind(state)
+            .execute(self.audit)
+            .await
+        {
+            warn_status_not_written(&self.name, state, &e);
         }
     }
 
     /// Задача подхвачена: бутстрап и подключение. Прошлый `last_error`
-    /// сохраняется до первого успеха — «текст последней ошибки».
+    /// сохраняется до первого успеха — «текст последней ошибки»: диагноз
+    /// аварийного перезапуска виден в реестре, пока источник не подключился.
     pub(crate) async fn starting(&self) {
-        self.write(worker_state::STARTING, None).await;
+        self.write_state(worker_state::STARTING).await;
     }
 
     /// Сессия репликации активна: последняя ошибка закрыта.

@@ -28,6 +28,15 @@ pub(crate) const REPLICATION_START_TIMEOUT_SECS: u64 = 15;
 /// по истечении таймаута соединение бросается на дроп клиента.
 pub(crate) const REPLICATION_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
 
+/// Дефолтный потолок буфера транзакции источника, строк журнала: транзакция
+/// клиента с большим числом изменений не буферизуется целиком — попытка
+/// завершается ошибкой с реконнектом и backoff (тикет #48). Потолок держит
+/// память воркера ограниченной при гигантской транзакции клиента: одна
+/// строка журнала — десятки байт метаданных плюс JSON-образы до сотен
+/// килобайт, сотни тысяч строк дали бы гигабайты на один источник.
+/// Переопределяется переменной `CDC_TX_BUFFER_MAX_ROWS`.
+pub(crate) const DEFAULT_TX_BUFFER_MAX_ROWS: usize = 100_000;
+
 /// Глобальная конфигурация воркера: собирается из окружения поверх дефолтов
 /// (крейт `config`). Настройки источников — строки подключения, служебные
 /// таблицы, префикс MESSAGE, размер батча — из окружения не читаются:
@@ -47,6 +56,13 @@ pub struct WorkerConfig {
     /// в миллисекундах (`CDC_RECONNECT_MAX_BACKOFF_MS`).
     #[serde(default = "default_reconnect_max_backoff_ms")]
     pub reconnect_max_backoff_ms: u64,
+
+    /// Потолок буфера транзакции источника, строк журнала
+    /// (`CDC_TX_BUFFER_MAX_ROWS`): транзакция клиента сверх потолка
+    /// не буферизуется — попытка завершается ошибкой с реконнектом
+    /// и backoff, вместо неограниченного роста памяти (тикет #48).
+    #[serde(default = "default_tx_buffer_max_rows")]
+    pub tx_buffer_max_rows: usize,
 }
 
 fn default_reconnect_initial_backoff_ms() -> u64 {
@@ -55,6 +71,10 @@ fn default_reconnect_initial_backoff_ms() -> u64 {
 
 fn default_reconnect_max_backoff_ms() -> u64 {
     30_000
+}
+
+fn default_tx_buffer_max_rows() -> usize {
+    DEFAULT_TX_BUFFER_MAX_ROWS
 }
 
 impl WorkerConfig {
@@ -92,6 +112,7 @@ mod tests {
             std::env::set_var("DATABASE_URL", "postgresql://audit/db");
             std::env::set_var("CDC_RECONNECT_INITIAL_BACKOFF_MS", "250");
             std::env::set_var("CDC_RECONNECT_MAX_BACKOFF_MS", "45000");
+            std::env::set_var("CDC_TX_BUFFER_MAX_ROWS", "7000");
             std::env::set_var("SOURCE_DATABASE_URL", "postgresql://src/db");
             std::env::set_var("CDC_SLOT", "legacy-slot");
             std::env::set_var("CDC_PUBLICATION", "legacy-pub");
@@ -104,11 +125,13 @@ mod tests {
         assert_eq!(config.database_url, "postgresql://audit/db");
         assert_eq!(config.reconnect_initial_backoff_ms, 250);
         assert_eq!(config.reconnect_max_backoff_ms, 45_000);
+        assert_eq!(config.tx_buffer_max_rows, 7_000);
 
         unsafe {
             std::env::remove_var("DATABASE_URL");
             std::env::remove_var("CDC_RECONNECT_INITIAL_BACKOFF_MS");
             std::env::remove_var("CDC_RECONNECT_MAX_BACKOFF_MS");
+            std::env::remove_var("CDC_TX_BUFFER_MAX_ROWS");
             std::env::remove_var("SOURCE_DATABASE_URL");
             std::env::remove_var("CDC_SLOT");
             std::env::remove_var("CDC_PUBLICATION");
@@ -118,15 +141,17 @@ mod tests {
         }
     }
 
-    /// Без переопределений — дефолты реконнекта.
+    /// Без переопределений — дефолты реконнекта и потолка буфера транзакции.
     #[test]
     fn reconnect_defaults() {
         let config = WorkerConfig {
             database_url: "postgresql://audit/db".to_owned(),
             reconnect_initial_backoff_ms: default_reconnect_initial_backoff_ms(),
             reconnect_max_backoff_ms: default_reconnect_max_backoff_ms(),
+            tx_buffer_max_rows: default_tx_buffer_max_rows(),
         };
         assert_eq!(config.reconnect_initial_backoff_ms, 1_000);
         assert_eq!(config.reconnect_max_backoff_ms, 30_000);
+        assert_eq!(config.tx_buffer_max_rows, DEFAULT_TX_BUFFER_MAX_ROWS);
     }
 }
