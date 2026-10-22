@@ -16,7 +16,10 @@ volumes:
 services:
   # БД аудита Waltrail
   db1:
-    image: postgres:17.4
+    # PostgreSQL 17.11 — последний минор ветки 17 (postgresql.org/docs/release,
+    # релиз 2026-08-13, сверено 2026-10-22): точный пин вместо плавающего
+    # тега 17.
+    image: postgres:17.11
     restart: always
     environment:
       POSTGRES_USER: postgres
@@ -42,7 +45,8 @@ services:
   # к журналу регистрацией через REST API (POST /api/sources): воркер сам
   # создаст публикацию audit_<имя> и слот waltrail_<имя> при подхвате
   db-src:
-    image: postgres:17.4
+    # PostgreSQL 17.11 — последний минор ветки 17, обоснование — у db1 выше.
+    image: postgres:17.11
     restart: always
     command:
       ["postgres", "-c", "wal_level=logical"]
