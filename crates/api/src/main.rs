@@ -1,6 +1,6 @@
 use anyhow::Context;
 use api::routes::{ApiDoc, api_router, not_found_fallback};
-use api::startup::{connect_pool, database_url_from_env, port_from_env};
+use api::startup::{connect_pool, cors_layer, database_url_from_env, port_from_env};
 use axum::{Json, Router, routing::get};
 use serde::Serialize;
 use tokio::net::TcpListener;
@@ -46,14 +46,7 @@ async fn main() -> anyhow::Result<()> {
             .merge(api_router())
             .fallback(not_found_fallback)
             .layer(TraceLayer::new_for_http())
-            // CORS отключён (тикет #54): API не браузерный по назначению —
-            // клиенты журнала не браузерные приложения, аутентификации нет,
-            // и «доверять всем origin» (allow_origin(Any)) незачем.
-            // Swagger UI обслуживается этим же приложением и работает
-            // в рамках одного происхождения: страница /swagger-ui читает
-            // /api-docs/openapi.json и дергает швы API с того же хоста —
-            // без CORS-заголовков. Если появится браузерный потребитель,
-            // CORS возвращается белым списком origin, а не Any.
+            .layer(cors_layer()?)
             .layer(CompressionLayer::new())
             .with_state(pool)
             .into_make_service(),

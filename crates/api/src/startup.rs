@@ -8,8 +8,10 @@ use std::env;
 use std::time::Duration;
 
 use anyhow::Context;
+use axum::http::HeaderValue;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 /// Порт HTTP-сервера по умолчанию (совпадает с пробросом порта в compose).
 pub const DEFAULT_PORT: u16 = 8000;
@@ -19,6 +21,11 @@ pub const PORT_ENV_VAR: &str = "API_PORT";
 
 /// Переменная окружения со строкой подключения к БД аудита.
 pub const DATABASE_URL_ENV_VAR: &str = "DATABASE_URL";
+
+/// Переменная окружения с белым списком origin CORS: origin через запятую
+/// (например `https://audit.example,https://grafana.example`). Пустая или
+/// незаданная — слой остаётся разрешительным (`allow_origin(Any)`).
+pub const CORS_ALLOWED_ORIGINS_ENV_VAR: &str = "API_CORS_ALLOWED_ORIGINS";
 
 /// Размер пула подключений к БД аудита.
 pub const POOL_MAX_CONNECTIONS: u32 = 20;
@@ -69,6 +76,85 @@ pub fn pool_options() -> PgPoolOptions {
     PgPoolOptions::new()
         .max_connections(POOL_MAX_CONNECTIONS)
         .acquire_timeout(Duration::from_secs(POOL_ACQUIRE_TIMEOUT_SECS))
+}
+
+/// Слой CORS api.
+///
+/// Решение по тикету #54 (правка владельца проекта): журнал читают
+/// и браузерные клиенты (GET /api/changes) — CORS работает «из коробки»:
+/// по умолчанию слой разрешительный, `allow_origin(Any)`, как до тикета;
+/// аутентификации у api нет, утечки через чужой origin не боятся.
+/// Переменная `API_CORS_ALLOWED_ORIGINS` (origin через запятую) сужает
+/// слой до белого списка — для развёртываний, где открытый CORS
+/// нежелателен. Swagger UI не страдает ни в одном из режимов: он
+/// обслуживается этим же приложением и работает в рамках одного
+/// происхождения, CORS ему не нужен. Невалидный origin в списке —
+/// ошибка старта: кривой конфиг не должен молча отрезать читателей.
+pub fn cors_layer() -> anyhow::Result<CorsLayer> {
+    let origins = cors_allowed_origins_from_env()?;
+    cors_layer_for(origins)
+}
+
+/// Строит слой CORS по разобранному белому списку (`None` — дефолт Any).
+fn cors_layer_for(origins: Option<Vec<String>>) -> anyhow::Result<CorsLayer> {
+    match origins {
+        Some(origins) => {
+            let allowed = origins
+                .iter()
+                .map(|origin| validated_origin(origin))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            Ok(CorsLayer::new()
+                .allow_origin(AllowOrigin::list(allowed))
+                .allow_headers(Any))
+        }
+        // Дефолт разрешительный: переменная не задана или пуста — прежнее
+        // поведение `allow_origin(Any)` (браузерные читатели работают
+        // из коробки).
+        None => Ok(CorsLayer::new().allow_origin(Any).allow_headers(Any)),
+    }
+}
+
+/// Проверяет элемент белого списка и переводит его в значение заголовка.
+/// Двойная проверка: `Url::parse` отсекает мусор («не-origin с пробелом»,
+/// относительные пути) ещё до старта — кривой конфиг не должен молча
+/// отрезать читателей; `HeaderValue::from_str` отсекает управляющие
+/// символы, которые парсер URL молча вырезал бы.
+fn validated_origin(origin: &str) -> anyhow::Result<HeaderValue> {
+    let fail = || format!("{CORS_ALLOWED_ORIGINS_ENV_VAR}: невалидный origin {origin:?}");
+    url::Url::parse(origin).with_context(fail)?;
+    HeaderValue::from_str(origin).with_context(fail)
+}
+
+/// Белый список origin CORS из окружения: `None` — переменная не задана,
+/// пустая или сводится к пустому списку (дефолт — разрешительный слой).
+pub fn cors_allowed_origins_from_env() -> anyhow::Result<Option<Vec<String>>> {
+    cors_allowed_origins_from(env::var(CORS_ALLOWED_ORIGINS_ENV_VAR))
+}
+
+/// Преобразует результат чтения `CORS_ALLOWED_ORIGINS_ENV_VAR`.
+fn cors_allowed_origins_from(
+    env_result: Result<String, env::VarError>,
+) -> anyhow::Result<Option<Vec<String>>> {
+    match env_result {
+        Ok(raw) => Ok(cors_origins_from(&raw)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err(anyhow::anyhow!(
+            "переменная окружения {CORS_ALLOWED_ORIGINS_ENV_VAR} содержит не-Unicode значение"
+        )),
+    }
+}
+
+/// Разбирает значение `API_CORS_ALLOWED_ORIGINS`: origin через запятую,
+/// пробелы вокруг элементов срезаются, пустые элементы отбрасываются;
+/// пустой результат — `None` (слой остаётся разрешительным).
+fn cors_origins_from(raw: &str) -> Option<Vec<String>> {
+    let origins: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    (!origins.is_empty()).then_some(origins)
 }
 
 /// Подключение к БД аудита.
@@ -163,6 +249,92 @@ mod tests {
             options.get_acquire_timeout(),
             Duration::from_secs(POOL_ACQUIRE_TIMEOUT_SECS)
         );
+    }
+
+    #[test]
+    fn cors_origins_parse_comma_list_and_trim() {
+        assert_eq!(
+            cors_origins_from(" https://a.example , https://b.example,"),
+            Some(vec![
+                "https://a.example".to_owned(),
+                "https://b.example".to_owned()
+            ]),
+            "пробелы срезаются, пустые элементы отбрасываются"
+        );
+        assert_eq!(
+            cors_origins_from("https://one.example"),
+            Some(vec!["https://one.example".to_owned()]),
+            "одиночный origin без запятой"
+        );
+    }
+
+    /// Пустая переменная — дефолт: разрешительный слой (Any), браузерные
+    /// читатели журнала работают из коробки (тикет #54).
+    #[test]
+    fn cors_origins_empty_value_keeps_permissive_default() {
+        assert_eq!(cors_origins_from(""), None);
+        assert_eq!(cors_origins_from("   "), None);
+        assert_eq!(
+            cors_origins_from("  ,  "),
+            None,
+            "пустой список = дефолт Any"
+        );
+        assert_eq!(
+            cors_allowed_origins_from(Ok(String::new())).expect("пустая переменная валидна"),
+            None
+        );
+    }
+
+    #[test]
+    fn cors_origins_absent_env_keeps_permissive_default() {
+        assert_eq!(
+            cors_allowed_origins_from(Err(env::VarError::NotPresent)).expect("отсутствие — норм"),
+            None
+        );
+    }
+
+    /// `VarError::NotUnicode` печатает само значение переменной:
+    /// текст ошибки формируется без исходного значения.
+    #[test]
+    fn cors_origins_error_does_not_leak_value() {
+        let error = cors_allowed_origins_from(Err(env::VarError::NotUnicode(
+            "https://\u{1F5DD}secret.example".into(),
+        )))
+        .expect_err("не-Unicode значение — ошибка");
+
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains(CORS_ALLOWED_ORIGINS_ENV_VAR));
+        assert!(!rendered.contains("secret.example"));
+    }
+
+    /// Невалидный origin в белом списке — ошибка старта с именем
+    /// переменной: кривой конфиг не должен молча отрезать читателей.
+    #[test]
+    fn cors_layer_rejects_invalid_origin_in_allowlist() {
+        let origins =
+            cors_origins_from("https://ok.example, не-origin с пробелом").expect("список непуст");
+        let error = cors_layer_for(Some(origins)).expect_err("кривой origin — ошибка старта");
+
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains(CORS_ALLOWED_ORIGINS_ENV_VAR));
+        assert!(
+            rendered.contains("не-origin"),
+            "именована причина: {rendered}"
+        );
+    }
+
+    #[test]
+    fn cors_layer_default_is_permissive_when_allowlist_absent() {
+        // Слой — значение must_use: привязываем, чтобы проверить сам факт
+        // сборки дефолта без обращения к окружению.
+        let _layer = cors_layer_for(None).expect("дефолтный разрешительный слой строится");
+    }
+
+    #[test]
+    fn cors_layer_accepts_wellformed_allowlist() {
+        let origins =
+            cors_origins_from("https://a.example, https://b.example:8443").expect("список непуст");
+        let _layer = cors_layer_for(Some(origins)).expect("корректный список строится");
     }
 
     /// Пароль из строки подключения не попадает в текст ошибки: при
