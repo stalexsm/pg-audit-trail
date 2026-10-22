@@ -1,20 +1,38 @@
+//! Схема OpenAPI и сборка роутера API. Аннотации `#[utoipa::path]`
+//! живут на обработчиках (`crate::handlers`) — одна точка правды
+//! для сигнатур, роутинга и документации (тикет #54); врапперы
+//! роутинга устранены.
+
 use axum::{
-    Json, Router,
-    extract::{Path, Query, State},
-    http::StatusCode,
+    Router,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use axum_valid::Valid;
-use sqlx::{PgPool, Pool, Postgres};
+use sqlx::{Pool, Postgres};
 use utoipa::OpenApi;
-use uuid::Uuid;
 
+use crate::AppError;
 use crate::dto::{
-    ChangeDetailDTO, ChangePageDTO, ChangeRowDTO, QChange, QSourceCreate, QSourcePatch, SourceDTO,
+    ChangeDetailDTO, ChangePageDTO, ChangeRowDTO, QSourceCreate, QSourcePatch, SourceDTO,
 };
-use crate::handlers as s;
-use crate::{AppError, AppResult};
+use crate::handlers::{
+    // Служебные типы, порождённые макросом `#[utoipa::path]` на
+    // обработчиках: на них ссылается derive OpenApi ниже.
+    __path_delete_source,
+    __path_get_change_by_id,
+    __path_get_list_changes,
+    __path_get_list_sources,
+    __path_get_source_by_name,
+    __path_patch_source,
+    __path_post_source,
+    delete_source,
+    get_change_by_id,
+    get_list_changes,
+    get_list_sources,
+    get_source_by_name,
+    patch_source,
+    post_source,
+};
 
 #[derive(OpenApi)]
 #[openapi(
@@ -62,156 +80,4 @@ pub fn api_router() -> Router<Pool<Postgres>> {
 pub async fn not_found_fallback() -> Response {
     AppError::not_found("Данной страницы не существует. Проверьте правильность адреса...")
         .into_response()
-}
-
-/// Метод для получения списка журнала: изменения строк источника.
-/// Значения по чувствительным ключам словаря (ADR-0006) в сводке образов
-/// и контексте маскируются — так же, как в детальной строке.
-#[utoipa::path(
-    get,
-    path = "/api/changes",
-    tag = "Changes",
-    params(QChange),
-    responses(
-        (status = 200, description = "Страница журнала", body = ChangePageDTO),
-        (status = 400, description = "Некорректные параметры запроса"),
-        (status = 500, description = "Ошибка сервера: нейтральное сообщение и correlation id (детали — только в логе, тикет #45)")
-    )
-)]
-pub async fn get_list_changes(
-    State(pool): State<PgPool>,
-    Valid(Query(q)): Valid<Query<QChange>>,
-) -> AppResult<Json<ChangePageDTO>> {
-    let res = s::get_list_changes(State(pool), Valid(Query(q))).await?;
-
-    Ok(Json(res))
-}
-
-/// Метод для получения детальной строки журнала. Значения по
-/// чувствительным ключам словаря (ADR-0006) в образах и контексте
-/// маскируются — так же, как в списке.
-#[utoipa::path(
-    get,
-    path = "/api/changes/{id}",
-    tag = "Changes",
-    responses(
-        (status = 200, description = "Детальная строки журнала", body = ChangeDetailDTO),
-        (status = 400, description = "Некорректные параметры запроса"),
-        (status = 404, description = "Записи не существует"),
-        (status = 500, description = "Ошибка сервера: нейтральное сообщение и correlation id (детали — только в логе, тикет #45)")
-    )
-)]
-pub async fn get_change_by_id(
-    State(pool): State<PgPool>,
-    Path(id): Path<Uuid>,
-) -> AppResult<Json<ChangeDetailDTO>> {
-    let res = s::get_change_by_id(State(pool), Path(id)).await?;
-
-    Ok(Json(res))
-}
-
-/// Регистрирует источник журнала (ADR-0005); в ответе url маскирован
-/// (тикет #38): видны схема и хост, креды, порт и имя базы скрыты.
-#[utoipa::path(
-    post,
-    path = "/api/sources",
-    tag = "Sources",
-    request_body = QSourceCreate,
-    responses(
-        (status = 201, description = "Источник зарегистрирован", body = SourceDTO),
-        (status = 400, description = "Ошибка валидации: невалидное имя, URL или дубликат имени"),
-        (status = 500, description = "Ошибка сервера: нейтральное сообщение и correlation id (детали — только в логе, тикет #45)")
-    )
-)]
-pub async fn post_source(
-    State(pool): State<PgPool>,
-    Valid(Json(q)): Valid<Json<QSourceCreate>>,
-) -> AppResult<(StatusCode, Json<SourceDTO>)> {
-    let res = s::post_source(State(pool), Valid(Json(q))).await?;
-
-    Ok((StatusCode::CREATED, Json(res)))
-}
-
-/// Список источников реестра со статусами воркеров.
-#[utoipa::path(
-    get,
-    path = "/api/sources",
-    tag = "Sources",
-    responses(
-        (status = 200, description = "Источники реестра, по имени", body = Vec<SourceDTO>),
-        (status = 500, description = "Ошибка сервера: нейтральное сообщение и correlation id (детали — только в логе, тикет #45)")
-    )
-)]
-pub async fn get_list_sources(State(pool): State<PgPool>) -> AppResult<Json<Vec<SourceDTO>>> {
-    let res = s::get_list_sources(State(pool)).await?;
-
-    Ok(Json(res))
-}
-
-/// Один источник реестра по имени.
-#[utoipa::path(
-    get,
-    path = "/api/sources/{name}",
-    tag = "Sources",
-    params(("name" = String, Path, description = "Имя источника")),
-    responses(
-        (status = 200, description = "Источник реестра", body = SourceDTO),
-        (status = 404, description = "Источника не существует"),
-        (status = 500, description = "Ошибка сервера: нейтральное сообщение и correlation id (детали — только в логе, тикет #45)")
-    )
-)]
-pub async fn get_source_by_name(
-    State(pool): State<PgPool>,
-    Path(name): Path<String>,
-) -> AppResult<Json<SourceDTO>> {
-    let res = s::get_source_by_name(State(pool), Path(name)).await?;
-
-    Ok(Json(res))
-}
-
-/// Правит настройки источника: только `ignore_tables`, `message_prefix`,
-/// `batch_size`; URL неизменяем (ADR-0005): попытка передать `url` — явный
-/// 400. Опущенное поле остаётся без изменений.
-#[utoipa::path(
-    patch,
-    path = "/api/sources/{name}",
-    tag = "Sources",
-    params(("name" = String, Path, description = "Имя источника")),
-    request_body = QSourcePatch,
-    responses(
-        (status = 200, description = "Источник после правки", body = SourceDTO),
-        (status = 400, description = "Ошибка валидации тела, включая попытку сменить неизменяемый url"),
-        (status = 404, description = "Источника не существует"),
-        (status = 409, description = "Источник помечен к удалению"),
-        (status = 500, description = "Ошибка сервера: нейтральное сообщение и correlation id (детали — только в логе, тикет #45)")
-    )
-)]
-pub async fn patch_source(
-    State(pool): State<PgPool>,
-    Path(name): Path<String>,
-    Valid(Json(q)): Valid<Json<QSourcePatch>>,
-) -> AppResult<Json<SourceDTO>> {
-    let res = s::patch_source(State(pool), Path(name), Valid(Json(q))).await?;
-
-    Ok(Json(res))
-}
-
-/// Помечает источник к удалению; исполнение — за воркером (ADR-0005),
-/// поэтому 202. Повторный вызов идемпотентен.
-#[utoipa::path(
-    delete,
-    path = "/api/sources/{name}",
-    tag = "Sources",
-    params(("name" = String, Path, description = "Имя источника")),
-    responses(
-        (status = 202, description = "Источник помечен к удалению"),
-        (status = 404, description = "Источника не существует"),
-        (status = 500, description = "Ошибка сервера: нейтральное сообщение и correlation id (детали — только в логе, тикет #45)")
-    )
-)]
-pub async fn delete_source(
-    State(pool): State<PgPool>,
-    Path(name): Path<String>,
-) -> AppResult<StatusCode> {
-    s::delete_source(State(pool), Path(name)).await
 }
