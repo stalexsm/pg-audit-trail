@@ -400,9 +400,14 @@ pub struct QSourceCreate {
 /// Правка настроек источника: PATCH /api/sources/{name}. Меняются только
 /// служебные таблицы, префикс MESSAGE и размер батча; URL неизменяем
 /// (ADR-0005: смена сервера — удалить и создать заново). Опущенное поле
-/// остаётся без изменений.
+/// остаётся без изменений. Попытка передать `url` — явный 400 (тикет #54):
+/// раньше поле молча игнорировалось, и клиент верил, что сменил сервер.
 #[derive(Deserialize, Debug, Validate, ToSchema)]
 pub struct QSourcePatch {
+    /// Неизменяемо: URL задаётся при регистрации (ADR-0005); любое
+    /// значение в правке — 400.
+    pub url: Option<String>,
+
     #[validate(custom(function = "validate_ignore_tables"))]
     pub ignore_tables: Option<Vec<String>>,
 
@@ -725,16 +730,20 @@ mod tests {
     }
 
     #[test]
-    fn patch_ignores_unknown_fields_like_url() {
-        // Неизвестные поля тела (включая url) serde молча игнорирует:
-        // неизменяемость URL проверяется интеграционным тестом шва.
+    fn patch_carries_url_attempt_for_explicit_rejection() {
+        // Поле url разбирается (а не молча теряется): обработчик обязан
+        // отвергнуть правку с ним явным 400 — неизменяемость URL (ADR-0005,
+        // тикет #54). Прочие неизвестные поля serde по-прежнему игнорирует.
         let patch: QSourcePatch = serde_json::from_value(serde_json::json!({
             "url": "postgresql://evil/x",
             "batch_size": 100,
         }))
-        .expect("правка с лишним url");
+        .expect("правка с полем url разбирается");
+        assert_eq!(patch.url.as_deref(), Some("postgresql://evil/x"));
         assert_eq!(patch.batch_size, Some(100));
-        assert!(patch.validate().is_ok());
+
+        let patch: QSourcePatch = serde_json::from_str("{}").expect("правка без url");
+        assert_eq!(patch.url, None, "опущенное поле — отсутствие попытки");
     }
 
     #[test]

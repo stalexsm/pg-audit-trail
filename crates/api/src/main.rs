@@ -1,15 +1,11 @@
 use anyhow::Context;
-use api::routes::{ApiDoc, api_router};
-use api::startup::{connect_pool, database_url_from_env, port_from_env};
-use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::get};
+use api::routes::{ApiDoc, api_router, not_found_fallback};
+use api::startup::{connect_pool, cors_layer, database_url_from_env, port_from_env};
+use axum::{Json, Router, routing::get};
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::signal;
-use tower_http::{
-    compression::CompressionLayer,
-    cors::{Any, CorsLayer},
-    trace::TraceLayer,
-};
+use tower_http::{compression::CompressionLayer, trace::TraceLayer};
 use tracing::{error, info};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
@@ -48,9 +44,9 @@ async fn main() -> anyhow::Result<()> {
             .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
             .route("/health", get(health))
             .merge(api_router())
-            .fallback(handler_404)
+            .fallback(not_found_fallback)
             .layer(TraceLayer::new_for_http())
-            .layer(CorsLayer::new().allow_origin(Any).allow_headers(Any))
+            .layer(cors_layer()?)
             .layer(CompressionLayer::new())
             .with_state(pool)
             .into_make_service(),
@@ -102,12 +98,4 @@ pub struct Health {
 //Метод для проверки работоспособности API
 async fn health() -> AppResult<Json<Health>> {
     Ok(Json(Health { ok: true }))
-}
-
-/// Обработка не существующих запросов.
-async fn handler_404() -> impl IntoResponse {
-    (
-        StatusCode::NOT_FOUND,
-        "Данной страницы не существует. Проверьте правильность адреса...",
-    )
 }

@@ -108,7 +108,20 @@ pub(crate) async fn stream_session(
                     let Some(mut buf) = buffer.take() else {
                         continue;
                     };
-                    buf.set_committed_at(pg_micros_to_utc(commit_time_micros));
+                    // Время коммита известно только к моменту Commit;
+                    // неразобранная метка — не тишина: пишем координаты
+                    // (источник, xid, LSN) и подставляем текущее время.
+                    let committed_at = pg_micros_to_utc(commit_time_micros).unwrap_or_else(|| {
+                        warn!(
+                            source = %record.name,
+                            xid = buf.xid,
+                            end_lsn = %end_lsn,
+                            commit_time_micros,
+                            "время коммита источника не разобрано — строкам подставлено текущее время"
+                        );
+                        Utc::now()
+                    });
+                    buf.set_committed_at(committed_at);
                     // Контекст последнего MESSAGE (ADR-0004) проставляется
                     // строкам изменений строго перед вставкой батча;
                     // транзакция без изменений строк вставки не порождает,
@@ -374,7 +387,9 @@ fn handle_audit_message(buf: &mut TransactionBuffer, content: &[u8], lsn: Lsn) {
         }
     };
     buf.push_message(payload);
-    metrics::add_event();
+    // Отдельный счётчик: MESSAGE строк журнала не создаёт, в остаток
+    // буферов (события минус вставленные строки) входить не должен.
+    metrics::add_message();
     debug!(%lsn, "MESSAGE принят как контекст транзакции");
 }
 
@@ -416,13 +431,14 @@ fn journal_row(
     }
 }
 
-/// Микросекунды от эпохи PostgreSQL → `DateTime<Utc>`.
-fn pg_micros_to_utc(micros: i64) -> DateTime<Utc> {
-    let seconds = PG_EPOCH_SECONDS + micros.div_euclid(1_000_000);
+/// Микросекунды от эпохи PostgreSQL → `DateTime<Utc>`; метка вне диапазона
+/// календаря — `None` (вызывающий код логирует координаты и подставляет
+/// текущее время — тише терять колонку `committed_at` нельзя, но и ронять
+/// сессию репликации из-за кривой метки не нужно).
+fn pg_micros_to_utc(micros: i64) -> Option<DateTime<Utc>> {
+    let seconds = PG_EPOCH_SECONDS.checked_add(micros.div_euclid(1_000_000))?;
     let nanos = (micros.rem_euclid(1_000_000) * 1_000) as u32;
-    Utc.timestamp_opt(seconds, nanos)
-        .single()
-        .unwrap_or_else(Utc::now)
+    Utc.timestamp_opt(seconds, nanos).single()
 }
 
 #[cfg(test)]
@@ -491,5 +507,27 @@ mod tests {
         assert_eq!(endpoint.user, "postgres");
         assert_eq!(endpoint.password, "");
         assert_eq!(endpoint.database, "clientdb");
+    }
+
+    /// Метка коммита протокола (микросекунды от эпохи PostgreSQL)
+    /// переводится в UTC корректно, включая дробную часть микросекунд.
+    #[test]
+    fn commit_micros_convert_to_utc() {
+        let ts = pg_micros_to_utc(1_500_000).expect("метка в диапазоне календаря");
+        assert_eq!(ts.timestamp(), 946_684_801, "эпоха + 1 секунда");
+        assert_eq!(ts.timestamp_subsec_nanos(), 500_000_000);
+        assert_eq!(
+            pg_micros_to_utc(0).expect("эпоха PostgreSQL").timestamp(),
+            946_684_800
+        );
+    }
+
+    /// Метка вне диапазона календаря — None: вызывающий код логирует
+    /// координаты (источник, xid, LSN) и подставляет текущее время,
+    /// сессия репликации не роняется (тикет #54).
+    #[test]
+    fn out_of_range_commit_micros_do_not_parse() {
+        assert_eq!(pg_micros_to_utc(i64::MAX), None);
+        assert_eq!(pg_micros_to_utc(i64::MIN), None);
     }
 }
