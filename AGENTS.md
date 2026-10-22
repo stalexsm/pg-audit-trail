@@ -18,9 +18,11 @@
 
 ```bash
 cargo fmt --check
-cargo clippy --all --all-targets
+cargo clippy --all --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+Команда clippy здесь должна оставаться в точности равной команде из гейта clippy в `.github/workflows/ci.yml` — порог линтов одинаков локально и в CI.
 
 Предупреждения clippy исправляй в коде; `#[allow(...)]` допустим только с комментарием-обоснованием рядом.
 
