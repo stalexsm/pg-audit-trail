@@ -53,6 +53,7 @@ fn worker_config(audit_url: String, initial_backoff_ms: u64, max_backoff_ms: u64
         database_url: audit_url,
         reconnect_initial_backoff_ms: initial_backoff_ms,
         reconnect_max_backoff_ms: max_backoff_ms,
+        tx_buffer_max_rows: 100_000,
     }
 }
 

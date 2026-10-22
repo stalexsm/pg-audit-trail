@@ -122,6 +122,7 @@ async fn cancel_during_blocked_insert_finishes_within_budget() {
         database_url: audit_url.clone(),
         reconnect_initial_backoff_ms: 1_000,
         reconnect_max_backoff_ms: 30_000,
+        tx_buffer_max_rows: 100_000,
     };
     let token = CancellationToken::new();
     let handle = tokio::spawn(worker_cdc::run(config, token.clone()));
