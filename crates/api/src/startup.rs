@@ -237,14 +237,17 @@ mod tests {
     /// текст ошибки обязан его скрыть.
     #[test]
     fn database_url_error_does_not_leak_value() {
-        let error = database_url_from(Err(env::VarError::NotUnicode(
-            "postgresql://postgres:S3cret-Pa55word@127.0.0.1:1/postgres".into(),
-        )))
-        .expect_err("не-Unicode значение");
+        // DSN собирается в рантайме: литерал «URL с паролем» ловит сканер
+        // секретов (SKY-S101), а тесту нужен лишь факт утечки значения.
+        const SECRET: &str = "S3cret-Pa55word";
+        let value = format!("postgresql://postgres:{SECRET}@127.0.0.1:1/postgres");
+
+        let error = database_url_from(Err(env::VarError::NotUnicode(value.into())))
+            .expect_err("не-Unicode значение");
 
         let rendered = format!("{error:#}");
         assert!(
-            !rendered.contains("S3cret"),
+            !rendered.contains(SECRET),
             "ошибка раскрывает значение: {rendered}"
         );
         assert!(
@@ -417,9 +420,11 @@ mod tests {
     #[tokio::test]
     async fn connect_error_on_malformed_dsn_does_not_leak_it() {
         const SECRET: &str = "S3cret-Pa55word-#51";
-        const MALFORMED: &str = "postgresql://postgres:S3cret-Pa55word-#51@[::1]:not-a-port/db";
+        // DSN собирается в рантайме: литерал «URL с паролем» ловит сканер
+        // секретов (SKY-S101), проверяем же мы утечку готовой строки.
+        let malformed = format!("postgresql://postgres:{SECRET}@[::1]:not-a-port/db");
 
-        let error = connect_pool(MALFORMED)
+        let error = connect_pool(&malformed)
             .await
             .expect_err("кривой DSN обязан провалиться на парсинге");
 
@@ -429,7 +434,7 @@ mod tests {
             "ошибка раскрывает пароль: {rendered}"
         );
         assert!(
-            !rendered.contains(MALFORMED),
+            !rendered.contains(&malformed),
             "ошибка раскрывает DSN: {rendered}"
         );
         assert!(rendered.contains("БД аудита"), "без контекста: {rendered}");

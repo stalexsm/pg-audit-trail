@@ -46,6 +46,11 @@ expression = "MIT"
 license-files = [{ path = "../../LICENSE", hash = 0x5d3b380a }]
 
 [[licenses.clarify]]
+crate = "waltrail-log"
+expression = "MIT"
+license-files = [{ path = "../../LICENSE", hash = 0x5d3b380a }]
+
+[[licenses.clarify]]
 crate = "worker-cdc"
 expression = "MIT"
 license-files = [{ path = "../../LICENSE", hash = 0x5d3b380a }]
