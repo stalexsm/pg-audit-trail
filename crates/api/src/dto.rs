@@ -220,6 +220,10 @@ pub struct ChangeDetailDTO {
 const SENSITIVE_KEYS: [&str; 6] = ["password", "passwd", "pwd", "token", "secret", "api_key"];
 
 /// Маска чувствительного значения в образах и контексте.
+///
+/// Отдельна от `SOURCE_URL_MASK` (маска строки подключения реестра):
+/// домены разные — значения журнала и url источника, — смена одной
+/// маски не должна менять формат другой выдачи.
 const SENSITIVE_VALUE_MASK: &str = "*****";
 
 /// Ключ чувствителен по словарю (ADR-0006)?
@@ -236,7 +240,7 @@ fn is_sensitive_key(key: &str) -> bool {
 /// обрабатывается как образ: чувствительное имя колонки в `key` скрывает
 /// значения обоих образов целиком — сами значения лежат в ней не под
 /// чувствительным ключом, а под `before`/`after`.
-pub(crate) fn mask_sensitive_values(value: &serde_json::Value) -> serde_json::Value {
+fn mask_sensitive_values(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
             let hidden_summary = map
@@ -412,6 +416,10 @@ fn validate_slot_name(name: &str) -> Result<(), ValidationError> {
 }
 
 /// Маска чувствительной части строки подключения в ответах API.
+///
+/// Отдельна от `SENSITIVE_VALUE_MASK` (маска образов и контекста журнала):
+/// домены разные — url источника и значения журнала, — смена одной маски
+/// не должна менять формат другой выдачи.
 pub(crate) const SOURCE_URL_MASK: &str = "*****";
 
 /// Маскирует строку подключения источника для ответов API: видны только

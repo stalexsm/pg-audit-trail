@@ -309,7 +309,7 @@ async fn filter_by_context_containment() {
 }
 
 #[tokio::test]
-async fn detail_returns_full_row_and_masks_password() {
+async fn masks_sensitive_keys_recursively_in_list_and_detail() {
     let (pool, db_name, router) = spawn_env("detail").await;
 
     let mut change = row(
