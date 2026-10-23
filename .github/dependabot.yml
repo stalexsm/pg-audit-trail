@@ -1,0 +1,19 @@
+# Обновления версий GitHub Actions (workflow ci.yml).
+#
+# Все actions запинены на полные commit SHA (проверяет гейт skylos, SKY-D292) —
+# апгрейды тянет Dependabot, а не ручные правки: он поднимает SHA и сам
+# обновляет комментарий версии рядом с пином.
+#
+# Значение экосистемы — именно «actions»: значения «github-actions» не
+# существует, с ним Dependabot отбраковывает файл целиком и молча не делает
+# ничего (ошибка видна только в Insights → Dependency graph → Dependabot).
+#
+# Каждый PR бота прогоняет все гейты ci.yml; в main обновление попадает только
+# через required check «gates» в branch protection.
+version: 2
+updates:
+  - package-ecosystem: "actions"
+    # Workflows лежат в .github/workflows — от корня репозитория.
+    directory: "/"
+    schedule:
+      interval: "weekly"
