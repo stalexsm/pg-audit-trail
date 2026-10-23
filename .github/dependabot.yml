@@ -17,3 +17,8 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # Свежевыпущенные версии выдерживаем 7 дней перед бампом (гейт semgrep,
+    # dependabot-missing-cooldown): защита от только что опубликованных,
+    # потенциально скомпрометированных или нестабильных версий.
+    cooldown:
+      default-days: 7
